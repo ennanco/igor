@@ -54,7 +54,7 @@ must finish its acceptance checks before work starts on a dependent milestone.
 - [x] `A0.02` `cargo clippy --workspace --all-targets -- -D warnings` succeeds.
 - [x] `A0.03` `cargo test --workspace` succeeds.
 - [x] `A0.04` `cargo run -p igor-cli -- --version` prints the workspace version.
-- [ ] `A0.05` CI runs the same checks on a clean checkout.
+- [x] `A0.05` CI runs the same checks on a clean checkout.
 
 ## Milestone 1: Core Contracts And State Machines
 
