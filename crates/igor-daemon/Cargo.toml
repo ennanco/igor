@@ -1,0 +1,15 @@
+[package]
+name = "igor-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+igor-core.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

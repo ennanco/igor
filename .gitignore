@@ -1,0 +1,15 @@
+/target/
+/.igor/
+/.state/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.tmp
+*.zst
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+**/RESULTS.md

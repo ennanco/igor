@@ -1,0 +1,40 @@
+# Igor
+
+**Integrated General-purpose Orchestrator for Research**
+
+Igor is a resource-aware experiment runner and recovery orchestrator for Linux.
+It will execute arbitrary process and Docker workloads, coordinate exclusive
+compute resources, persist execution history, extract structured results, and
+generate project reports.
+
+The project is at the foundation stage and is not ready to manage real
+experiments. See [`DESIGN.md`](DESIGN.md) for the agreed architecture and
+[`TASKS.md`](TASKS.md) for the ordered implementation backlog.
+
+## Requirements
+
+- Linux
+- Rust `1.97.1`
+- `systemd --user` for the initial service integration
+- SQLite and Docker capabilities will be provided through Rust libraries and
+  optional runtime integrations
+
+## Development
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo doc --workspace --no-deps
+```
+
+Inspect the placeholder CLI:
+
+```bash
+cargo run -p igor-cli -- --version
+```
+
+## License
+
+Licensed under either of Apache License, Version 2.0 or MIT license at your
+option.
