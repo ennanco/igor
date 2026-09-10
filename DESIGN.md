@@ -172,6 +172,19 @@ Fallbacks follow the XDG base-directory specification, normally:
 Large project artifacts remain in project-configured locations rather than
 being copied into the global Igor state directory.
 
+Portable project configuration lives with the project and may be committed:
+
+```text
+PROJECT_ROOT/.igor/project.toml
+PROJECT_ROOT/.igor/report-prompt.md
+```
+
+`project.toml` declares workload defaults and requirements. Machine-specific
+capacity and credentials remain in `$XDG_CONFIG_HOME/igor/config.toml`; GPU
+identities and other host details must not leak into portable project config.
+When no project path is explicit, Igor searches from the current directory
+toward its parents for `.igor/project.toml`.
+
 ## 7. Command Execution Contract
 
 A direct command is represented structurally:
@@ -678,6 +691,7 @@ stored exception URLs.
 ### 20.1 Projects And Configuration
 
 ```bash
+igor init [PATH]
 igor project add PATH
 igor project list
 igor config path
@@ -685,6 +699,12 @@ igor config show
 igor config check
 igor doctor
 ```
+
+`igor init` creates `.igor/project.toml` with unrestricted CPU and memory, no
+timeout, and exclusive-host scheduling defaults. It creates only configuration
+files needed by enabled features and never overwrites an existing file unless
+the user passes `--force`. Runtime state, logs, databases, and secrets are not
+created inside the project.
 
 ### 20.2 Jobs And Families
 

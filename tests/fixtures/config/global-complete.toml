@@ -1,0 +1,19 @@
+schema_version = 1
+
+[paths]
+state_dir = "state"
+runtime_dir = "runtime"
+database = "state/custom.sqlite3"
+log_dir = "state/logs"
+worktree_dir = "state/worktrees"
+report_dir = "state/reports"
+
+[host]
+cpu_threads = 16
+memory_bytes = 68719476736
+gpus = ["GPU-fixture"]
+named_resources = ["scratch-disk"]
+
+[telegram]
+bot_token = "fixture-token"
+chat_id = "fixture-chat"

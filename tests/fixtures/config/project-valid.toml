@@ -1,0 +1,5 @@
+schema_version = 1
+
+[paths]
+artifact_root = "artifacts"
+cleanup_roots = ["artifacts/checkpoints"]

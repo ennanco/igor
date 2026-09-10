@@ -1,0 +1,22 @@
+# Portable Igor project configuration.
+schema_version = 1
+
+[resources]
+mode = "exclusive-host"
+cpu_threads = "unlimited"
+memory = "unlimited"
+timeout = "none"
+gpu_count = 1
+gpu_exclusive = true
+
+[paths]
+artifact_root = "artifacts"
+cleanup_roots = ["artifacts"]
+
+[report]
+enabled = true
+trigger = "family-completed"
+output = "RESULTS.md"
+mode = "replace-generated-file"
+generator = "opencode"
+prompt_file = ".igor/report-prompt.md"

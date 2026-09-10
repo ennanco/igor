@@ -1,0 +1,23 @@
+# Host-specific Igor configuration. Credentials belong here, never in a project.
+schema_version = 1
+
+[paths]
+# Relative paths are resolved from this file's directory.
+# state_dir = "../state"
+# runtime_dir = "/run/user/1000/igor"
+# database = "../state/igor.sqlite3"
+# log_dir = "../state/logs"
+# worktree_dir = "../state/worktrees"
+# report_dir = "../state/reports"
+
+[host]
+# Optional host identities and observed capacity. They are scheduling metadata,
+# not implicit limits on project workloads.
+# cpu_threads = 16
+# memory_bytes = 68719476736
+# gpus = ["GPU-uuid"]
+# named_resources = ["scratch-disk"]
+
+[telegram]
+# bot_token = "replace-me"
+# chat_id = "replace-me"

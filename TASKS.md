@@ -62,40 +62,40 @@ Dependencies: milestone 0.
 
 ### Tasks
 
-- [ ] `M1.01` Define strongly typed identifiers for projects, families,
+- [x] `M1.01` Define strongly typed identifiers for projects, families,
   generations, jobs, attempts, events, actions, deliveries, recoveries,
   reports, resources, and agent sessions.
-- [ ] `M1.02` Define the project model and versioned project configuration.
-- [ ] `M1.03` Define a command specification containing program, argument vector,
+- [x] `M1.02` Define the project model and versioned project configuration.
+- [x] `M1.03` Define a command specification containing program, argument vector,
   working directory, shell policy, and environment policy.
-- [ ] `M1.04` Define direct-process and Docker executor specifications without
+- [x] `M1.04` Define direct-process and Docker executor specifications without
   implementing either executor.
-- [ ] `M1.05` Define resource requests with unrestricted CPU and memory defaults.
-- [ ] `M1.06` Define `exclusive-host`, exclusive GPU, and named-resource modes.
-- [ ] `M1.07` Define job and immutable attempt specifications.
-- [ ] `M1.08` Define family membership, seeds, and generation identity.
-- [ ] `M1.09` Define job, attempt, action, delivery, recovery, report, and cleanup
+- [x] `M1.05` Define resource requests with unrestricted CPU and memory defaults.
+- [x] `M1.06` Define `exclusive-host`, exclusive GPU, and named-resource modes.
+- [x] `M1.07` Define job and immutable attempt specifications.
+- [x] `M1.08` Define family membership, seeds, and generation identity.
+- [x] `M1.09` Define job, attempt, action, delivery, recovery, report, and cleanup
   state enums.
-- [ ] `M1.10` Define valid state transitions as domain operations.
-- [ ] `M1.11` Define event kinds and versioned event payloads.
-- [ ] `M1.12` Define retry policies for attempts, actions, and deliveries.
-- [ ] `M1.13` Define the no-timeout default and optional explicit timeout.
-- [ ] `M1.14` Define artifact roles and retention decisions.
-- [ ] `M1.15` Define structured error categories and stable public error codes.
-- [ ] `M1.16` Add Serde round-trip tests for every persisted contract.
-- [ ] `M1.17` Add transition-table tests covering every legal and illegal state
+- [x] `M1.10` Define valid state transitions as domain operations.
+- [x] `M1.11` Define event kinds and versioned event payloads.
+- [x] `M1.12` Define retry policies for attempts, actions, and deliveries.
+- [x] `M1.13` Define the no-timeout default and optional explicit timeout.
+- [x] `M1.14` Define artifact roles and retention decisions.
+- [x] `M1.15` Define structured error categories and stable public error codes.
+- [x] `M1.16` Add Serde round-trip tests for every persisted contract.
+- [x] `M1.17` Add transition-table tests covering every legal and illegal state
   change.
-- [ ] `M1.18` Add compatibility tests that reject unsupported config and payload
+- [x] `M1.18` Add compatibility tests that reject unsupported config and payload
   versions with actionable errors.
 
 ### Acceptance
 
-- [ ] `A1.01` Domain types do not depend on Clap, SQLx, systemd, or terminal
+- [x] `A1.01` Domain types do not depend on Clap, SQLx, systemd, or terminal
   presentation.
-- [ ] `A1.02` A job and attempt specification can round-trip through JSON without
+- [x] `A1.02` A job and attempt specification can round-trip through JSON without
   changing argument boundaries or defaults.
-- [ ] `A1.03` CPU, memory, and timeout are unrestricted when omitted.
-- [ ] `A1.04` Invalid state transitions fail before reaching persistence.
+- [x] `A1.03` CPU, memory, and timeout are unrestricted when omitted.
+- [x] `A1.04` Invalid state transitions fail before reaching persistence.
 
 ## Milestone 2: Configuration And XDG Paths
 
@@ -103,32 +103,38 @@ Dependencies: milestone 1.
 
 ### Tasks
 
-- [ ] `M2.01` Implement XDG config, state, runtime, log, worktree, and report
+- [x] `M2.01` Implement XDG config, state, runtime, log, worktree, and report
   path discovery.
-- [ ] `M2.02` Implement deterministic fallback paths when XDG variables are
+- [x] `M2.02` Implement deterministic fallback paths when XDG variables are
   absent.
-- [ ] `M2.03` Define the global `config.toml` schema and defaults.
-- [ ] `M2.04` Define the project `igor.toml` schema and defaults.
-- [ ] `M2.05` Implement precedence for CLI options, `IGOR_*` variables, selected
+- [x] `M2.03` Define the global `config.toml` schema and defaults.
+- [x] `M2.04` Define the project `.igor/project.toml` schema and defaults.
+- [x] `M2.05` Discover `.igor/project.toml` from the current directory toward
+  its parents when no project path is explicit.
+- [x] `M2.06` Implement precedence for CLI options, `IGOR_*` variables, selected
   config file, and built-in defaults.
-- [ ] `M2.06` Resolve relative project paths against the configuration file that
+- [x] `M2.07` Resolve relative project paths against the configuration file that
   declares them.
-- [ ] `M2.07` Validate that artifact and cleanup roots cannot escape declared
+- [x] `M2.08` Validate that artifact and cleanup roots cannot escape declared
   project locations.
-- [ ] `M2.08` Implement `igor config path`.
-- [ ] `M2.09` Implement `igor config show` with secret redaction.
-- [ ] `M2.10` Implement `igor config check`.
-- [ ] `M2.11` Add fixtures for valid, minimal, complete, and invalid configs.
-- [ ] `M2.12` Generate an example global config and example project config.
+- [x] `M2.09` Implement `igor init [PATH]` without overwriting existing files
+  unless `--force` is explicit.
+- [x] `M2.10` Implement `igor config path`.
+- [x] `M2.11` Implement `igor config show` with secret redaction.
+- [x] `M2.12` Implement `igor config check`.
+- [x] `M2.13` Add fixtures for valid, minimal, complete, and invalid configs.
+- [x] `M2.14` Generate an example global config and example project config.
 
 ### Acceptance
 
-- [ ] `A2.01` Tests run under disposable XDG directories without touching the
+- [x] `A2.01` Tests run under disposable XDG directories without touching the
   user's real configuration.
-- [ ] `A2.02` A minimal config produces unrestricted compute and no timeout.
-- [ ] `A2.03` Invalid paths, versions, and enum values report their exact config
+- [x] `A2.02` A minimal config produces unrestricted compute and no timeout.
+- [x] `A2.03` Invalid paths, versions, and enum values report their exact config
   location.
-- [ ] `A2.04` Secret values never appear in `config show` or validation errors.
+- [x] `A2.04` Secret values never appear in `config show` or validation errors.
+- [x] `A2.05` `igor init` creates portable project configuration while all
+  runtime state remains under XDG paths.
 
 ## Milestone 3: SQLite Foundation And Repositories
 
@@ -678,7 +684,7 @@ all terminal curator actions.
 - [ ] `M18.05` Export jobs, attempts, notification state, and curator history.
 - [ ] `M18.06` Import legacy records with preserved legacy IDs and source labels.
 - [ ] `M18.07` Keep imported legacy history terminal and immutable.
-- [ ] `M18.08` Create a Sleep_CNN `igor.toml`.
+- [ ] `M18.08` Create a Sleep_CNN `.igor/project.toml`.
 - [ ] `M18.09` Define Sleep_CNN direct and Docker execution profiles.
 - [ ] `M18.10` Define the GNN family and seed-generation contract.
 - [ ] `M18.11` Define immutable scientific config and dataset paths.
