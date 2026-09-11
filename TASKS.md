@@ -136,47 +136,48 @@ Dependencies: milestone 1.
 - [x] `A2.05` `igor init` creates portable project configuration while all
   runtime state remains under XDG paths.
 
-## Milestone 3: SQLite Foundation And Repositories
+## Milestone 3: SQLite Schema Versioning And Repositories
 
 Dependencies: milestones 1-2.
 
 ### Tasks
 
-- [ ] `M3.01` Add SQLx with SQLite and compile-time migration support.
-- [ ] `M3.02` Create migration `0001` for `schema_migrations`, `projects`,
-  `families`, `generations`, `jobs`, and `attempts`.
-- [ ] `M3.03` Create migration `0002` for `events`, `resources`, and
+- [x] `M3.01` Add SQLx with SQLite, compile-time migration support, and its
+  checksummed `_sqlx_migrations` ledger.
+- [x] `M3.02` Create migration `0001` for `projects`, `families`, `generations`,
+  `jobs`, and `attempts`.
+- [x] `M3.03` Create migration `0002` for `events`, `resources`, and
   `resource_leases`.
-- [ ] `M3.04` Create migration `0003` for `actions`, `metrics`, `artifacts`,
+- [x] `M3.04` Create migration `0003` for `actions`, `metrics`, `artifacts`,
   `deliveries`, `recoveries`, `report_runs`, and `agent_sessions`.
-- [ ] `M3.05` Add state constraints and foreign keys to all tables.
-- [ ] `M3.06` Add indexes for queue ordering, attempt lookup, event streams,
+- [x] `M3.05` Add state constraints and foreign keys to all tables.
+- [x] `M3.06` Add indexes for queue ordering, attempt lookup, event streams,
   leases, pending actions, and pending deliveries.
-- [ ] `M3.07` Enable WAL, foreign keys, and a bounded busy timeout on every
+- [x] `M3.07` Enable WAL, foreign keys, and a bounded busy timeout on every
   writable connection.
-- [ ] `M3.08` Implement transactional migration startup.
-- [ ] `M3.09` Implement project repository operations.
-- [ ] `M3.10` Implement family and generation repository operations.
-- [ ] `M3.11` Implement job and attempt repository operations.
-- [ ] `M3.12` Implement append-only event repository operations.
-- [ ] `M3.13` Implement action and delivery transactional claims.
-- [ ] `M3.14` Implement resource and lease repository operations.
-- [ ] `M3.15` Ensure each lifecycle transition and its event are committed in one
+- [x] `M3.08` Implement transactional migration startup.
+- [x] `M3.09` Implement project repository operations.
+- [x] `M3.10` Implement family and generation repository operations.
+- [x] `M3.11` Implement job and attempt repository operations.
+- [x] `M3.12` Implement append-only event repository operations.
+- [x] `M3.13` Implement action and delivery transactional claims.
+- [x] `M3.14` Implement resource and lease repository operations.
+- [x] `M3.15` Ensure each lifecycle transition and its event are committed in one
   transaction.
-- [ ] `M3.16` Implement database integrity checking.
-- [ ] `M3.17` Implement consistent backup through SQLite's backup API.
-- [ ] `M3.18` Add concurrent-claim and busy-database integration tests.
-- [ ] `M3.19` Add migration tests from an empty database and versioned fixtures.
-- [ ] `M3.20` Add tests proving foreign-key enforcement on every connection.
+- [x] `M3.16` Implement database integrity checking.
+- [x] `M3.17` Implement consistent backup through SQLite's backup API.
+- [x] `M3.18` Add concurrent-claim and busy-database integration tests.
+- [x] `M3.19` Add migration tests from an empty database and versioned fixtures.
+- [x] `M3.20` Add tests proving foreign-key enforcement on every connection.
 
 ### Acceptance
 
-- [ ] `A3.01` Two claimers cannot acquire the same job, action, delivery, or
+- [x] `A3.01` Two claimers cannot acquire the same job, action, delivery, or
   resource lease.
-- [ ] `A3.02` A failed transaction leaves neither a state change nor a partial
+- [x] `A3.02` A failed transaction leaves neither a state change nor a partial
   event.
-- [ ] `A3.03` A backup taken while writes occur passes integrity checks.
-- [ ] `A3.04` Every schema change is represented by a migration.
+- [x] `A3.03` A backup taken while writes occur passes integrity checks.
+- [x] `A3.04` Every schema change is represented by a migration.
 
 ## Milestone 4: Local Protocol And Daemon Skeleton
 

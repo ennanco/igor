@@ -390,11 +390,15 @@ into the main branch remains an explicit user action.
 
 ## 12. Persistent Data Model
 
+Igor presents this as automatic database schema updating. Internally, each
+schema update remains a numbered SQL migration, following SQLx and database
+tooling conventions.
+
 The initial schema should include:
 
 | Table | Responsibility |
 |---|---|
-| `schema_migrations` | Numbered transactional migrations |
+| `_sqlx_migrations` | SQLx-managed versions and checksums for numbered migrations |
 | `projects` | Project identity and configuration path |
 | `families` | Comparable experiment families |
 | `generations` | Revision and protocol shared by family members |

@@ -8,6 +8,7 @@ mod event;
 mod executor;
 mod id;
 mod job;
+pub mod persistence;
 mod project;
 mod resource;
 mod retry;
@@ -36,6 +37,13 @@ pub use id::{
 pub use job::{
     AttemptSpec, ConfigurationIdentity, FamilyMembership, GenerationIdentity, JobSpec,
     ResultContract, Seed, SourceIdentity,
+};
+pub use persistence::{
+    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, Database,
+    DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, Family,
+    FamilyGenerationRepository, Generation, IntegrityCheck, JobAttemptRepository, PersistenceError,
+    ProjectRepository, Resource, ResourceLease, ResourceRepository, StoredAttempt, StoredEvent,
+    StoredJob,
 };
 pub use project::{
     PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ReportConfig, ReportGenerator,
