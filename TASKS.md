@@ -185,29 +185,29 @@ Dependencies: milestone 3.
 
 ### Tasks
 
-- [ ] `M4.01` Define a versioned request and response protocol for the Unix
-  socket.
-- [ ] `M4.02` Define stable protocol errors and client exit-code mapping.
-- [ ] `M4.03` Implement socket creation under `$XDG_RUNTIME_DIR/igor`.
-- [ ] `M4.04` Restrict the socket to the current user.
-- [ ] `M4.05` Reject incompatible protocol versions.
-- [ ] `M4.06` Implement worker startup, shutdown, and signal handling.
-- [ ] `M4.07` Implement supervisor startup, shutdown, and signal handling.
-- [ ] `M4.08` Implement health, version, and database-status requests.
-- [ ] `M4.09` Implement a reusable CLI client.
-- [ ] `M4.10` Implement `igor daemon health`.
-- [ ] `M4.11` Implement `igor daemon status`.
-- [ ] `M4.12` Add graceful cleanup of stale socket files after verified dead
-  owners.
-- [ ] `M4.13` Add integration tests with disposable worker and supervisor
-  processes.
+- [x] `M4.01` Define a versioned request and response protocol for the Unix
+   socket.
+- [x] `M4.02` Define stable protocol errors and client exit-code mapping.
+- [x] `M4.03` Implement socket creation under `$XDG_RUNTIME_DIR/igor`.
+- [x] `M4.04` Restrict the socket to the current user.
+- [x] `M4.05` Reject incompatible protocol versions.
+- [x] `M4.06` Implement worker startup, shutdown, and signal handling.
+- [x] `M4.07` Implement supervisor startup, shutdown, and signal handling.
+- [x] `M4.08` Implement health, version, and database-status requests.
+- [x] `M4.09` Implement a reusable CLI client.
+- [x] `M4.10` Implement `igor daemon health`.
+- [x] `M4.11` Implement `igor daemon status`.
+- [x] `M4.12` Add graceful cleanup of stale socket files after verified dead
+   owners.
+- [x] `M4.13` Add integration tests with disposable worker and supervisor
+   processes.
 
 ### Acceptance
 
-- [ ] `A4.01` An unprivileged second user cannot use the socket.
-- [ ] `A4.02` Abrupt daemon termination does not prevent a clean restart.
-- [ ] `A4.03` CLI errors distinguish unavailable daemon, protocol mismatch, and
-  invalid request.
+- [x] `A4.01` An unprivileged second user cannot use the socket.
+- [x] `A4.02` Abrupt daemon termination does not prevent a clean restart.
+- [x] `A4.03` CLI errors distinguish unavailable daemon, protocol mismatch, and
+   invalid request.
 
 ## Milestone 5: Submission And Inspection CLI
 

@@ -144,6 +144,10 @@ The worker and supervisor are separate long-running processes built from the
 same binary. Both use transactional claims and leases. SQLite runs in WAL mode
 with foreign keys enabled and numbered migrations.
 
+Each daemon role owns a separate Unix socket under the shared runtime directory.
+This lets both processes run independently without introducing a third broker;
+the CLI contacts the role responsible for each request.
+
 Long agent calls, network delivery, report generation, and artifact cleanup
 must never block the worker from starting the next compatible experiment.
 
@@ -157,7 +161,8 @@ $XDG_STATE_HOME/igor/igor.sqlite3
 $XDG_STATE_HOME/igor/logs/
 $XDG_STATE_HOME/igor/worktrees/
 $XDG_STATE_HOME/igor/reports/
-$XDG_RUNTIME_DIR/igor/igor.sock
+$XDG_RUNTIME_DIR/igor/worker.sock
+$XDG_RUNTIME_DIR/igor/supervisor.sock
 $XDG_RUNTIME_DIR/igor/resources/
 ```
 

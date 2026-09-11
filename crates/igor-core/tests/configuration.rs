@@ -55,7 +55,14 @@ fn xdg_paths_and_fallbacks_are_deterministic() -> Result<(), Box<dyn Error>> {
         xdg_state.join("igor/worktrees")
     );
     assert_eq!(effective.paths.report_dir, xdg_state.join("igor/reports"));
-    assert_eq!(effective.paths.socket, xdg_runtime.join("igor/igor.sock"));
+    assert_eq!(
+        effective.paths.worker_socket,
+        xdg_runtime.join("igor/worker.sock")
+    );
+    assert_eq!(
+        effective.paths.supervisor_socket,
+        xdg_runtime.join("igor/supervisor.sock")
+    );
     assert_eq!(
         effective.paths.resource_dir,
         xdg_runtime.join("igor/resources")

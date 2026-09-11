@@ -168,7 +168,8 @@ pub struct RuntimePaths {
     pub log_dir: PathBuf,
     pub worktree_dir: PathBuf,
     pub report_dir: PathBuf,
-    pub socket: PathBuf,
+    pub worker_socket: PathBuf,
+    pub supervisor_socket: PathBuf,
     pub resource_dir: PathBuf,
 }
 
@@ -450,7 +451,8 @@ fn resolve_runtime_paths(
         log_dir,
         worktree_dir,
         report_dir,
-        socket: runtime_dir.join("igor.sock"),
+        worker_socket: runtime_dir.join("worker.sock"),
+        supervisor_socket: runtime_dir.join("supervisor.sock"),
         resource_dir: runtime_dir.join("resources"),
     }
 }

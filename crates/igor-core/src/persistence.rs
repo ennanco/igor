@@ -218,6 +218,15 @@ impl Database {
         Ok(())
     }
 
+    pub async fn schema_version(&self) -> PersistenceResult<i64> {
+        sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations WHERE success = 1",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| db("read schema version", source))
+    }
+
     pub fn projects(&self) -> ProjectRepository<'_> {
         ProjectRepository { database: self }
     }

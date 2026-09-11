@@ -1,0 +1,615 @@
+use std::{
+    fs::{self, File, OpenOptions},
+    future::Future,
+    io,
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream},
+    },
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use fs2::FileExt;
+use igor_core::{Database, DatabaseOptions, IntegrityCheck, RuntimePaths};
+use serde_json::Value;
+use thiserror::Error;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixListener, UnixStream},
+    task::JoinSet,
+    time::timeout,
+};
+
+use crate::protocol::{
+    DaemonRole, DatabaseStatus, Health, PROTOCOL_VERSION, ProtocolError, ProtocolErrorKind,
+    Request, RequestEnvelope, Response, ResponseEnvelope, Version,
+};
+
+const MAX_FRAME_BYTES: usize = 64 * 1024;
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Error)]
+pub enum DaemonError {
+    #[error("{role} daemon is already running at {path}")]
+    AlreadyRunning { role: DaemonRole, path: PathBuf },
+    #[error("insecure runtime path {path}: {reason}")]
+    InsecureRuntime { path: PathBuf, reason: String },
+    #[error("cannot {operation} {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("database startup failed: {0}")]
+    Database(#[from] igor_core::PersistenceError),
+    #[error("database initialization task failed: {0}")]
+    DatabaseInitialization(String),
+}
+
+#[derive(Debug, Error)]
+pub enum ClientError {
+    #[error("{role} daemon is unavailable at {path}: {source}")]
+    Unavailable {
+        role: DaemonRole,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{role} daemon timed out at {path}")]
+    Timeout { role: DaemonRole, path: PathBuf },
+    #[error("daemon protocol mismatch: found version {found}, supported version is {supported}")]
+    ProtocolMismatch { found: u32, supported: u32 },
+    #[error("daemon rejected request ({code}): {message}")]
+    InvalidRequest { code: String, message: String },
+    #[error("daemon database is unavailable ({code}): {message}")]
+    DatabaseUnavailable { code: String, message: String },
+    #[error("daemon request failed ({code}): {message}")]
+    Internal { code: String, message: String },
+    #[error("invalid daemon response: {0}")]
+    InvalidResponse(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct Client {
+    worker_socket: PathBuf,
+    supervisor_socket: PathBuf,
+}
+
+impl Client {
+    #[must_use]
+    pub fn new(paths: &RuntimePaths) -> Self {
+        Self {
+            worker_socket: paths.worker_socket.clone(),
+            supervisor_socket: paths.supervisor_socket.clone(),
+        }
+    }
+
+    pub async fn request(
+        &self,
+        role: DaemonRole,
+        request: Request,
+    ) -> Result<Response, ClientError> {
+        let path = match role {
+            DaemonRole::Worker => &self.worker_socket,
+            DaemonRole::Supervisor => &self.supervisor_socket,
+        };
+        let exchange = async {
+            let mut stream =
+                UnixStream::connect(path)
+                    .await
+                    .map_err(|source| ClientError::Unavailable {
+                        role,
+                        path: path.clone(),
+                        source,
+                    })?;
+            let mut encoded = serde_json::to_vec(&RequestEnvelope::new(request))
+                .map_err(|error| ClientError::InvalidResponse(error.to_string()))?;
+            encoded.push(b'\n');
+            stream
+                .write_all(&encoded)
+                .await
+                .map_err(|source| ClientError::Unavailable {
+                    role,
+                    path: path.clone(),
+                    source,
+                })?;
+            let frame =
+                read_frame(&mut stream)
+                    .await
+                    .map_err(|source| ClientError::Unavailable {
+                        role,
+                        path: path.clone(),
+                        source,
+                    })?;
+            let response = decode_response(&frame)?;
+            validate_response(role, request, response)
+        };
+        timeout(IO_TIMEOUT, exchange)
+            .await
+            .map_err(|_| ClientError::Timeout {
+                role,
+                path: path.clone(),
+            })?
+    }
+}
+
+pub async fn run(role: DaemonRole, paths: &RuntimePaths) -> Result<(), DaemonError> {
+    run_until(role, paths, shutdown_signal()).await
+}
+
+pub async fn run_until<F>(
+    role: DaemonRole,
+    paths: &RuntimePaths,
+    shutdown: F,
+) -> Result<(), DaemonError>
+where
+    F: Future<Output = ()>,
+{
+    let database = open_database(paths).await?;
+    let bound = BoundSocket::bind(role, paths)?;
+    let listener = bound.listener;
+    let _cleanup = bound.cleanup;
+    let mut requests = JoinSet::new();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = &mut shutdown => break,
+            completed = requests.join_next(), if !requests.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(%role, %error, "daemon request task failed");
+                }
+            }
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.map_err(|source| daemon_io(
+                    "accept connection on",
+                    role.socket_path(paths),
+                    source,
+                ))?;
+                if peer_is_current_user(&stream)? {
+                    let database = database.clone();
+                    requests.spawn(async move {
+                        match timeout(IO_TIMEOUT, serve_connection(stream, role, database)).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(%role, %error, "daemon request failed");
+                            }
+                            Err(error) => {
+                                tracing::warn!(%role, %error, "daemon request timed out");
+                            }
+                        }
+                    });
+                } else {
+                    tracing::warn!(%role, "rejected Unix socket peer with a different user ID");
+                }
+            }
+        }
+    }
+
+    if timeout(SHUTDOWN_GRACE, drain_requests(&mut requests))
+        .await
+        .is_err()
+    {
+        requests.abort_all();
+        while requests.join_next().await.is_some() {}
+    }
+    database.pool().close().await;
+    Ok(())
+}
+
+async fn open_database(paths: &RuntimePaths) -> Result<Database, DaemonError> {
+    let database_path = paths.database.clone();
+    let file_name = database_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| insecure(&database_path, "database path has no filename"))?;
+    let lock_path = database_path.with_file_name(format!(".{file_name}.init.lock"));
+    let lock = tokio::task::spawn_blocking(move || -> Result<File, DaemonError> {
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|source| daemon_io("create database directory", parent, source))?;
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|source| daemon_io("open database initialization lock", &lock_path, source))?;
+        FileExt::lock_exclusive(&lock).map_err(|source| {
+            daemon_io("acquire database initialization lock", &lock_path, source)
+        })?;
+        Ok(lock)
+    })
+    .await
+    .map_err(|error| DaemonError::DatabaseInitialization(error.to_string()))??;
+    let database = Database::open_with_options(
+        &paths.database,
+        DatabaseOptions {
+            max_connections: 4,
+            ..DatabaseOptions::default()
+        },
+    )
+    .await?;
+    drop(lock);
+    Ok(database)
+}
+
+async fn drain_requests(requests: &mut JoinSet<()>) {
+    while let Some(result) = requests.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "daemon request task failed during shutdown");
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let terminate = signal(SignalKind::terminate());
+        match terminate {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "failed to listen for Ctrl-C");
+                        }
+                    }
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to listen for SIGTERM");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+}
+
+async fn serve_connection(
+    mut stream: UnixStream,
+    role: DaemonRole,
+    database: Database,
+) -> io::Result<()> {
+    let response = match read_frame(&mut stream).await {
+        Ok(frame) => match decode_request(&frame) {
+            Ok(request) => handle_request(role, &database, request).await,
+            Err(error) => ResponseEnvelope::failure(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
+            ResponseEnvelope::failure(ProtocolError::frame_too_large())
+        }
+        Err(error) => ResponseEnvelope::failure(ProtocolError::invalid_request(error.to_string())),
+    };
+    let mut encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
+    encoded.push(b'\n');
+    stream.write_all(&encoded).await
+}
+
+async fn handle_request(
+    role: DaemonRole,
+    database: &Database,
+    request: Request,
+) -> ResponseEnvelope {
+    match request {
+        Request::Health => ResponseEnvelope::success(Response::Health(Health {
+            role,
+            healthy: true,
+            pid: std::process::id(),
+        })),
+        Request::Version => ResponseEnvelope::success(Response::Version(Version {
+            role,
+            igor: env!("CARGO_PKG_VERSION").into(),
+            protocol: PROTOCOL_VERSION,
+        })),
+        Request::DatabaseStatus => {
+            let status = async {
+                let schema_version = database.schema_version().await?;
+                database.integrity_check(IntegrityCheck::Quick).await?;
+                Ok::<_, igor_core::PersistenceError>(schema_version)
+            }
+            .await;
+            match status {
+                Ok(schema_version) => {
+                    ResponseEnvelope::success(Response::DatabaseStatus(DatabaseStatus {
+                        role,
+                        schema_version,
+                        integrity: "ok".into(),
+                    }))
+                }
+                Err(error) => {
+                    tracing::error!(%role, %error, "database status request failed");
+                    ResponseEnvelope::failure(ProtocolError::database_unavailable())
+                }
+            }
+        }
+    }
+}
+
+fn decode_request(frame: &[u8]) -> Result<Request, ProtocolError> {
+    let value: Value = serde_json::from_slice(frame)
+        .map_err(|error| ProtocolError::invalid_request(error.to_string()))?;
+    let version = value
+        .get("protocol_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| {
+            ProtocolError::invalid_request("protocol_version must be an unsigned integer")
+        })?;
+    if version != PROTOCOL_VERSION {
+        return Err(ProtocolError::incompatible(version));
+    }
+    let envelope: RequestEnvelope = serde_json::from_value(value)
+        .map_err(|error| ProtocolError::invalid_request(error.to_string()))?;
+    Ok(envelope.request)
+}
+
+fn decode_response(frame: &[u8]) -> Result<Response, ClientError> {
+    let value: Value = serde_json::from_slice(frame)
+        .map_err(|error| ClientError::InvalidResponse(error.to_string()))?;
+    let version = value
+        .get("protocol_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| ClientError::InvalidResponse("missing protocol_version".into()))?;
+    if version != PROTOCOL_VERSION {
+        return Err(ClientError::ProtocolMismatch {
+            found: version,
+            supported: PROTOCOL_VERSION,
+        });
+    }
+    let envelope: ResponseEnvelope = serde_json::from_value(value)
+        .map_err(|error| ClientError::InvalidResponse(error.to_string()))?;
+    match (envelope.response, envelope.error) {
+        (Some(response), None) => Ok(response),
+        (None, Some(error)) => Err(client_protocol_error(error)),
+        _ => Err(ClientError::InvalidResponse(
+            "response must contain exactly one of response or error".into(),
+        )),
+    }
+}
+
+fn client_protocol_error(error: ProtocolError) -> ClientError {
+    match error.kind {
+        ProtocolErrorKind::IncompatibleProtocol => ClientError::ProtocolMismatch {
+            found: error.found_version.unwrap_or_default(),
+            supported: error.supported_version.unwrap_or(PROTOCOL_VERSION),
+        },
+        ProtocolErrorKind::DatabaseUnavailable => ClientError::DatabaseUnavailable {
+            code: error.code,
+            message: error.message,
+        },
+        ProtocolErrorKind::InvalidRequest | ProtocolErrorKind::FrameTooLarge => {
+            ClientError::InvalidRequest {
+                code: error.code,
+                message: error.message,
+            }
+        }
+        ProtocolErrorKind::Internal => ClientError::Internal {
+            code: error.code,
+            message: error.message,
+        },
+    }
+}
+
+fn validate_response(
+    role: DaemonRole,
+    request: Request,
+    response: Response,
+) -> Result<Response, ClientError> {
+    let valid = match (&request, &response) {
+        (Request::Health, Response::Health(value)) => value.role == role,
+        (Request::Version, Response::Version(value)) => value.role == role,
+        (Request::DatabaseStatus, Response::DatabaseStatus(value)) => value.role == role,
+        _ => false,
+    };
+    if valid {
+        Ok(response)
+    } else {
+        Err(ClientError::InvalidResponse(format!(
+            "{role} returned {response:?} for {request:?}"
+        )))
+    }
+}
+
+async fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before a complete frame",
+            ));
+        }
+        frame.extend_from_slice(&chunk[..read]);
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "protocol frame is too large",
+            ));
+        }
+        if let Some(end) = frame.iter().position(|byte| *byte == b'\n') {
+            if frame[end + 1..]
+                .iter()
+                .any(|byte| !byte.is_ascii_whitespace())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "multiple protocol frames are not allowed",
+                ));
+            }
+            frame.truncate(end);
+            return Ok(frame);
+        }
+    }
+}
+
+struct BoundSocket {
+    listener: UnixListener,
+    cleanup: SocketCleanup,
+}
+
+impl BoundSocket {
+    fn bind(role: DaemonRole, paths: &RuntimePaths) -> Result<Self, DaemonError> {
+        let uid = current_uid()?;
+        secure_runtime_directory(&paths.runtime_dir, uid)?;
+        let socket_path = role.socket_path(paths);
+        let lock_path = paths.runtime_dir.join(format!("{}.lock", role.as_str()));
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|source| daemon_io("open lock file", &lock_path, source))?;
+        let lock_metadata = fs::symlink_metadata(&lock_path)
+            .map_err(|source| daemon_io("inspect lock file", &lock_path, source))?;
+        if !lock_metadata.file_type().is_file()
+            || lock_metadata.file_type().is_symlink()
+            || lock_metadata.uid() != uid
+        {
+            return Err(insecure(
+                &lock_path,
+                "lock must be a regular file owned by the current user",
+            ));
+        }
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .map_err(|source| daemon_io("secure lock file", &lock_path, source))?;
+        FileExt::try_lock_exclusive(&lock).map_err(|source| {
+            if source.kind() == io::ErrorKind::WouldBlock {
+                DaemonError::AlreadyRunning {
+                    role,
+                    path: socket_path.to_path_buf(),
+                }
+            } else {
+                daemon_io("lock", &lock_path, source)
+            }
+        })?;
+        remove_stale_socket(role, socket_path, uid)?;
+        let listener = StdUnixListener::bind(socket_path)
+            .map_err(|source| daemon_io("bind socket", socket_path, source))?;
+        fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600))
+            .map_err(|source| daemon_io("secure socket", socket_path, source))?;
+        let metadata = fs::symlink_metadata(socket_path)
+            .map_err(|source| daemon_io("inspect socket", socket_path, source))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|source| daemon_io("configure socket", socket_path, source))?;
+        let listener = UnixListener::from_std(listener)
+            .map_err(|source| daemon_io("register socket", socket_path, source))?;
+        Ok(Self {
+            listener,
+            cleanup: SocketCleanup {
+                path: socket_path.to_path_buf(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                _lock: lock,
+            },
+        })
+    }
+}
+
+struct SocketCleanup {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    _lock: File,
+}
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        if let Ok(metadata) = fs::symlink_metadata(&self.path)
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn current_uid() -> Result<u32, DaemonError> {
+    fs::metadata("/proc/self")
+        .map(|metadata| metadata.uid())
+        .map_err(|source| daemon_io("inspect", Path::new("/proc/self"), source))
+}
+
+fn secure_runtime_directory(path: &Path, uid: u32) -> Result<(), DaemonError> {
+    fs::create_dir_all(path)
+        .map_err(|source| daemon_io("create runtime directory", path, source))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|source| daemon_io("inspect runtime directory", path, source))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(insecure(path, "must be a directory, not a symlink"));
+    }
+    if metadata.uid() != uid {
+        return Err(insecure(path, "is not owned by the current user"));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|source| daemon_io("secure runtime directory", path, source))
+}
+
+fn remove_stale_socket(role: DaemonRole, path: &Path, uid: u32) -> Result<(), DaemonError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => return Err(daemon_io("inspect socket", path, source)),
+    };
+    if !metadata.file_type().is_socket() || metadata.uid() != uid {
+        return Err(insecure(
+            path,
+            "existing path is not a Unix socket owned by the current user",
+        ));
+    }
+    match StdUnixStream::connect(path) {
+        Ok(_) => {
+            return Err(DaemonError::AlreadyRunning {
+                role,
+                path: path.to_path_buf(),
+            });
+        }
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+        Err(source) => return Err(daemon_io("verify stale socket", path, source)),
+    }
+    let current = fs::symlink_metadata(path)
+        .map_err(|source| daemon_io("recheck stale socket", path, source))?;
+    if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+        return Err(insecure(path, "socket changed while checking its owner"));
+    }
+    fs::remove_file(path).map_err(|source| daemon_io("remove stale socket", path, source))
+}
+
+fn peer_is_current_user(stream: &UnixStream) -> Result<bool, DaemonError> {
+    let peer = stream.peer_cred().map_err(|source| {
+        daemon_io(
+            "inspect socket peer for",
+            Path::new("accepted connection"),
+            source,
+        )
+    })?;
+    Ok(peer.uid() == current_uid()?)
+}
+
+fn daemon_io(operation: &'static str, path: &Path, source: io::Error) -> DaemonError {
+    DaemonError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn insecure(path: &Path, reason: impl Into<String>) -> DaemonError {
+    DaemonError::InsecureRuntime {
+        path: path.to_path_buf(),
+        reason: reason.into(),
+    }
+}
