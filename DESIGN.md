@@ -228,6 +228,12 @@ Each attempt stores a frozen copy of its effective command, arguments,
 environment policy, working directory, Git revision, configuration hashes,
 executor settings, resources, and result contract.
 
+Submission creates the first pending attempt atomically with its job. This is
+when the effective execution specification is frozen; the worker later starts
+that existing attempt. Direct submissions always retain their argument vector.
+Explicit shell submissions are frozen as `/bin/sh -c COMMAND` and marked as
+shell execution.
+
 ## 8. Executors
 
 ### 8.1 Direct Process
@@ -366,6 +372,13 @@ because a coding agent proposed an unvalidated patch.
 Every attempt is pinned to a Git revision or immutable source snapshot. A
 repair must not modify the shared project checkout used by other attempts.
 
+Initial submission requires a Git worktree until immutable snapshots for
+non-Git projects are implemented. Dirty worktrees are rejected unless the user
+passes an explicit allow-dirty policy. An allowed dirty submission records the
+revision, branch, repository identity, dirty state, and a digest of the observed
+worktree changes; this is an explicit reproducibility waiver rather than a claim
+that the clean revision alone identifies those bytes.
+
 Repair flow:
 
 1. Classify the failure.
@@ -433,6 +446,11 @@ Required SQLite behavior:
 
 SQLite may create `-wal` and `-shm` companion files. This remains one logical
 database.
+
+Project roots are registered canonically and idempotently. Submission order is
+global to the database so priority ties have deterministic FIFO behavior across
+projects. Project registration, job creation, the first pending attempt, and
+their initial events use atomic transactions where applicable.
 
 ## 13. Actions And Supervisor
 

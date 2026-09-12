@@ -11,7 +11,10 @@ use std::{
 };
 
 use fs2::FileExt;
-use igor_core::{Database, DatabaseOptions, IntegrityCheck, RuntimePaths};
+use igor_core::{
+    Database, DatabaseOptions, IntegrityCheck, PersistenceError, RuntimePaths, build_submission,
+    load_project_config,
+};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::{
@@ -26,8 +29,8 @@ use crate::protocol::{
     Request, RequestEnvelope, Response, ResponseEnvelope, Version,
 };
 
-const MAX_FRAME_BYTES: usize = 64 * 1024;
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Error)]
@@ -68,6 +71,10 @@ pub enum ClientError {
     DatabaseUnavailable { code: String, message: String },
     #[error("daemon request failed ({code}): {message}")]
     Internal { code: String, message: String },
+    #[error("daemon object was not found ({code}): {message}")]
+    NotFound { code: String, message: String },
+    #[error("daemon operation conflicts with existing state ({code}): {message}")]
+    Conflict { code: String, message: String },
     #[error("invalid daemon response: {0}")]
     InvalidResponse(String),
 }
@@ -105,7 +112,7 @@ impl Client {
                         path: path.clone(),
                         source,
                     })?;
-            let mut encoded = serde_json::to_vec(&RequestEnvelope::new(request))
+            let mut encoded = serde_json::to_vec(&RequestEnvelope::new(request.clone()))
                 .map_err(|error| ClientError::InvalidResponse(error.to_string()))?;
             encoded.push(b'\n');
             stream
@@ -330,7 +337,123 @@ async fn handle_request(
                 }
             }
         }
+        _request if role != DaemonRole::Worker => ResponseEnvelope::failure(
+            ProtocolError::invalid_request("operational requests must be sent to the worker"),
+        ),
+        Request::ProjectRegister { project } => match normalize_project(project) {
+            Ok(project) => match database.projects().register(&project).await {
+                Ok(project) => ResponseEnvelope::success(Response::Project(project)),
+                Err(error) => persistence_response(error),
+            },
+            Err(error) => ResponseEnvelope::failure(ProtocolError::invalid_request(error)),
+        },
+        Request::ProjectList => match database.projects().list().await {
+            Ok(projects) => ResponseEnvelope::success(Response::Projects { projects }),
+            Err(error) => persistence_response(error),
+        },
+        Request::ProjectByRoot { root } => match database.projects().by_root(&root).await {
+            Ok(project) => ResponseEnvelope::success(Response::OptionalProject { project }),
+            Err(error) => persistence_response(error),
+        },
+        Request::Submit { project_id, input } => {
+            let project = match database.projects().get(project_id).await {
+                Ok(Some(project)) => project,
+                Ok(None) => return ResponseEnvelope::failure(ProtocolError::not_found("project")),
+                Err(error) => return persistence_response(error),
+            };
+            let built = tokio::task::spawn_blocking(move || {
+                let config =
+                    load_project_config(&project.config_path).map_err(|error| error.to_string())?;
+                build_submission(&project, &config.config, *input)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+            let submission = match built {
+                Ok(Ok(submission)) => submission,
+                Ok(Err(error)) => {
+                    return ResponseEnvelope::failure(ProtocolError::invalid_request(error));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "submission builder task failed");
+                    return ResponseEnvelope::failure(ProtocolError::internal());
+                }
+            };
+            match database
+                .jobs()
+                .submit(
+                    &submission.job,
+                    &submission.attempt,
+                    submission.priority,
+                    &submission.job_event,
+                    &submission.attempt_event,
+                )
+                .await
+            {
+                Ok(job) => ResponseEnvelope::success(Response::Submitted(job)),
+                Err(error) => persistence_response(error),
+            }
+        }
+        Request::JobList { project_id } => match database.jobs().list(project_id).await {
+            Ok(jobs) => ResponseEnvelope::success(Response::Jobs { jobs }),
+            Err(error) => persistence_response(error),
+        },
+        Request::JobShow { job_id } => match database.jobs().detail(job_id).await {
+            Ok(Some(job)) => ResponseEnvelope::success(Response::Job(job)),
+            Ok(None) => ResponseEnvelope::failure(ProtocolError::not_found("job")),
+            Err(error) => persistence_response(error),
+        },
+        Request::JobEvents { job_id } => match database.jobs().get_job(job_id).await {
+            Ok(Some(_)) => match database.events().for_job(job_id).await {
+                Ok(events) => ResponseEnvelope::success(Response::Events { events }),
+                Err(error) => persistence_response(error),
+            },
+            Ok(None) => ResponseEnvelope::failure(ProtocolError::not_found("job")),
+            Err(error) => persistence_response(error),
+        },
     }
+}
+
+fn normalize_project(mut project: igor_core::Project) -> Result<igor_core::Project, String> {
+    project.root = project
+        .root
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize project root: {error}"))?;
+    let expected = project.root.join(".igor/project.toml");
+    for path in [project.root.join(".igor"), expected.clone()] {
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("{} must not be a symbolic link", path.display()));
+        }
+    }
+    project.config_path = project
+        .config_path
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize project configuration: {error}"))?;
+    let expected = expected
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize expected project configuration: {error}"))?;
+    if project.config_path != expected {
+        return Err("project configuration must be PROJECT_ROOT/.igor/project.toml".into());
+    }
+    load_project_config(&project.config_path).map_err(|error| error.to_string())?;
+    Ok(project)
+}
+
+fn persistence_response(error: PersistenceError) -> ResponseEnvelope {
+    let protocol = match error {
+        PersistenceError::NotFound { entity } => ProtocolError::not_found(entity),
+        PersistenceError::Conflict { entity } => ProtocolError::conflict(entity),
+        PersistenceError::Domain(error) => ProtocolError::invalid_request(error.to_string()),
+        PersistenceError::InvalidValue { entity, value } => {
+            ProtocolError::invalid_request(format!("invalid {entity}: {value}"))
+        }
+        error => {
+            tracing::error!(%error, "daemon persistence request failed");
+            ProtocolError::internal()
+        }
+    };
+    ResponseEnvelope::failure(protocol)
 }
 
 fn decode_request(frame: &[u8]) -> Result<Request, ProtocolError> {
@@ -396,6 +519,14 @@ fn client_protocol_error(error: ProtocolError) -> ClientError {
             code: error.code,
             message: error.message,
         },
+        ProtocolErrorKind::NotFound => ClientError::NotFound {
+            code: error.code,
+            message: error.message,
+        },
+        ProtocolErrorKind::Conflict => ClientError::Conflict {
+            code: error.code,
+            message: error.message,
+        },
     }
 }
 
@@ -408,6 +539,13 @@ fn validate_response(
         (Request::Health, Response::Health(value)) => value.role == role,
         (Request::Version, Response::Version(value)) => value.role == role,
         (Request::DatabaseStatus, Response::DatabaseStatus(value)) => value.role == role,
+        (Request::ProjectRegister { .. }, Response::Project(_))
+        | (Request::ProjectList, Response::Projects { .. })
+        | (Request::ProjectByRoot { .. }, Response::OptionalProject { .. })
+        | (Request::Submit { .. }, Response::Submitted(_))
+        | (Request::JobList { .. }, Response::Jobs { .. })
+        | (Request::JobShow { .. }, Response::Job(_))
+        | (Request::JobEvents { .. }, Response::Events { .. }) => role == DaemonRole::Worker,
         _ => false,
     };
     if valid {
@@ -611,5 +749,38 @@ fn insecure(path: &Path, reason: impl Into<String>) -> DaemonError {
     DaemonError::InsecureRuntime {
         path: path.to_path_buf(),
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use igor_core::{Project, ProjectId, initialize_project};
+
+    use super::*;
+
+    #[test]
+    fn project_registration_rejects_symlinked_configuration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("project");
+        initialize_project(&root, false)?;
+        let external = temporary.path().join("external.toml");
+        fs::write(&external, "schema_version = 1\n")?;
+        let config_path = root.join(".igor/project.toml");
+        fs::remove_file(&config_path)?;
+        symlink(&external, &config_path)?;
+        let result = normalize_project(Project {
+            id: ProjectId::new(),
+            name: "project".into(),
+            root,
+            config_path,
+        });
+        let Err(error) = result else {
+            return Err(std::io::Error::other("symlinked configuration was accepted").into());
+        };
+        assert!(error.contains("symbolic link"));
+        Ok(())
     }
 }

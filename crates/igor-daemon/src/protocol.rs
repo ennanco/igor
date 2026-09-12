@@ -1,9 +1,11 @@
 use std::{fmt, path::Path};
 
-use igor_core::RuntimePaths;
+use igor_core::{
+    JobDetail, JobId, Project, ProjectId, RuntimePaths, StoredEvent, StoredJob, SubmissionInput,
+};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,12 +55,32 @@ impl RequestEnvelope {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Health,
     Version,
     DatabaseStatus,
+    ProjectRegister {
+        project: Project,
+    },
+    ProjectList,
+    ProjectByRoot {
+        root: std::path::PathBuf,
+    },
+    Submit {
+        project_id: ProjectId,
+        input: Box<SubmissionInput>,
+    },
+    JobList {
+        project_id: Option<ProjectId>,
+    },
+    JobShow {
+        job_id: JobId,
+    },
+    JobEvents {
+        job_id: JobId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,6 +119,13 @@ pub enum Response {
     Health(Health),
     Version(Version),
     DatabaseStatus(DatabaseStatus),
+    Project(Project),
+    Projects { projects: Vec<Project> },
+    OptionalProject { project: Option<Project> },
+    Submitted(StoredJob),
+    Jobs { jobs: Vec<StoredJob> },
+    Job(JobDetail),
+    Events { events: Vec<StoredEvent> },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -130,6 +159,8 @@ pub enum ProtocolErrorKind {
     InvalidRequest,
     FrameTooLarge,
     DatabaseUnavailable,
+    NotFound,
+    Conflict,
     Internal,
 }
 
@@ -175,7 +206,7 @@ impl ProtocolError {
         Self {
             code: "IGOR-PROTO-003".into(),
             kind: ProtocolErrorKind::FrameTooLarge,
-            message: "request frame exceeds 65536 bytes".into(),
+            message: "request frame exceeds 1048576 bytes".into(),
             found_version: None,
             supported_version: None,
         }
@@ -198,6 +229,28 @@ impl ProtocolError {
             code: "IGOR-DAEMON-002".into(),
             kind: ProtocolErrorKind::Internal,
             message: "daemon request failed".into(),
+            found_version: None,
+            supported_version: None,
+        }
+    }
+
+    #[must_use]
+    pub fn not_found(entity: &str) -> Self {
+        Self {
+            code: "IGOR-API-001".into(),
+            kind: ProtocolErrorKind::NotFound,
+            message: format!("{entity} was not found"),
+            found_version: None,
+            supported_version: None,
+        }
+    }
+
+    #[must_use]
+    pub fn conflict(entity: &str) -> Self {
+        Self {
+            code: "IGOR-API-002".into(),
+            kind: ProtocolErrorKind::Conflict,
+            message: format!("{entity} conflicts with existing state"),
             found_version: None,
             supported_version: None,
         }

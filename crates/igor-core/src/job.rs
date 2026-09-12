@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -82,16 +84,20 @@ impl JobSpec {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "identity", rename_all = "snake_case")]
 pub enum SourceIdentity {
+    Git(GitIdentity),
     GitRevision(String),
     SnapshotDigest(String),
 }
 
 impl SourceIdentity {
     fn validate(&self) -> Result<()> {
-        let value = match self {
-            Self::GitRevision(value) | Self::SnapshotDigest(value) => value,
+        let valid = match self {
+            Self::Git(identity) => {
+                !identity.repository.trim().is_empty() && !identity.revision.trim().is_empty()
+            }
+            Self::GitRevision(value) | Self::SnapshotDigest(value) => !value.trim().is_empty(),
         };
-        if value.trim().is_empty() {
+        if !valid {
             return Err(DomainError::validation(
                 ErrorCode::InvalidAttempt,
                 "attempt.source",
@@ -103,9 +109,38 @@ impl SourceIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitIdentity {
+    pub repository: String,
+    pub root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub revision: String,
+    pub dirty: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_digest: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentRole {
+    ScientificConfiguration,
+    ImmutableInput,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContentIdentity {
+    pub path: PathBuf,
+    pub role: ContentRole,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConfigurationIdentity {
     pub project_digest: String,
     pub job_digest: String,
+    #[serde(default)]
+    pub contents: Vec<ContentIdentity>,
 }
 
 impl ConfigurationIdentity {

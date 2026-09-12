@@ -27,6 +27,7 @@ pub enum NamedResourceMode {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NamedResourceRequest {
     pub name: String,
     pub mode: NamedResourceMode,

@@ -73,10 +73,11 @@ fn attempt(job: &JobSpec, sequence: u32) -> Result<AttemptSpec, Box<dyn Error>> 
         AttemptId::new(),
         sequence,
         job,
-        SourceIdentity::GitRevision("0123456789abcdef".into()),
+        SourceIdentity::SnapshotDigest("0123456789abcdef".into()),
         ConfigurationIdentity {
             project_digest: "sha256:project".into(),
             job_digest: "sha256:job".into(),
+            contents: Vec::new(),
         },
         ResultContract {
             schema_version: 1,
@@ -94,7 +95,6 @@ async fn insert_project_job(database: &Database) -> Result<(Project, JobSpec), B
         .insert_job_with_event(
             &job,
             10,
-            1,
             &event(EventKind::JobSubmitted, json!({"source": "test"}))?,
         )
         .await?;
@@ -116,6 +116,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "generations",
         "jobs",
         "metrics",
+        "project_aliases",
         "projects",
         "recoveries",
         "report_runs",
@@ -170,7 +171,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(ledger.len(), 3);
+    assert_eq!(ledger.len(), 4);
     for (index, row) in ledger.iter().enumerate() {
         assert_eq!(row.get::<i64, _>("version"), (index + 1) as i64);
         assert!(row.get::<bool, _>("success"));
@@ -194,11 +195,20 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
     fixture.run(&pool).await?;
     sqlx::query("INSERT INTO projects (id, name, root_path, config_path) VALUES ('00000000-0000-0000-0000-000000000001', 'fixture', '/fixture', '/fixture/config')")
         .execute(&pool).await?;
+    sqlx::query("INSERT INTO projects (id, name, root_path, config_path) VALUES ('00000000-0000-0000-0000-000000000006', 'legacy-duplicate', '/fixture', '/fixture/config')")
+        .execute(&pool).await?;
     sqlx::query("INSERT INTO families (id, project_id, name) VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'fixture-family')")
         .execute(&pool).await?;
     sqlx::query("INSERT INTO generations (id, family_id, project_id, generation_number, source_revision, protocol_digest, spec_json) VALUES ('00000000-0000-0000-0000-000000000003', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 1, 'revision', 'digest', '{}')")
         .execute(&pool).await?;
     sqlx::query("INSERT INTO jobs (id, project_id, family_id, generation_id, name, state, submission_order, spec_json) VALUES ('00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000003', 'fixture-job', 'queued', 1, '{}')")
+        .execute(&pool).await?;
+    sqlx::query(
+        "UPDATE jobs SET submission_order = -2 WHERE id = '00000000-0000-0000-0000-000000000004'",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO jobs (id, project_id, name, state, submission_order, spec_json) VALUES ('00000000-0000-0000-0000-000000000008', '00000000-0000-0000-0000-000000000001', 'later-fixture-job', 'queued', -1, '{}')")
         .execute(&pool).await?;
     sqlx::query("INSERT INTO attempts (id, job_id, project_id, sequence, state, spec_json) VALUES ('00000000-0000-0000-0000-000000000005', '00000000-0000-0000-0000-000000000004', '00000000-0000-0000-0000-000000000001', 1, 'pending', '{}')")
         .execute(&pool).await?;
@@ -209,7 +219,7 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
             .fetch_all(database.pool())
             .await?;
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
     let checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
             .fetch_one(database.pool())
@@ -225,6 +235,34 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
     .fetch_all(database.pool())
     .await?;
     assert_eq!(names, vec!["fixture"]);
+    let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM projects")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(projects, 2);
+    let paths: Vec<(String, String)> =
+        sqlx::query_as("SELECT root_path, config_path FROM projects ORDER BY created_at, id")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(paths[0], ("/fixture".into(), "/fixture/config".into()));
+    assert_eq!(paths[1], ("/fixture".into(), "/fixture/config".into()));
+    let aliases: i64 = sqlx::query_scalar("SELECT count(*) FROM project_aliases")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(aliases, 1);
+    let duplicate_root = sqlx::query("INSERT INTO projects (id, name, root_path, config_path) VALUES ('00000000-0000-0000-0000-000000000007', 'duplicate-root', '/fixture', '/other/config')")
+        .execute(database.pool())
+        .await;
+    assert!(duplicate_root.is_err());
+    let job_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM jobs ORDER BY submission_order")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        job_ids,
+        [
+            "00000000-0000-0000-0000-000000000004",
+            "00000000-0000-0000-0000-000000000008"
+        ]
+    );
     Ok(())
 }
 
@@ -455,7 +493,6 @@ async fn concurrent_claims_and_resource_ownership_are_exclusive() -> TestResult 
         .insert_job_with_event(
             &resource_job,
             10,
-            2,
             &event(EventKind::JobSubmitted, json!({"source": "test"}))?,
         )
         .await?;
@@ -581,13 +618,14 @@ async fn composite_foreign_keys_reject_cross_project_and_event_mismatches() -> T
             .insert_job_with_event(
                 &wrong_generation_job,
                 0,
-                2,
                 &event(EventKind::JobSubmitted, json!({}))?,
             )
             .await
             .is_err()
     );
-    let second_project = project();
+    let mut second_project = project();
+    second_project.root = PathBuf::from("/tmp/research-second");
+    second_project.config_path = PathBuf::from("/tmp/research-second/.igor/project.toml");
     database.projects().insert(&second_project).await?;
     let second_family = Family {
         id: FamilyId::new(),
@@ -622,7 +660,6 @@ async fn composite_foreign_keys_reject_cross_project_and_event_mismatches() -> T
             .insert_job_with_event(
                 &mismatched_job,
                 0,
-                2,
                 &event(EventKind::JobSubmitted, json!({}))?,
             )
             .await
@@ -632,12 +669,7 @@ async fn composite_foreign_keys_reject_cross_project_and_event_mismatches() -> T
     let second_job = job(second_project.id);
     database
         .jobs()
-        .insert_job_with_event(
-            &second_job,
-            0,
-            1,
-            &event(EventKind::JobSubmitted, json!({}))?,
-        )
+        .insert_job_with_event(&second_job, 0, &event(EventKind::JobSubmitted, json!({}))?)
         .await?;
     let second_attempt = attempt(&second_job, 1)?;
     database
@@ -653,7 +685,6 @@ async fn composite_foreign_keys_reject_cross_project_and_event_mismatches() -> T
         .insert_job_with_event(
             &other_first_job,
             0,
-            2,
             &event(EventKind::JobSubmitted, json!({}))?,
         )
         .await?;
@@ -710,7 +741,6 @@ async fn shared_resource_leases_respect_total_capacity() -> TestResult {
         .insert_job_with_event(
             &second_job,
             10,
-            2,
             &event(EventKind::JobSubmitted, json!({"source": "test"}))?,
         )
         .await?;
@@ -720,7 +750,6 @@ async fn shared_resource_leases_respect_total_capacity() -> TestResult {
         .insert_job_with_event(
             &third_job,
             10,
-            3,
             &event(EventKind::JobSubmitted, json!({"source": "test"}))?,
         )
         .await?;
@@ -812,7 +841,7 @@ async fn failed_creation_event_rolls_back_job_and_attempt() -> TestResult {
     assert!(
         database
             .jobs()
-            .insert_job_with_event(&job, 10, 1, &event(EventKind::JobSubmitted, json!({}))?,)
+            .insert_job_with_event(&job, 10, &event(EventKind::JobSubmitted, json!({}))?)
             .await
             .is_err()
     );
@@ -827,7 +856,7 @@ async fn failed_creation_event_rolls_back_job_and_attempt() -> TestResult {
         .await?;
     database
         .jobs()
-        .insert_job_with_event(&job, 10, 1, &event(EventKind::JobSubmitted, json!({}))?)
+        .insert_job_with_event(&job, 10, &event(EventKind::JobSubmitted, json!({}))?)
         .await?;
     let attempt = attempt(&job, 1)?;
     sqlx::query("CREATE TRIGGER reject_attempt_creation BEFORE INSERT ON events WHEN NEW.kind = 'attempt_created' BEGIN SELECT RAISE(ABORT, 'injected attempt creation event failure'); END")
@@ -1084,7 +1113,8 @@ async fn online_backup_during_writes_restores_cleanly() -> TestResult {
                     sequence += 1;
                     let project = Project {
                         id: ProjectId::new(), name: format!("project-{sequence}"),
-                        root: PathBuf::from("/tmp"), config_path: PathBuf::from("/tmp/config"),
+                        root: PathBuf::from(format!("/tmp/project-{sequence}")),
+                        config_path: PathBuf::from(format!("/tmp/project-{sequence}/config")),
                     };
                     writer.projects().insert(&project).await
                 } => {
@@ -1122,6 +1152,176 @@ async fn online_backup_during_writes_restores_cleanly() -> TestResult {
             .filter_map(Result::ok)
             .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn project_registration_is_idempotent_and_listed() -> TestResult {
+    let (_directory, database) = database().await?;
+    let first = project();
+    let registered = database.projects().register(&first).await?;
+    let mut duplicate = first.clone();
+    duplicate.id = ProjectId::new();
+    duplicate.name = "renamed request".into();
+    let repeated = database.projects().register(&duplicate).await?;
+    assert_eq!(registered, repeated);
+    assert_eq!(database.projects().by_root(&first.root).await?, Some(first));
+    assert_eq!(database.projects().list().await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn persisted_legacy_git_attempt_remains_readable() -> TestResult {
+    let (_directory, database) = database().await?;
+    let (project, job) = insert_project_job(&database).await?;
+    let attempt = attempt(&job, 1)?;
+    let mut document = serde_json::to_value(&attempt)?;
+    document["source"] = json!({
+        "kind": "git_revision",
+        "identity": "0123456789abcdef"
+    });
+    sqlx::query("INSERT INTO attempts (id, job_id, project_id, sequence, state, spec_json) VALUES (?, ?, ?, 1, 'pending', ?)")
+        .bind(attempt.id().to_string())
+        .bind(job.id.to_string())
+        .bind(project.id.to_string())
+        .bind(serde_json::to_string(&document)?)
+        .execute(database.pool())
+        .await?;
+    let attempts = database.jobs().attempts_for_job(job.id).await?;
+    assert!(matches!(
+        attempts[0].spec.source(),
+        SourceIdentity::GitRevision(revision) if revision == "0123456789abcdef"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn submission_is_atomic_and_allocates_global_order() -> TestResult {
+    let (_directory, database) = database().await?;
+    let first_project = project();
+    database.projects().insert(&first_project).await?;
+    let mut second_project = project();
+    second_project.root = PathBuf::from("/tmp/second-project");
+    second_project.config_path = second_project.root.join(".igor/project.toml");
+    database.projects().insert(&second_project).await?;
+
+    let first_job = job(first_project.id);
+    let first_attempt = attempt(&first_job, 1)?;
+    let first = database
+        .jobs()
+        .submit(
+            &first_job,
+            &first_attempt,
+            9,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let second_job = job(second_project.id);
+    let second_attempt = attempt(&second_job, 1)?;
+    let second = database
+        .jobs()
+        .submit(
+            &second_job,
+            &second_attempt,
+            1,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    assert_eq!((first.submission_order, second.submission_order), (1, 2));
+    assert_eq!(database.jobs().list(None).await?.len(), 2);
+    let detail = database
+        .jobs()
+        .detail(first_job.id)
+        .await?
+        .ok_or_else(|| missing("submitted job missing"))?;
+    assert_eq!(detail.attempts.len(), 1);
+    let events = database.events().for_job(first_job.id).await?;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].job_id, Some(first_job.id));
+    assert_eq!(events[1].attempt_id, Some(first_attempt.id()));
+
+    let failed_job = job(first_project.id);
+    let failed_attempt = attempt(&failed_job, 1)?;
+    let duplicate_event = event(EventKind::JobSubmitted, json!({}))?;
+    let invalid_attempt_event = Event {
+        id: duplicate_event.id,
+        kind: EventKind::AttemptCreated,
+        payload: EventPayload::new(EventKind::AttemptCreated, 1, json!({}))?,
+    };
+    assert!(
+        database
+            .jobs()
+            .submit(
+                &failed_job,
+                &failed_attempt,
+                0,
+                &duplicate_event,
+                &invalid_attempt_event,
+            )
+            .await
+            .is_err()
+    );
+    assert!(database.jobs().get_job(failed_job.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_submissions_receive_distinct_global_order() -> TestResult {
+    let (_directory, database) = database().await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        let job = job(project.id);
+        let attempt = attempt(&job, 1)?;
+        let job_event = event(EventKind::JobSubmitted, json!({}))?;
+        let attempt_event = event(EventKind::AttemptCreated, json!({}))?;
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            database
+                .jobs()
+                .submit(&job, &attempt, 0, &job_event, &attempt_event)
+                .await
+        }));
+    }
+    barrier.wait().await;
+    let mut orders = BTreeSet::new();
+    for handle in handles {
+        orders.insert(handle.await??.submission_order);
+    }
+    assert_eq!(orders, BTreeSet::from([1, 2]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn attempt_specifications_are_immutable_in_sqlite() -> TestResult {
+    let (_directory, database) = database().await?;
+    let (project, job) = insert_project_job(&database).await?;
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .insert_attempt_with_event(&attempt, &event(EventKind::AttemptCreated, json!({}))?)
+        .await?;
+    let changed = sqlx::query("UPDATE attempts SET spec_json = '{}' WHERE id = ?")
+        .bind(attempt.id().to_string())
+        .execute(database.pool())
+        .await;
+    assert!(changed.is_err());
+    assert_eq!(
+        database
+            .jobs()
+            .get_attempt(attempt.id())
+            .await?
+            .ok_or_else(|| missing("attempt missing"))?
+            .spec,
+        attempt
+    );
+    assert_eq!(project.id, job.project_id);
     Ok(())
 }
 

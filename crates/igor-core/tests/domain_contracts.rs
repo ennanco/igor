@@ -131,10 +131,11 @@ fn persisted_models_round_trip_without_losing_arguments() -> Result<(), Box<dyn 
         AttemptId::new(),
         1,
         &job,
-        SourceIdentity::GitRevision("0123456789abcdef".into()),
+        SourceIdentity::SnapshotDigest("0123456789abcdef".into()),
         ConfigurationIdentity {
             project_digest: "sha256:project".into(),
             job_digest: "sha256:job".into(),
+            contents: Vec::new(),
         },
         ResultContract {
             schema_version: 1,
@@ -168,6 +169,19 @@ fn omitted_execution_fields_have_safe_defaults() -> Result<(), Box<dyn Error>> {
     assert_eq!(job.resources.timeout_seconds, None);
     assert_eq!(job.resources.gpu_count, 1);
     assert!(job.resources.gpu_exclusive);
+    Ok(())
+}
+
+#[test]
+fn legacy_git_revision_identity_remains_readable() -> Result<(), Box<dyn Error>> {
+    let source: SourceIdentity = serde_json::from_value(json!({
+        "kind": "git_revision",
+        "identity": "0123456789abcdef"
+    }))?;
+    assert_eq!(
+        source,
+        SourceIdentity::GitRevision("0123456789abcdef".into())
+    );
     Ok(())
 }
 

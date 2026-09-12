@@ -215,32 +215,32 @@ Dependencies: milestone 4.
 
 ### Tasks
 
-- [ ] `M5.01` Implement `igor project add PATH`.
-- [ ] `M5.02` Implement `igor project list`.
-- [ ] `M5.03` Implement generic `igor submit -- PROGRAM ARG...`.
-- [ ] `M5.04` Implement explicit `igor submit --shell COMMAND`.
-- [ ] `M5.05` Implement `igor submit --file job.toml`.
-- [ ] `M5.06` Resolve and freeze the effective job specification at submission.
-- [ ] `M5.07` Capture Git repository identity, branch, revision, and dirty state.
-- [ ] `M5.08` Hash declared scientific configurations and immutable inputs.
-- [ ] `M5.09` Require explicit policy when submitting a dirty Git worktree.
-- [ ] `M5.10` Implement priority and human-readable job names.
-- [ ] `M5.11` Implement `igor list`.
-- [ ] `M5.12` Implement `igor show JOB_ID`.
-- [ ] `M5.13` Implement `igor events JOB_ID`.
-- [ ] `M5.14` Implement `igor wait JOB_ID`.
-- [ ] `M5.15` Add `--json` to every read command.
-- [ ] `M5.16` Add CLI tests for spaces, empty arguments, Unicode, and arguments
+- [x] `M5.01` Implement `igor project add PATH`.
+- [x] `M5.02` Implement `igor project list`.
+- [x] `M5.03` Implement generic `igor submit -- PROGRAM ARG...`.
+- [x] `M5.04` Implement explicit `igor submit --shell COMMAND`.
+- [x] `M5.05` Implement `igor submit --file job.toml`.
+- [x] `M5.06` Resolve and freeze the effective job specification at submission.
+- [x] `M5.07` Capture Git repository identity, branch, revision, and dirty state.
+- [x] `M5.08` Hash declared scientific configurations and immutable inputs.
+- [x] `M5.09` Require explicit policy when submitting a dirty Git worktree.
+- [x] `M5.10` Implement priority and human-readable job names.
+- [x] `M5.11` Implement `igor list`.
+- [x] `M5.12` Implement `igor show JOB_ID`.
+- [x] `M5.13` Implement `igor events JOB_ID`.
+- [x] `M5.14` Implement `igor wait JOB_ID`.
+- [x] `M5.15` Add `--json` to every read command.
+- [x] `M5.16` Add CLI tests for spaces, empty arguments, Unicode, and arguments
   beginning with `-`.
-- [ ] `M5.17` Add tests proving direct submission never invokes a shell.
+- [x] `M5.17` Add tests proving direct submission never invokes a shell.
 
 ### Acceptance
 
-- [ ] `A5.01` Python, Julia, Rust, and shell examples serialize to the same
+- [x] `A5.01` Python, Julia, Rust, and shell examples serialize to the same
   language-neutral job contract.
-- [ ] `A5.02` Attempt specifications remain unchanged when project config or Git
+- [x] `A5.02` Attempt specifications remain unchanged when project config or Git
   HEAD changes after submission.
-- [ ] `A5.03` Human and JSON output expose the same state and identifiers.
+- [x] `A5.03` Human and JSON output expose the same state and identifiers.
 
 ## Milestone 6: Direct Process Worker
 
@@ -652,6 +652,8 @@ Dependencies: milestones 0-16.
 - [ ] `M17.16` Add release checks for licenses and dependency advisories.
 - [ ] `M17.17` Run all quality gates and opt-in integration suites on a clean
   machine or VM.
+- [ ] `M17.18` Paginate job and event history responses before supporting queues
+  whose serialized history can exceed the local protocol frame limit.
 
 ### Acceptance
 

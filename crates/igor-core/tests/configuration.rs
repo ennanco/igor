@@ -175,6 +175,26 @@ fn relative_paths_are_normalized_and_cannot_escape() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn provenance_paths_are_resolved_against_the_project() -> Result<(), Box<dyn Error>> {
+    let temporary = TempDir::new()?;
+    let config = temporary.path().join(".igor/project.toml");
+    write(
+        &config,
+        "schema_version = 1\n[provenance]\nscientific_configurations = ['configs/science.json']\nimmutable_inputs = ['inputs/split.json']\n",
+    )?;
+    let loaded = load_project_config(&config)?;
+    assert_eq!(
+        loaded.config.provenance.scientific_configurations,
+        [temporary.path().join("configs/science.json")]
+    );
+    assert_eq!(
+        loaded.config.provenance.immutable_inputs,
+        [temporary.path().join("inputs/split.json")]
+    );
+    Ok(())
+}
+
+#[test]
 fn diagnostics_identify_file_field_version_and_enum() -> Result<(), Box<dyn Error>> {
     let temporary = TempDir::new()?;
     let config = temporary.path().join(".igor/project.toml");

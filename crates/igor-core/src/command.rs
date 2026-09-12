@@ -22,7 +22,7 @@ pub enum EnvironmentInheritance {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EnvironmentPolicy {
     pub set: BTreeMap<String, String>,
     pub remove: Vec<String>,

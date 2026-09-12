@@ -345,6 +345,27 @@ pub fn load_project_config(path: &Path) -> Result<LoadedProjectConfig, ConfigErr
         &project_root,
         &config.report.prompt_file,
     )?;
+    for (index, declared_path) in config
+        .provenance
+        .scientific_configurations
+        .iter_mut()
+        .enumerate()
+    {
+        *declared_path = resolve_project_path(
+            path,
+            &format!("provenance.scientific_configurations[{index}]"),
+            &project_root,
+            declared_path,
+        )?;
+    }
+    for (index, declared_path) in config.provenance.immutable_inputs.iter_mut().enumerate() {
+        *declared_path = resolve_project_path(
+            path,
+            &format!("provenance.immutable_inputs[{index}]"),
+            &project_root,
+            declared_path,
+        )?;
+    }
     Ok(LoadedProjectConfig {
         config_file: path.to_path_buf(),
         project_root,

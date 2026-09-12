@@ -13,6 +13,10 @@ gpu_exclusive = true
 artifact_root = "artifacts"
 cleanup_roots = ["artifacts"]
 
+[provenance]
+scientific_configurations = []
+immutable_inputs = []
+
 [report]
 enabled = true
 trigger = "family-completed"

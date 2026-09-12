@@ -92,12 +92,12 @@ async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box
         ));
         assert!(matches!(
             client.request(role, Request::Version).await?,
-            Response::Version(version) if version.role == role && version.protocol == 1
+            Response::Version(version) if version.role == role && version.protocol == 2
         ));
         assert!(matches!(
             client.request(role, Request::DatabaseStatus).await?,
             Response::DatabaseStatus(status)
-                if status.role == role && status.schema_version == 3 && status.integrity == "ok"
+                if status.role == role && status.schema_version == 4 && status.integrity == "ok"
         ));
     }
     assert_eq!(
@@ -225,7 +225,7 @@ async fn client_rejects_response_from_the_wrong_role() -> Result<(), Box<dyn Err
             let mut request = String::new();
             let _ = BufReader::new(&stream).read_line(&mut request);
             let _ = stream.write_all(
-                b"{\"protocol_version\":1,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
+                b"{\"protocol_version\":2,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
             );
         }
     });
@@ -236,6 +236,23 @@ async fn client_rejects_response_from_the_wrong_role() -> Result<(), Box<dyn Err
         .ok_or("client accepted the wrong daemon role")?;
     assert!(matches!(error, ClientError::InvalidResponse(_)));
     server.join().map_err(|_| "fake server thread panicked")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn supervisor_rejects_worker_operations() -> Result<(), Box<dyn Error>> {
+    let temporary = TempDir::new()?;
+    let paths = paths(temporary.path());
+    let (stop, supervisor) = spawn_daemon(DaemonRole::Supervisor, paths.clone());
+    wait_for_health(&Client::new(&paths), DaemonRole::Supervisor).await?;
+    let error = Client::new(&paths)
+        .request(DaemonRole::Supervisor, Request::ProjectList)
+        .await
+        .err()
+        .ok_or("supervisor accepted a worker operation")?;
+    assert!(matches!(error, ClientError::InvalidRequest { .. }));
+    let _ = stop.send(());
+    supervisor.await??;
     Ok(())
 }
 

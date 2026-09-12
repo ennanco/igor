@@ -74,6 +74,13 @@ pub struct ProjectPaths {
     pub cleanup_roots: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProvenanceConfig {
+    pub scientific_configurations: Vec<PathBuf>,
+    pub immutable_inputs: Vec<PathBuf>,
+}
+
 impl Default for ProjectPaths {
     fn default() -> Self {
         Self {
@@ -113,6 +120,7 @@ pub struct ProjectConfig {
     pub resources: ResourceRequest,
     pub paths: ProjectPaths,
     pub report: ReportConfig,
+    pub provenance: ProvenanceConfig,
     pub attempt_retry: AttemptRetryPolicy,
     pub action_retry: ActionRetryPolicy,
     pub delivery_retry: DeliveryRetryPolicy,
@@ -129,6 +137,8 @@ struct ProjectConfigDocument {
     #[serde(default)]
     report: ReportConfig,
     #[serde(default)]
+    provenance: ProvenanceConfig,
+    #[serde(default)]
     attempt_retry: AttemptRetryPolicy,
     #[serde(default)]
     action_retry: ActionRetryPolicy,
@@ -143,6 +153,7 @@ impl Default for ProjectConfigDocument {
             resources: ResourceRequest::default(),
             paths: ProjectPaths::default(),
             report: ReportConfig::default(),
+            provenance: ProvenanceConfig::default(),
             attempt_retry: AttemptRetryPolicy::default(),
             action_retry: ActionRetryPolicy::default(),
             delivery_retry: DeliveryRetryPolicy::default(),
@@ -195,6 +206,7 @@ impl ProjectConfig {
             resources: document.resources,
             paths: document.paths,
             report: document.report,
+            provenance: document.provenance,
             attempt_retry: document.attempt_retry,
             action_retry: document.action_retry,
             delivery_retry: document.delivery_retry,

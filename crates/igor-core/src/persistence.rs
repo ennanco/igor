@@ -419,25 +419,40 @@ pub struct Generation {
     pub spec: Value,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct StoredJob {
     pub spec: JobSpec,
     pub state: JobState,
     pub priority: i64,
     pub submission_order: i64,
+    pub submitted_at: String,
+    pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct StoredAttempt {
     pub spec: AttemptSpec,
     pub state: AttemptState,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct StoredEvent {
     pub sequence: i64,
+    pub project_id: ProjectId,
+    pub job_id: Option<JobId>,
+    pub attempt_id: Option<AttemptId>,
     pub event: Event,
     pub occurred_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct JobDetail {
+    pub job: StoredJob,
+    pub attempts: Vec<StoredAttempt>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -495,6 +510,78 @@ pub struct ProjectRepository<'a> {
 }
 
 impl ProjectRepository<'_> {
+    pub async fn register(&self, project: &Project) -> PersistenceResult<Project> {
+        project.validate()?;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin project registration", source))?;
+        let conflict: Option<String> = sqlx::query_scalar(
+            "SELECT root_path FROM projects WHERE config_path = ? AND root_path != ? AND is_alias = 0 LIMIT 1",
+        )
+        .bind(project.config_path.to_string_lossy().as_ref())
+        .bind(project.root.to_string_lossy().as_ref())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("check project registration", source))?;
+        if conflict.is_some() {
+            return Err(PersistenceError::Conflict { entity: "project" });
+        }
+        sqlx::query(
+            "INSERT INTO projects (id, name, root_path, config_path)
+             SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM projects WHERE root_path = ? AND is_alias = 0)",
+        )
+        .bind(project.id.to_string())
+        .bind(&project.name)
+        .bind(project.root.to_string_lossy().as_ref())
+        .bind(project.config_path.to_string_lossy().as_ref())
+        .bind(project.root.to_string_lossy().as_ref())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("register project", source))?;
+        let row = sqlx::query(
+            "SELECT id, name, root_path, config_path FROM projects WHERE root_path = ? AND is_alias = 0",
+        )
+        .bind(project.root.to_string_lossy().as_ref())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|source| db("read registered project", source))?;
+        let registered = decode_project(row)?;
+        if registered.config_path != project.config_path {
+            return Err(PersistenceError::Conflict { entity: "project" });
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit project registration", source))?;
+        Ok(registered)
+    }
+
+    pub async fn by_root(&self, root: &Path) -> PersistenceResult<Option<Project>> {
+        let row = sqlx::query(
+            "SELECT id, name, root_path, config_path FROM projects WHERE root_path = ? AND is_alias = 0",
+        )
+        .bind(root.to_string_lossy().as_ref())
+        .fetch_optional(&self.database.pool)
+        .await
+        .map_err(|source| db("get project by root", source))?;
+        row.map(decode_project).transpose()
+    }
+
+    pub async fn list(&self) -> PersistenceResult<Vec<Project>> {
+        let rows = sqlx::query(
+            "SELECT id, name, root_path, config_path FROM projects
+             WHERE is_alias = 0
+             ORDER BY name, id",
+        )
+        .fetch_all(&self.database.pool)
+        .await
+        .map_err(|source| db("list projects", source))?;
+        rows.into_iter().map(decode_project).collect()
+    }
+
     pub async fn insert(&self, project: &Project) -> PersistenceResult<()> {
         project.validate()?;
         sqlx::query("INSERT INTO projects (id, name, root_path, config_path) VALUES (?, ?, ?, ?)")
@@ -514,15 +601,7 @@ impl ProjectRepository<'_> {
             .fetch_optional(&self.database.pool)
             .await
             .map_err(|source| db("get project", source))?;
-        row.map(|row| {
-            Ok(Project {
-                id: parse_id(row.get("id"), "project")?,
-                name: row.get("name"),
-                root: PathBuf::from(row.get::<String, _>("root_path")),
-                config_path: PathBuf::from(row.get::<String, _>("config_path")),
-            })
-        })
-        .transpose()
+        row.map(decode_project).transpose()
     }
 
     pub async fn update(&self, project: &Project) -> PersistenceResult<()> {
@@ -632,11 +711,104 @@ pub struct JobAttemptRepository<'a> {
 }
 
 impl JobAttemptRepository<'_> {
+    pub async fn submit(
+        &self,
+        job: &JobSpec,
+        attempt: &AttemptSpec,
+        priority: i64,
+        job_event: &Event,
+        attempt_event: &Event,
+    ) -> PersistenceResult<StoredJob> {
+        job.validate()?;
+        attempt.validate()?;
+        if attempt.job_id() != job.id
+            || attempt.sequence() != 1
+            || attempt.command() != &job.command
+            || attempt.executor() != &job.executor
+            || attempt.resources() != &job.resources
+            || attempt.family() != job.family.as_ref()
+        {
+            return Err(PersistenceError::InvalidValue {
+                entity: "initial attempt",
+                value: format!("job {}, sequence {}", attempt.job_id(), attempt.sequence()),
+            });
+        }
+        require_event_kind(
+            job_event,
+            EventKind::JobSubmitted,
+            "job creation event kind",
+        )?;
+        require_event_kind(
+            attempt_event,
+            EventKind::AttemptCreated,
+            "attempt creation event kind",
+        )?;
+        let (family_id, generation_id) = job.family.as_ref().map_or((None, None), |family| {
+            (
+                Some(family.family_id.to_string()),
+                Some(family.generation.id.to_string()),
+            )
+        });
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin submission", source))?;
+        sqlx::query(
+            "INSERT INTO jobs (id, project_id, family_id, generation_id, name, state, priority, submission_order, spec_json)
+             VALUES (?, ?, ?, ?, ?, 'queued', ?, (SELECT COALESCE(MAX(submission_order), 0) + 1 FROM jobs), ?)",
+        )
+        .bind(job.id.to_string())
+        .bind(job.project_id.to_string())
+        .bind(family_id)
+        .bind(generation_id)
+        .bind(&job.name)
+        .bind(priority)
+        .bind(json(job, "job spec")?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("insert submitted job", source))?;
+        insert_event(
+            &mut transaction,
+            job.project_id,
+            Some(job.id),
+            None,
+            job_event,
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO attempts (id, job_id, project_id, sequence, state, spec_json)
+             VALUES (?, ?, ?, 1, 'pending', ?)",
+        )
+        .bind(attempt.id().to_string())
+        .bind(job.id.to_string())
+        .bind(job.project_id.to_string())
+        .bind(json(attempt, "attempt spec")?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("insert initial attempt", source))?;
+        insert_event(
+            &mut transaction,
+            job.project_id,
+            Some(job.id),
+            Some(attempt.id()),
+            attempt_event,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit submission", source))?;
+        self.get_job(job.id)
+            .await?
+            .ok_or(PersistenceError::NotFound { entity: "job" })
+    }
+
     pub async fn insert_job_with_event(
         &self,
         job: &JobSpec,
         priority: i64,
-        submission_order: i64,
         event: &Event,
     ) -> PersistenceResult<()> {
         job.validate()?;
@@ -654,14 +826,13 @@ impl JobAttemptRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin job creation", source))?;
-        sqlx::query("INSERT INTO jobs (id, project_id, family_id, generation_id, name, state, priority, submission_order, spec_json) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)")
+        sqlx::query("INSERT INTO jobs (id, project_id, family_id, generation_id, name, state, priority, submission_order, spec_json) VALUES (?, ?, ?, ?, ?, 'queued', ?, (SELECT COALESCE(MAX(submission_order), 0) + 1 FROM jobs), ?)")
             .bind(job.id.to_string())
             .bind(job.project_id.to_string())
             .bind(family_id)
             .bind(generation_id)
             .bind(&job.name)
             .bind(priority)
-            .bind(submission_order)
             .bind(spec)
             .execute(&mut *transaction)
             .await
@@ -676,13 +847,49 @@ impl JobAttemptRepository<'_> {
 
     pub async fn get_job(&self, id: JobId) -> PersistenceResult<Option<StoredJob>> {
         let row = sqlx::query(
-            "SELECT spec_json, state, priority, submission_order FROM jobs WHERE id = ?",
+            "SELECT spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.database.pool)
         .await
         .map_err(|source| db("get job", source))?;
         row.map(decode_job).transpose()
+    }
+
+    pub async fn list(&self, project_id: Option<ProjectId>) -> PersistenceResult<Vec<StoredJob>> {
+        let rows = match project_id {
+            Some(project_id) => {
+                sqlx::query("SELECT spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE project_id = ? OR project_id IN (SELECT project_id FROM project_aliases WHERE canonical_project_id = ?) ORDER BY submission_order DESC")
+                    .bind(project_id.to_string())
+                    .bind(project_id.to_string())
+                    .fetch_all(&self.database.pool)
+                    .await
+            }
+            None => sqlx::query("SELECT spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs ORDER BY submission_order DESC")
+                .fetch_all(&self.database.pool)
+                .await,
+        }
+        .map_err(|source| db("list jobs", source))?;
+        rows.into_iter().map(decode_job).collect()
+    }
+
+    pub async fn attempts_for_job(&self, job_id: JobId) -> PersistenceResult<Vec<StoredAttempt>> {
+        let rows = sqlx::query("SELECT spec_json, state, created_at, started_at, finished_at, updated_at FROM attempts WHERE job_id = ? ORDER BY sequence")
+            .bind(job_id.to_string())
+            .fetch_all(&self.database.pool)
+            .await
+            .map_err(|source| db("list job attempts", source))?;
+        rows.into_iter().map(decode_attempt).collect()
+    }
+
+    pub async fn detail(&self, job_id: JobId) -> PersistenceResult<Option<JobDetail>> {
+        let Some(job) = self.get_job(job_id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(JobDetail {
+            job,
+            attempts: self.attempts_for_job(job_id).await?,
+        }))
     }
 
     pub async fn claim_queued(
@@ -796,18 +1003,12 @@ impl JobAttemptRepository<'_> {
     }
 
     pub async fn get_attempt(&self, id: AttemptId) -> PersistenceResult<Option<StoredAttempt>> {
-        let row = sqlx::query("SELECT spec_json, state FROM attempts WHERE id = ?")
+        let row = sqlx::query("SELECT spec_json, state, created_at, started_at, finished_at, updated_at FROM attempts WHERE id = ?")
             .bind(id.to_string())
             .fetch_optional(&self.database.pool)
             .await
             .map_err(|source| db("get attempt", source))?;
-        row.map(|row| {
-            Ok(StoredAttempt {
-                spec: from_json(row.get("spec_json"), "attempt spec")?,
-                state: parse_attempt_state(row.get("state"))?,
-            })
-        })
-        .transpose()
+        row.map(decode_attempt).transpose()
     }
 
     pub async fn transition_job(
@@ -989,6 +1190,28 @@ fn decode_job(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<StoredJob> {
         state: parse_job_state(row.get("state"))?,
         priority: row.get("priority"),
         submission_order: row.get("submission_order"),
+        submitted_at: row.get("submitted_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_attempt(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<StoredAttempt> {
+    Ok(StoredAttempt {
+        spec: from_json(row.get("spec_json"), "attempt spec")?,
+        state: parse_attempt_state(row.get("state"))?,
+        created_at: row.get("created_at"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_project(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<Project> {
+    Ok(Project {
+        id: parse_id(row.get("id"), "project")?,
+        name: row.get("name"),
+        root: PathBuf::from(row.get::<String, _>("root_path")),
+        config_path: PathBuf::from(row.get::<String, _>("config_path")),
     })
 }
 
@@ -1019,7 +1242,7 @@ impl EventRepository<'_> {
     }
 
     pub async fn for_job(&self, job_id: JobId) -> PersistenceResult<Vec<StoredEvent>> {
-        let rows = sqlx::query("SELECT sequence, id, kind, payload_json, occurred_at FROM events WHERE job_id = ? ORDER BY sequence")
+        let rows = sqlx::query("SELECT sequence, id, project_id, job_id, attempt_id, kind, payload_json, occurred_at FROM events WHERE job_id = ? ORDER BY sequence")
             .bind(job_id.to_string())
             .fetch_all(&self.database.pool)
             .await
@@ -1053,6 +1276,15 @@ fn decode_event(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<StoredEvent> 
     let payload: EventPayload = from_json(row.get("payload_json"), "event payload")?;
     Ok(StoredEvent {
         sequence: row.get("sequence"),
+        project_id: parse_id(row.get("project_id"), "event project")?,
+        job_id: row
+            .get::<Option<String>, _>("job_id")
+            .map(|value| parse_id(&value, "event job"))
+            .transpose()?,
+        attempt_id: row
+            .get::<Option<String>, _>("attempt_id")
+            .map(|value| parse_id(&value, "event attempt"))
+            .transpose()?,
         event: Event::new(parse_id(row.get("id"), "event")?, kind, payload)?,
         occurred_at: row.get("occurred_at"),
     })

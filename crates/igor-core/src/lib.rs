@@ -13,6 +13,7 @@ mod project;
 mod resource;
 mod retry;
 mod state;
+mod submission;
 pub mod telemetry;
 
 pub use artifact::{ArtifactRole, RetentionDecision};
@@ -35,19 +36,19 @@ pub use id::{
     ProjectId, RecoveryId, ReportId, ResourceId,
 };
 pub use job::{
-    AttemptSpec, ConfigurationIdentity, FamilyMembership, GenerationIdentity, JobSpec,
-    ResultContract, Seed, SourceIdentity,
+    AttemptSpec, ConfigurationIdentity, ContentIdentity, ContentRole, FamilyMembership,
+    GenerationIdentity, GitIdentity, JobSpec, ResultContract, Seed, SourceIdentity,
 };
 pub use persistence::{
     ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, Database,
     DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, Family,
-    FamilyGenerationRepository, Generation, IntegrityCheck, JobAttemptRepository, PersistenceError,
-    ProjectRepository, Resource, ResourceLease, ResourceRepository, StoredAttempt, StoredEvent,
-    StoredJob,
+    FamilyGenerationRepository, Generation, IntegrityCheck, JobAttemptRepository, JobDetail,
+    PersistenceError, ProjectRepository, Resource, ResourceLease, ResourceRepository,
+    StoredAttempt, StoredEvent, StoredJob,
 };
 pub use project::{
-    PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ReportConfig, ReportGenerator,
-    ReportMode, ReportTrigger,
+    PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,
+    ReportGenerator, ReportMode, ReportTrigger,
 };
 pub use resource::{
     GpuRequest, NamedResourceMode, NamedResourceRequest, ResourceMode, ResourceRequest,
@@ -56,4 +57,8 @@ pub use retry::{ActionRetryPolicy, AttemptRetryPolicy, DeliveryRetryPolicy, Retr
 pub use state::{
     ActionState, AttemptState, CleanupState, DeliveryState, JobState, RecoveryState, ReportState,
     TransitionState,
+};
+pub use submission::{
+    JOB_FILE_VERSION, JobExecution, JobFile, Submission, SubmissionError, SubmissionInput,
+    build_submission, load_job_file,
 };

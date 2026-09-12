@@ -11,7 +11,7 @@ pub enum ProcessIsolation {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProcessExecutorSpec {
     pub isolation: ProcessIsolation,
 }
@@ -24,6 +24,7 @@ pub enum MountAccess {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DockerMount {
     pub source: PathBuf,
     pub target: PathBuf,
@@ -31,6 +32,7 @@ pub struct DockerMount {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DockerExecutorSpec {
     pub image: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -56,3 +56,18 @@ fn protocol_errors_have_stable_codes() {
     );
     assert_eq!(ProtocolError::internal().code, "IGOR-DAEMON-002");
 }
+
+#[test]
+fn milestone_five_requests_round_trip() -> Result<(), Box<dyn Error>> {
+    for request in [Request::ProjectList, Request::JobList { project_id: None }] {
+        let envelope = RequestEnvelope::new(request);
+        let encoded = serde_json::to_vec(&envelope)?;
+        assert_eq!(
+            serde_json::from_slice::<RequestEnvelope>(&encoded)?,
+            envelope
+        );
+    }
+    assert_eq!(ProtocolError::not_found("job").code, "IGOR-API-001");
+    assert_eq!(ProtocolError::conflict("project").code, "IGOR-API-002");
+    Ok(())
+}

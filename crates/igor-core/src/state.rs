@@ -64,6 +64,16 @@ state_machine!(
     }
 );
 
+impl JobState {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Lost | Self::Superseded
+        )
+    }
+}
+
 state_machine!(
     AttemptState {
         Pending => "pending", Starting => "starting", Running => "running",
