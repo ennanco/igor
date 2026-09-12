@@ -454,17 +454,7 @@ fn sanitize_remote(remote: &str) -> String {
 
 fn reject_secret_environment(environment: &EnvironmentPolicy) -> Result<(), SubmissionError> {
     for name in environment.set.keys() {
-        let uppercase = name.to_ascii_uppercase();
-        if uppercase.starts_with("IGOR_")
-            || uppercase.contains("TOKEN")
-            || uppercase.contains("SECRET")
-            || uppercase.contains("PASSWORD")
-            || uppercase.contains("CREDENTIAL")
-            || uppercase.ends_with("_KEY")
-            || uppercase.ends_with("_PAT")
-            || uppercase == "DATABASE_URL"
-            || uppercase.starts_with("AWS_ACCESS_KEY")
-        {
+        if crate::environment_variable_is_sensitive(name) {
             return Err(SubmissionError::JobFile {
                 path: PathBuf::from("environment.set").join(name),
                 reason:

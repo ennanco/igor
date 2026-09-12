@@ -11,9 +11,9 @@ use igor_core::{
     ActionId, ActionRecord, ActionState, ArtifactRecord, ArtifactRole, AttemptId, AttemptSpec,
     AttemptState, CommandSpec, ConfigurationIdentity, Database, DatabaseOptions, DeliveryId,
     DeliveryRecord, DeliveryState, EnvironmentPolicy, Event, EventId, EventKind, EventPayload,
-    Family, FamilyId, Generation, GenerationId, GenerationIdentity, IntegrityCheck, JobId, JobSpec,
-    JobState, PersistenceError, Project, ProjectId, Resource, ResourceId, ResultContract,
-    ShellPolicy, SourceIdentity,
+    ExecutionOutcome, Family, FamilyId, Generation, GenerationId, GenerationIdentity,
+    IntegrityCheck, JobId, JobSpec, JobState, PersistenceError, ProcessStart, Project, ProjectId,
+    Resource, ResourceId, ResultContract, ShellPolicy, SourceIdentity,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
@@ -110,6 +110,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "agent_sessions",
         "artifacts",
         "attempts",
+        "attempt_processes",
         "deliveries",
         "events",
         "families",
@@ -171,7 +172,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(ledger.len(), 4);
+    assert_eq!(ledger.len(), 5);
     for (index, row) in ledger.iter().enumerate() {
         assert_eq!(row.get::<i64, _>("version"), (index + 1) as i64);
         assert!(row.get::<bool, _>("success"));
@@ -219,7 +220,7 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
             .fetch_all(database.pool())
             .await?;
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
     let checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
             .fetch_one(database.pool())
@@ -1295,6 +1296,150 @@ async fn concurrent_submissions_receive_distinct_global_order() -> TestResult {
         orders.insert(handle.await??.submission_order);
     }
     assert_eq!(orders, BTreeSet::from([1, 2]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestResult {
+    let (_directory, database) = database().await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let mut jobs = Vec::new();
+    for (name, priority) in [("first", 0), ("second", 0), ("urgent", 10)] {
+        let mut job = job(project.id);
+        job.name = name.into();
+        let attempt = attempt(&job, 1)?;
+        database
+            .jobs()
+            .submit(
+                &job,
+                &attempt,
+                priority,
+                &event(EventKind::JobSubmitted, json!({}))?,
+                &event(EventKind::AttemptCreated, json!({}))?,
+            )
+            .await?;
+        jobs.push((job, attempt));
+    }
+
+    let urgent = database
+        .jobs()
+        .claim_execution("worker-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("urgent execution was not claimed"))?;
+    assert_eq!(urgent.job.spec.name, "urgent");
+    assert_eq!(urgent.job.state, JobState::Running);
+    assert_eq!(urgent.attempt.state, AttemptState::Starting);
+    assert!(
+        database
+            .jobs()
+            .claim_execution("worker-b", Duration::from_secs(30))
+            .await?
+            .is_none()
+    );
+    assert!(
+        database
+            .jobs()
+            .heartbeat_execution(&urgent, Duration::from_secs(30))
+            .await
+            .is_err()
+    );
+    let process = ProcessStart {
+        pid: 1234,
+        process_group_id: 1234,
+        process_start_ticks: 9876,
+        stdout_path: PathBuf::from("/tmp/igor/stdout.log"),
+        stderr_path: PathBuf::from("/tmp/igor/stderr.log"),
+    };
+    database
+        .jobs()
+        .record_process_started(&urgent, &process)
+        .await?;
+    database
+        .jobs()
+        .heartbeat_execution(&urgent, Duration::from_secs(30))
+        .await?;
+    let recorded = database
+        .jobs()
+        .process_for_attempt(urgent.attempt.spec.id())
+        .await?
+        .ok_or_else(|| missing("process metadata was not persisted"))?;
+    assert_eq!(recorded.pid, process.pid);
+    assert_eq!(recorded.process_group_id, process.process_group_id);
+    assert_eq!(recorded.process_start_ticks, process.process_start_ticks);
+    database
+        .jobs()
+        .finish_execution(
+            &urgent,
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(urgent.job.spec.id)
+            .await?
+            .ok_or_else(|| missing("finished job missing"))?
+            .state,
+        JobState::Succeeded
+    );
+    assert_eq!(
+        database
+            .jobs()
+            .get_attempt(urgent.attempt.spec.id())
+            .await?
+            .ok_or_else(|| missing("finished attempt missing"))?
+            .state,
+        AttemptState::Succeeded
+    );
+    assert_eq!(
+        database
+            .jobs()
+            .process_for_attempt(urgent.attempt.spec.id())
+            .await?
+            .ok_or_else(|| missing("finished process metadata missing"))?
+            .exit_code,
+        Some(0)
+    );
+
+    let first = database
+        .jobs()
+        .claim_execution("worker-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("first FIFO execution was not claimed"))?;
+    assert_eq!(first.job.spec.name, "first");
+    database
+        .jobs()
+        .finish_execution(
+            &first,
+            &ExecutionOutcome {
+                state: AttemptState::Failed,
+                exit_code: Some(7),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(first.job.spec.id)
+            .await?
+            .ok_or_else(|| missing("failed job missing"))?
+            .state,
+        JobState::Failed
+    );
+    let next = database
+        .jobs()
+        .claim_execution("worker-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("second FIFO execution was not claimed"))?;
+    assert_eq!(next.job.spec.name, "second");
     Ok(())
 }
 

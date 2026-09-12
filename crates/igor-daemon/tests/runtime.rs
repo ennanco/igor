@@ -97,7 +97,7 @@ async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box
         assert!(matches!(
             client.request(role, Request::DatabaseStatus).await?,
             Response::DatabaseStatus(status)
-                if status.role == role && status.schema_version == 4 && status.integrity == "ok"
+                if status.role == role && status.schema_version == 5 && status.integrity == "ok"
         ));
     }
     assert_eq!(

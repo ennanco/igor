@@ -20,6 +20,7 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    sync::watch,
     task::JoinSet,
     time::timeout,
 };
@@ -160,6 +161,14 @@ where
     let listener = bound.listener;
     let _cleanup = bound.cleanup;
     let mut requests = JoinSet::new();
+    let (worker_shutdown, worker_receiver) = watch::channel(false);
+    let worker = (role == DaemonRole::Worker).then(|| {
+        tokio::spawn(crate::worker::run(
+            database.clone(),
+            paths.clone(),
+            worker_receiver,
+        ))
+    });
     tokio::pin!(shutdown);
 
     loop {
@@ -203,6 +212,14 @@ where
     {
         requests.abort_all();
         while requests.join_next().await.is_some() {}
+    }
+    let _ = worker_shutdown.send(true);
+    if let Some(worker) = worker {
+        match timeout(SHUTDOWN_GRACE, worker).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "worker execution loop failed"),
+            Err(_) => tracing::warn!("worker execution loop did not stop before shutdown"),
+        }
     }
     database.pool().close().await;
     Ok(())

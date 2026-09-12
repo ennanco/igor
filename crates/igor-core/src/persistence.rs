@@ -439,6 +439,48 @@ pub struct StoredAttempt {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionClaim {
+    pub job: StoredJob,
+    pub attempt: StoredAttempt,
+    pub lease_id: Uuid,
+    pub owner: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ProcessRecord {
+    pub attempt_id: AttemptId,
+    pub job_id: JobId,
+    pub project_id: ProjectId,
+    pub pid: i64,
+    pub process_group_id: i64,
+    pub process_start_ticks: i64,
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+    pub heartbeat_at: String,
+    pub exit_code: Option<i32>,
+    pub term_signal: Option<i32>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessStart {
+    pub pid: i64,
+    pub process_group_id: i64,
+    pub process_start_ticks: i64,
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionOutcome {
+    pub state: AttemptState,
+    pub exit_code: Option<i32>,
+    pub term_signal: Option<i32>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct StoredEvent {
     pub sequence: i64,
@@ -957,6 +999,392 @@ impl JobAttemptRepository<'_> {
         Ok(claim)
     }
 
+    pub async fn claim_execution(
+        &self,
+        owner: &str,
+        duration: Duration,
+    ) -> PersistenceResult<Option<ExecutionClaim>> {
+        let seconds = validate_lease(owner, duration)?;
+        let lease_id = Uuid::new_v4();
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin execution claim", source))?;
+        let job_row = sqlx::query(
+            "WITH candidate AS (
+                SELECT jobs.id FROM jobs
+                JOIN attempts ON attempts.job_id = jobs.id AND attempts.sequence = 1
+                WHERE jobs.state = 'queued' AND attempts.state = 'pending'
+                    AND NOT EXISTS (SELECT 1 FROM jobs AS active WHERE active.state = 'running')
+                ORDER BY jobs.priority DESC, jobs.submission_order ASC LIMIT 1
+             )
+             UPDATE jobs SET state = 'running', claim_id = ?, claim_owner = ?,
+                 claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = (SELECT id FROM candidate)
+             RETURNING id, project_id, spec_json, state, priority, submission_order,
+                       submitted_at, updated_at, claim_expires_at",
+        )
+        .bind(lease_id.to_string())
+        .bind(owner)
+        .bind(seconds)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("claim execution job", source))?;
+        let Some(job_row) = job_row else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| db("commit empty execution claim", source))?;
+            return Ok(None);
+        };
+        let job_id: JobId = parse_id(job_row.get("id"), "claimed execution job")?;
+        let project_id: ProjectId =
+            parse_id(job_row.get("project_id"), "claimed execution project")?;
+        let expires_at = job_row.get("claim_expires_at");
+        let job = decode_job(job_row)?;
+        let attempt_row = sqlx::query(
+            "UPDATE attempts SET state = 'starting',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE job_id = ? AND sequence = 1 AND state = 'pending'
+             RETURNING id, spec_json, state, created_at, started_at, finished_at, updated_at",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("claim execution attempt", source))?
+        .ok_or(PersistenceError::Conflict {
+            entity: "execution attempt",
+        })?;
+        let attempt_id: AttemptId = parse_id(attempt_row.get("id"), "claimed execution attempt")?;
+        let attempt = decode_attempt(attempt_row)?;
+        let job_event = state_event(
+            EventKind::JobStateChanged,
+            "job",
+            &job_id.to_string(),
+            "running",
+            Some(lease_id),
+            None,
+        )?;
+        insert_event(&mut transaction, project_id, Some(job_id), None, &job_event).await?;
+        let attempt_event = state_event(
+            EventKind::AttemptStateChanged,
+            "attempt",
+            &attempt_id.to_string(),
+            "starting",
+            Some(lease_id),
+            None,
+        )?;
+        insert_event(
+            &mut transaction,
+            project_id,
+            Some(job_id),
+            Some(attempt_id),
+            &attempt_event,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit execution claim", source))?;
+        Ok(Some(ExecutionClaim {
+            job,
+            attempt,
+            lease_id,
+            owner: owner.into(),
+            expires_at,
+        }))
+    }
+
+    pub async fn record_process_started(
+        &self,
+        claim: &ExecutionClaim,
+        process: &ProcessStart,
+    ) -> PersistenceResult<()> {
+        if process.pid <= 0 || process.process_group_id <= 0 || process.process_start_ticks < 0 {
+            return Err(PersistenceError::InvalidValue {
+                entity: "process identity",
+                value: format!(
+                    "pid {}, process group {}, start ticks {}",
+                    process.pid, process.process_group_id, process.process_start_ticks
+                ),
+            });
+        }
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin process start", source))?;
+        let attempt_id = claim.attempt.spec.id();
+        let job_id = claim.job.spec.id;
+        let project_id = claim.job.spec.project_id;
+        let inserted = sqlx::query(
+            "INSERT INTO attempt_processes
+                 (attempt_id, job_id, project_id, pid, process_group_id, process_start_ticks,
+                  stdout_path, stderr_path)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?
+             WHERE EXISTS (
+                 SELECT 1 FROM jobs WHERE id = ? AND state = 'running'
+                     AND claim_id = ? AND claim_owner = ?
+             )",
+        )
+        .bind(attempt_id.to_string())
+        .bind(job_id.to_string())
+        .bind(project_id.to_string())
+        .bind(process.pid)
+        .bind(process.process_group_id)
+        .bind(process.process_start_ticks)
+        .bind(process.stdout_path.to_string_lossy().as_ref())
+        .bind(process.stderr_path.to_string_lossy().as_ref())
+        .bind(job_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("insert process identity", source))?;
+        if inserted.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "execution claim",
+            });
+        }
+        let updated = sqlx::query(
+            "UPDATE attempts SET state = 'running',
+                 started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'starting'",
+        )
+        .bind(attempt_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("mark process attempt running", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "execution attempt",
+            });
+        }
+        let event = state_event(
+            EventKind::AttemptStateChanged,
+            "attempt",
+            &attempt_id.to_string(),
+            "running",
+            Some(claim.lease_id),
+            None,
+        )?;
+        insert_event(
+            &mut transaction,
+            project_id,
+            Some(job_id),
+            Some(attempt_id),
+            &event,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit process start", source))?;
+        Ok(())
+    }
+
+    pub async fn heartbeat_execution(
+        &self,
+        claim: &ExecutionClaim,
+        duration: Duration,
+    ) -> PersistenceResult<()> {
+        let seconds = validate_lease(&claim.owner, duration)?;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin execution heartbeat", source))?;
+        let updated = sqlx::query(
+            "UPDATE jobs SET
+                 claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?",
+        )
+        .bind(seconds)
+        .bind(claim.job.spec.id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("heartbeat execution claim", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "execution claim",
+            });
+        }
+        let process = sqlx::query(
+            "UPDATE attempt_processes SET
+                 heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE attempt_id = ?",
+        )
+        .bind(claim.attempt.spec.id().to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("heartbeat attempt process", source))?;
+        if process.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "attempt process",
+            });
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit execution heartbeat", source))?;
+        Ok(())
+    }
+
+    pub async fn finish_execution(
+        &self,
+        claim: &ExecutionClaim,
+        outcome: &ExecutionOutcome,
+    ) -> PersistenceResult<()> {
+        if !matches!(
+            outcome.state,
+            AttemptState::Succeeded | AttemptState::Failed
+        ) {
+            return Err(PersistenceError::InvalidValue {
+                entity: "execution outcome",
+                value: outcome.state.as_str().into(),
+            });
+        }
+        if outcome.exit_code.is_some() && outcome.term_signal.is_some() {
+            return Err(PersistenceError::InvalidValue {
+                entity: "execution outcome",
+                value: "exit code and terminating signal are mutually exclusive".into(),
+            });
+        }
+        if outcome.state == AttemptState::Succeeded
+            && (outcome.exit_code != Some(0)
+                || outcome.term_signal.is_some()
+                || outcome.error.is_some())
+        {
+            return Err(PersistenceError::InvalidValue {
+                entity: "execution outcome",
+                value: "successful execution must have exit code zero and no signal or error"
+                    .into(),
+            });
+        }
+        let job_state = if outcome.state == AttemptState::Succeeded {
+            JobState::Succeeded
+        } else {
+            JobState::Failed
+        };
+        let attempt_id = claim.attempt.spec.id();
+        let job_id = claim.job.spec.id;
+        let project_id = claim.job.spec.project_id;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin execution finish", source))?;
+        sqlx::query(
+            "UPDATE attempt_processes SET exit_code = ?, term_signal = ?, error = ?,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE attempt_id = ?",
+        )
+        .bind(outcome.exit_code)
+        .bind(outcome.term_signal)
+        .bind(&outcome.error)
+        .bind(attempt_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("record process outcome", source))?;
+        let attempt = sqlx::query(
+            "UPDATE attempts SET state = ?,
+                 finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state IN ('starting', 'running')",
+        )
+        .bind(outcome.state.as_str())
+        .bind(attempt_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("finish execution attempt", source))?;
+        if attempt.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "execution attempt",
+            });
+        }
+        let job = sqlx::query(
+            "UPDATE jobs SET state = ?, claim_id = NULL, claim_owner = NULL,
+                 claim_expires_at = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?",
+        )
+        .bind(job_state.as_str())
+        .bind(job_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("finish execution job", source))?;
+        if job.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "execution claim",
+            });
+        }
+        let details = serde_json::json!({
+            "exit_code": outcome.exit_code,
+            "term_signal": outcome.term_signal,
+            "error": outcome.error,
+        });
+        let attempt_event = state_event(
+            EventKind::AttemptStateChanged,
+            "attempt",
+            &attempt_id.to_string(),
+            outcome.state.as_str(),
+            Some(claim.lease_id),
+            Some(details.clone()),
+        )?;
+        insert_event(
+            &mut transaction,
+            project_id,
+            Some(job_id),
+            Some(attempt_id),
+            &attempt_event,
+        )
+        .await?;
+        let job_event = state_event(
+            EventKind::JobStateChanged,
+            "job",
+            &job_id.to_string(),
+            job_state.as_str(),
+            Some(claim.lease_id),
+            Some(details),
+        )?;
+        insert_event(&mut transaction, project_id, Some(job_id), None, &job_event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit execution finish", source))?;
+        Ok(())
+    }
+
+    pub async fn process_for_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<Option<ProcessRecord>> {
+        let row = sqlx::query(
+            "SELECT attempt_id, job_id, project_id, pid, process_group_id,
+                    process_start_ticks, stdout_path, stderr_path, heartbeat_at,
+                    exit_code, term_signal, error
+             FROM attempt_processes WHERE attempt_id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(&self.database.pool)
+        .await
+        .map_err(|source| db("get attempt process", source))?;
+        row.map(decode_process).transpose()
+    }
+
     pub async fn insert_attempt_with_event(
         &self,
         attempt: &AttemptSpec,
@@ -1203,6 +1631,23 @@ fn decode_attempt(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<StoredAttem
         started_at: row.get("started_at"),
         finished_at: row.get("finished_at"),
         updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_process(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<ProcessRecord> {
+    Ok(ProcessRecord {
+        attempt_id: parse_id(row.get("attempt_id"), "process attempt")?,
+        job_id: parse_id(row.get("job_id"), "process job")?,
+        project_id: parse_id(row.get("project_id"), "process project")?,
+        pid: row.get("pid"),
+        process_group_id: row.get("process_group_id"),
+        process_start_ticks: row.get("process_start_ticks"),
+        stdout_path: PathBuf::from(row.get::<String, _>("stdout_path")),
+        stderr_path: PathBuf::from(row.get::<String, _>("stderr_path")),
+        heartbeat_at: row.get("heartbeat_at"),
+        exit_code: row.get("exit_code"),
+        term_signal: row.get("term_signal"),
+        error: row.get("error"),
     })
 }
 
@@ -1483,6 +1928,28 @@ fn claim_event(
             "state": state,
             "lease_id": lease_id,
             "owner": owner,
+        }),
+    )?;
+    Ok(Event::new(EventId::new(), kind, payload)?)
+}
+
+fn state_event(
+    kind: EventKind,
+    entity: &str,
+    record_id: &str,
+    state: &str,
+    lease_id: Option<Uuid>,
+    details: Option<Value>,
+) -> PersistenceResult<Event> {
+    let payload = EventPayload::new(
+        kind,
+        1,
+        serde_json::json!({
+            "entity": entity,
+            "record_id": record_id,
+            "state": state,
+            "lease_id": lease_id,
+            "details": details,
         }),
     )?;
     Ok(Event::new(EventId::new(), kind, payload)?)

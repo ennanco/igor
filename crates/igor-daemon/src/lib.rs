@@ -2,6 +2,7 @@
 
 mod protocol;
 mod runtime;
+mod worker;
 
 pub use protocol::{
     DaemonRole, DatabaseStatus, Health, PROTOCOL_VERSION, ProtocolError, ProtocolErrorKind,

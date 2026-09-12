@@ -17,7 +17,10 @@ mod submission;
 pub mod telemetry;
 
 pub use artifact::{ArtifactRole, RetentionDecision};
-pub use command::{CommandSpec, EnvironmentInheritance, EnvironmentPolicy, ShellPolicy};
+pub use command::{
+    CommandSpec, EnvironmentInheritance, EnvironmentPolicy, ShellPolicy,
+    environment_variable_is_sensitive,
+};
 pub use config::{
     ConfigError, ConfigOverrides, EffectiveConfig, Environment, GLOBAL_CONFIG_VERSION,
     GlobalConfig, GlobalPathConfig, HostConfig, LoadedProjectConfig, PROJECT_CONFIG_RELATIVE_PATH,
@@ -41,10 +44,11 @@ pub use job::{
 };
 pub use persistence::{
     ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, Database,
-    DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, Family,
-    FamilyGenerationRepository, Generation, IntegrityCheck, JobAttemptRepository, JobDetail,
-    PersistenceError, ProjectRepository, Resource, ResourceLease, ResourceRepository,
-    StoredAttempt, StoredEvent, StoredJob,
+    DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim,
+    ExecutionOutcome, Family, FamilyGenerationRepository, Generation, IntegrityCheck,
+    JobAttemptRepository, JobDetail, PersistenceError, ProcessRecord, ProcessStart,
+    ProjectRepository, Resource, ResourceLease, ResourceRepository, StoredAttempt, StoredEvent,
+    StoredJob,
 };
 pub use project::{
     PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,

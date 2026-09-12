@@ -72,3 +72,79 @@ impl CommandSpec {
         Ok(())
     }
 }
+
+#[must_use]
+pub fn environment_variable_is_sensitive(name: &str) -> bool {
+    let uppercase = name.to_ascii_uppercase();
+    uppercase.starts_with("IGOR_")
+        || uppercase.starts_with("TELEGRAM_")
+        || uppercase.starts_with("OPENCODE_")
+        || uppercase.starts_with("ANTHROPIC_")
+        || uppercase.starts_with("OPENAI_")
+        || uppercase.starts_with("GEMINI_")
+        || uppercase.starts_with("GOOGLE_API_")
+        || uppercase.starts_with("CLAUDE_")
+        || uppercase.starts_with("CODEX_")
+        || uppercase.starts_with("CURSOR_")
+        || uppercase.starts_with("AIDER_")
+        || uppercase.starts_with("CONTINUE_")
+        || uppercase.contains("TOKEN")
+        || uppercase.contains("SECRET")
+        || uppercase.contains("PASSWORD")
+        || uppercase.contains("CREDENTIAL")
+        || uppercase.contains("COOKIE")
+        || uppercase.contains("SESSION")
+        || uppercase.contains("JWT")
+        || uppercase.ends_with("_KEY")
+        || uppercase.ends_with("_PAT")
+        || uppercase.ends_with("_DSN")
+        || uppercase.ends_with("_AUTH")
+        || uppercase == "DATABASE_URL"
+        || uppercase.starts_with("AWS_ACCESS_KEY")
+        || matches!(
+            uppercase.as_str(),
+            "SSH_AUTH_SOCK"
+                | "GPG_AGENT_INFO"
+                | "XAUTHORITY"
+                | "KUBECONFIG"
+                | "DOCKER_CONFIG"
+                | "NETRC"
+                | "PIP_CONFIG_FILE"
+                | "NPM_CONFIG_USERCONFIG"
+                | "GIT_ASKPASS"
+                | "SSH_ASKPASS"
+                | "PGPASSFILE"
+                | "PGSERVICEFILE"
+                | "BOTO_CONFIG"
+                | "AWS_CONFIG_FILE"
+                | "AZURE_CONFIG_DIR"
+                | "CLOUDSDK_CONFIG"
+                | "GNUPGHOME"
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::environment_variable_is_sensitive;
+
+    #[test]
+    fn detects_service_agent_and_credential_environment_variables() {
+        for name in [
+            "IGOR_STATE_DIR",
+            "TELEGRAM_BOT_TOKEN",
+            "OPENCODE_CONFIG",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CODEX_HOME",
+            "AWS_SESSION_TOKEN",
+            "SSH_AUTH_SOCK",
+            "GIT_ASKPASS",
+            "PGPASSFILE",
+            "DATABASE_URL",
+        ] {
+            assert!(environment_variable_is_sensitive(name), "{name}");
+        }
+        for name in ["HOME", "LANG", "PATH", "SAFE_VALUE"] {
+            assert!(!environment_variable_is_sensitive(name), "{name}");
+        }
+    }
+}

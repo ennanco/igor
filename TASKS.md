@@ -246,20 +246,36 @@ Dependencies: milestone 4.
 
 Dependencies: milestone 5.
 
+### Implementation Phases
+
+Resume during the week of 2026-09-14. Implement, review, validate, and commit
+each phase separately before starting the next one.
+
+- **Phase 1: basic execution.** Complete `M6.01-M6.10`, `M6.19`, and the basic
+  success, failure, and output fixtures from `M6.20`. The result must execute
+  queued direct-process jobs and persist terminal state and logs.
+- **Phase 2: operator commands.** Complete `M6.11-M6.15` and the signal, child
+  process, large-output, and binary-output fixtures from `M6.20`. The result
+  must support cancellation, retry, and log reading/following.
+- **Phase 3: restart hardening.** Complete `M6.16-M6.18`, `M6.21`, and all M6
+  acceptance checks. The result must safely reconcile processes after worker
+  restart and complete the usable `v0.1` process queue.
+
 ### Tasks
 
-- [ ] `M6.01` Implement atomic priority and FIFO job selection.
-- [ ] `M6.02` Create an immutable attempt before launching a process.
-- [ ] `M6.03` Implement the direct-process executor with argument vectors.
-- [ ] `M6.04` Launch attempts in dedicated process groups.
-- [ ] `M6.05` Implement minimal environment inheritance and explicit additions
+- [x] `M6.01` Implement atomic priority and FIFO job selection.
+- [x] `M6.02` Claim and transition the immutable pending attempt created during
+  submission before launching a process.
+- [x] `M6.03` Implement the direct-process executor with argument vectors.
+- [x] `M6.04` Launch attempts in dedicated process groups.
+- [x] `M6.05` Implement minimal environment inheritance and explicit additions
   and removals.
-- [ ] `M6.06` Strip Igor, Telegram, agent, and unrelated secret variables from
+- [x] `M6.06` Strip Igor, Telegram, agent, and unrelated secret variables from
   child environments.
-- [ ] `M6.07` Capture stdout and stderr into attempt-specific logs.
-- [ ] `M6.08` Stream logs without blocking process supervision.
-- [ ] `M6.09` Persist PID, process start identity, start time, and heartbeat.
-- [ ] `M6.10` Record normal exit, nonzero exit, and terminating signal.
+- [x] `M6.07` Capture stdout and stderr into attempt-specific logs.
+- [x] `M6.08` Stream logs without blocking process supervision.
+- [x] `M6.09` Persist PID, process start identity, start time, and heartbeat.
+- [x] `M6.10` Record normal exit, nonzero exit, and terminating signal.
 - [ ] `M6.11` Implement manual cancellation with `SIGTERM` and configurable
   grace period before `SIGKILL`.
 - [ ] `M6.12` Implement `igor cancel JOB_ID`.
@@ -269,14 +285,14 @@ Dependencies: milestone 5.
 - [ ] `M6.16` Reconcile running attempts after worker restart.
 - [ ] `M6.17` Detect PID reuse before reattaching to a process.
 - [ ] `M6.18` Classify unrecoverable missing processes as `lost`.
-- [ ] `M6.19` Ensure no timeout is applied unless explicitly configured.
+- [x] `M6.19` Ensure no timeout is applied unless explicitly configured.
 - [ ] `M6.20` Add process fixtures for success, failure, sleep, signal handling,
   large output, binary output, and child processes.
 - [ ] `M6.21` Add restart and cancellation integration tests.
 
 ### Acceptance
 
-- [ ] `A6.01` A command can run longer than a test-configured observation period
+- [x] `A6.01` A command can run longer than a test-configured observation period
   without being killed when timeout is absent.
 - [ ] `A6.02` Worker restart preserves or correctly classifies the active
   attempt.
