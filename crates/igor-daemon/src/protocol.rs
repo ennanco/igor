@@ -1,11 +1,12 @@
 use std::{fmt, path::Path};
 
 use igor_core::{
-    JobDetail, JobId, Project, ProjectId, RuntimePaths, StoredEvent, StoredJob, SubmissionInput,
+    JobDetail, JobId, JobLogs, Project, ProjectId, RuntimePaths, StoredEvent, StoredJob,
+    SubmissionInput,
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +82,16 @@ pub enum Request {
     JobEvents {
         job_id: JobId,
     },
+    JobCancel {
+        job_id: JobId,
+        grace_seconds: u32,
+    },
+    JobRetry {
+        job_id: JobId,
+    },
+    JobLogs {
+        job_id: JobId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,6 +137,9 @@ pub enum Response {
     Jobs { jobs: Vec<StoredJob> },
     Job(JobDetail),
     Events { events: Vec<StoredEvent> },
+    Cancelled(JobDetail),
+    Retried(JobDetail),
+    Logs(JobLogs),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

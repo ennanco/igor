@@ -482,6 +482,15 @@ pub struct ExecutionOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct JobLogs {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    pub state: JobState,
+    pub stdout_path: Option<PathBuf>,
+    pub stderr_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct StoredEvent {
     pub sequence: i64,
     pub project_id: ProjectId,
@@ -1015,7 +1024,10 @@ impl JobAttemptRepository<'_> {
         let job_row = sqlx::query(
             "WITH candidate AS (
                 SELECT jobs.id FROM jobs
-                JOIN attempts ON attempts.job_id = jobs.id AND attempts.sequence = 1
+                JOIN attempts ON attempts.id = (
+                    SELECT id FROM attempts AS latest
+                    WHERE latest.job_id = jobs.id ORDER BY sequence DESC LIMIT 1
+                )
                 WHERE jobs.state = 'queued' AND attempts.state = 'pending'
                     AND NOT EXISTS (SELECT 1 FROM jobs AS active WHERE active.state = 'running')
                 ORDER BY jobs.priority DESC, jobs.submission_order ASC LIMIT 1
@@ -1048,7 +1060,10 @@ impl JobAttemptRepository<'_> {
         let attempt_row = sqlx::query(
             "UPDATE attempts SET state = 'starting',
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE job_id = ? AND sequence = 1 AND state = 'pending'
+             WHERE id = (
+                 SELECT id FROM attempts AS latest
+                 WHERE latest.job_id = ? ORDER BY sequence DESC LIMIT 1
+             ) AND state = 'pending'
              RETURNING id, spec_json, state, created_at, started_at, finished_at, updated_at",
         )
         .bind(job_id.to_string())
@@ -1240,6 +1255,39 @@ impl JobAttemptRepository<'_> {
         Ok(())
     }
 
+    pub async fn cancellation_grace(
+        &self,
+        claim: &ExecutionClaim,
+    ) -> PersistenceResult<Option<Duration>> {
+        let milliseconds = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT CAST(MAX(0, ROUND(
+                     (julianday(cancel_requested_at, '+' || cancel_grace_seconds || ' seconds')
+                      - julianday('now')) * 86400000
+                 )) AS INTEGER)
+             FROM jobs
+             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?
+                 AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 AND cancel_requested_at IS NOT NULL",
+        )
+        .bind(claim.job.spec.id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .fetch_optional(&self.database.pool)
+        .await
+        .map_err(|source| db("read execution cancellation", source))?
+        .flatten();
+        milliseconds
+            .map(|milliseconds| {
+                u64::try_from(milliseconds)
+                    .map(Duration::from_millis)
+                    .map_err(|_| PersistenceError::InvalidValue {
+                        entity: "cancellation grace period",
+                        value: milliseconds.to_string(),
+                    })
+            })
+            .transpose()
+    }
+
     pub async fn finish_execution(
         &self,
         claim: &ExecutionClaim,
@@ -1247,7 +1295,7 @@ impl JobAttemptRepository<'_> {
     ) -> PersistenceResult<()> {
         if !matches!(
             outcome.state,
-            AttemptState::Succeeded | AttemptState::Failed
+            AttemptState::Succeeded | AttemptState::Failed | AttemptState::Cancelled
         ) {
             return Err(PersistenceError::InvalidValue {
                 entity: "execution outcome",
@@ -1271,10 +1319,10 @@ impl JobAttemptRepository<'_> {
                     .into(),
             });
         }
-        let job_state = if outcome.state == AttemptState::Succeeded {
-            JobState::Succeeded
-        } else {
-            JobState::Failed
+        let job_state = match outcome.state {
+            AttemptState::Succeeded => JobState::Succeeded,
+            AttemptState::Cancelled => JobState::Cancelled,
+            _ => JobState::Failed,
         };
         let attempt_id = claim.attempt.spec.id();
         let job_id = claim.job.spec.id;
@@ -1315,7 +1363,8 @@ impl JobAttemptRepository<'_> {
         }
         let job = sqlx::query(
             "UPDATE jobs SET state = ?, claim_id = NULL, claim_owner = NULL,
-                 claim_expires_at = NULL,
+                 claim_expires_at = NULL, cancel_requested_at = NULL,
+                 cancel_grace_seconds = NULL,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?",
         )
@@ -1383,6 +1432,257 @@ impl JobAttemptRepository<'_> {
         .await
         .map_err(|source| db("get attempt process", source))?;
         row.map(decode_process).transpose()
+    }
+
+    pub async fn request_cancellation(
+        &self,
+        job_id: JobId,
+        grace: Duration,
+    ) -> PersistenceResult<JobDetail> {
+        let seconds =
+            i64::try_from(grace.as_secs()).map_err(|_| PersistenceError::InvalidValue {
+                entity: "cancellation grace period",
+                value: grace.as_secs().to_string(),
+            })?;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin cancellation request", source))?;
+        let row = sqlx::query("SELECT project_id, state FROM jobs WHERE id = ?")
+            .bind(job_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read cancellation job", source))?
+            .ok_or(PersistenceError::NotFound { entity: "job" })?;
+        let project_id = parse_id(row.get("project_id"), "cancellation project")?;
+        match parse_job_state(row.get("state"))? {
+            JobState::Running => {
+                let updated = sqlx::query(
+                    "UPDATE jobs SET
+                         cancel_requested_at = COALESCE(cancel_requested_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                         cancel_grace_seconds = CASE
+                             WHEN cancel_grace_seconds IS NULL THEN ?
+                             ELSE MIN(cancel_grace_seconds, ?)
+                         END,
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE id = ? AND state = 'running'",
+                )
+                .bind(seconds)
+                .bind(seconds)
+                .bind(job_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| db("request running job cancellation", source))?;
+                if updated.rows_affected() != 1 {
+                    return Err(PersistenceError::Conflict { entity: "job" });
+                }
+            }
+            JobState::Queued => {
+                let attempt = sqlx::query(
+                    "UPDATE attempts SET state = 'cancelled',
+                         finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE id = (SELECT id FROM attempts WHERE job_id = ? ORDER BY sequence DESC LIMIT 1)
+                         AND state = 'pending'
+                     RETURNING id",
+                )
+                .bind(job_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| db("cancel pending attempt", source))?
+                .ok_or(PersistenceError::Conflict { entity: "attempt" })?;
+                let attempt_id: AttemptId = parse_id(attempt.get("id"), "cancelled attempt")?;
+                let updated = sqlx::query(
+                    "UPDATE jobs SET state = 'cancelled',
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE id = ? AND state = 'queued' AND claim_id IS NULL",
+                )
+                .bind(job_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| db("cancel queued job", source))?;
+                if updated.rows_affected() != 1 {
+                    return Err(PersistenceError::Conflict { entity: "job" });
+                }
+                let attempt_event = state_event(
+                    EventKind::AttemptStateChanged,
+                    "attempt",
+                    &attempt_id.to_string(),
+                    "cancelled",
+                    None,
+                    None,
+                )?;
+                insert_event(
+                    &mut transaction,
+                    project_id,
+                    Some(job_id),
+                    Some(attempt_id),
+                    &attempt_event,
+                )
+                .await?;
+                let job_event = state_event(
+                    EventKind::JobStateChanged,
+                    "job",
+                    &job_id.to_string(),
+                    "cancelled",
+                    None,
+                    None,
+                )?;
+                insert_event(&mut transaction, project_id, Some(job_id), None, &job_event).await?;
+            }
+            _ => return Err(PersistenceError::Conflict { entity: "job" }),
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit cancellation request", source))?;
+        self.detail(job_id)
+            .await?
+            .ok_or(PersistenceError::NotFound { entity: "job" })
+    }
+
+    pub async fn retry(&self, job_id: JobId) -> PersistenceResult<JobDetail> {
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin job retry", source))?;
+        let row = sqlx::query("SELECT project_id, spec_json, state FROM jobs WHERE id = ?")
+            .bind(job_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read retry job", source))?
+            .ok_or(PersistenceError::NotFound { entity: "job" })?;
+        let state = parse_job_state(row.get("state"))?;
+        if !matches!(
+            state,
+            JobState::Failed | JobState::Cancelled | JobState::Lost
+        ) {
+            return Err(PersistenceError::Conflict { entity: "job" });
+        }
+        let project_id: ProjectId = parse_id(row.get("project_id"), "retry project")?;
+        let job: JobSpec = from_json(row.get("spec_json"), "retry job spec")?;
+        let previous_row = sqlx::query(
+            "SELECT spec_json FROM attempts WHERE job_id = ? ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(job_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|source| db("read previous retry attempt", source))?;
+        let previous: AttemptSpec =
+            from_json(previous_row.get("spec_json"), "previous attempt spec")?;
+        let sequence =
+            previous
+                .sequence()
+                .checked_add(1)
+                .ok_or_else(|| PersistenceError::InvalidValue {
+                    entity: "attempt sequence",
+                    value: previous.sequence().to_string(),
+                })?;
+        let attempt = AttemptSpec::from_job(
+            AttemptId::new(),
+            sequence,
+            &job,
+            previous.source().clone(),
+            previous.configuration().clone(),
+            previous.result().clone(),
+        )?;
+        sqlx::query(
+            "INSERT INTO attempts (id, job_id, project_id, sequence, state, spec_json)
+             VALUES (?, ?, ?, ?, 'pending', ?)",
+        )
+        .bind(attempt.id().to_string())
+        .bind(job_id.to_string())
+        .bind(project_id.to_string())
+        .bind(i64::from(sequence))
+        .bind(json(&attempt, "retry attempt spec")?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("insert retry attempt", source))?;
+        let updated = sqlx::query(
+            "UPDATE jobs SET state = 'queued', cancel_requested_at = NULL,
+                 cancel_grace_seconds = NULL,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = ? AND claim_id IS NULL",
+        )
+        .bind(job_id.to_string())
+        .bind(state.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("queue retried job", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict { entity: "job" });
+        }
+        let attempt_event = Event::new(
+            EventId::new(),
+            EventKind::AttemptCreated,
+            EventPayload::new(
+                EventKind::AttemptCreated,
+                1,
+                serde_json::json!({
+                    "job_id": job_id,
+                    "attempt_id": attempt.id(),
+                    "sequence": sequence,
+                }),
+            )?,
+        )?;
+        insert_event(
+            &mut transaction,
+            project_id,
+            Some(job_id),
+            Some(attempt.id()),
+            &attempt_event,
+        )
+        .await?;
+        let job_event = state_event(
+            EventKind::JobStateChanged,
+            "job",
+            &job_id.to_string(),
+            "queued",
+            None,
+            Some(serde_json::json!({"retry_attempt_id": attempt.id()})),
+        )?;
+        insert_event(&mut transaction, project_id, Some(job_id), None, &job_event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit job retry", source))?;
+        self.detail(job_id)
+            .await?
+            .ok_or(PersistenceError::NotFound { entity: "job" })
+    }
+
+    pub async fn logs_for_job(&self, job_id: JobId) -> PersistenceResult<JobLogs> {
+        let row = sqlx::query(
+            "SELECT jobs.state, attempts.id AS attempt_id,
+                    attempt_processes.stdout_path, attempt_processes.stderr_path
+             FROM jobs
+             JOIN attempts ON attempts.id = (
+                 SELECT id FROM attempts AS latest
+                 WHERE latest.job_id = jobs.id ORDER BY sequence DESC LIMIT 1
+             )
+             LEFT JOIN attempt_processes ON attempt_processes.attempt_id = attempts.id
+             WHERE jobs.id = ?",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(&self.database.pool)
+        .await
+        .map_err(|source| db("read job log paths", source))?
+        .ok_or(PersistenceError::NotFound { entity: "job" })?;
+        Ok(JobLogs {
+            job_id,
+            attempt_id: parse_id(row.get("attempt_id"), "log attempt")?,
+            state: parse_job_state(row.get("state"))?,
+            stdout_path: row
+                .get::<Option<String>, _>("stdout_path")
+                .map(PathBuf::from),
+            stderr_path: row
+                .get::<Option<String>, _>("stderr_path")
+                .map(PathBuf::from),
+        })
     }
 
     pub async fn insert_attempt_with_event(

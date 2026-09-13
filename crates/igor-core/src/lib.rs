@@ -46,7 +46,7 @@ pub use persistence::{
     ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, Database,
     DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim,
     ExecutionOutcome, Family, FamilyGenerationRepository, Generation, IntegrityCheck,
-    JobAttemptRepository, JobDetail, PersistenceError, ProcessRecord, ProcessStart,
+    JobAttemptRepository, JobDetail, JobLogs, PersistenceError, ProcessRecord, ProcessStart,
     ProjectRepository, Resource, ResourceLease, ResourceRepository, StoredAttempt, StoredEvent,
     StoredJob,
 };

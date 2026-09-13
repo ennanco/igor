@@ -1,5 +1,6 @@
 use std::error::Error;
 
+use igor_core::JobId;
 use igor_daemon::{
     DaemonRole, PROTOCOL_VERSION, ProtocolError, ProtocolErrorKind, Request, RequestEnvelope,
     Response, ResponseEnvelope, Version,
@@ -69,5 +70,26 @@ fn milestone_five_requests_round_trip() -> Result<(), Box<dyn Error>> {
     }
     assert_eq!(ProtocolError::not_found("job").code, "IGOR-API-001");
     assert_eq!(ProtocolError::conflict("project").code, "IGOR-API-002");
+    Ok(())
+}
+
+#[test]
+fn milestone_six_operator_requests_round_trip() -> Result<(), Box<dyn Error>> {
+    let job_id = JobId::new();
+    for request in [
+        Request::JobCancel {
+            job_id,
+            grace_seconds: 5,
+        },
+        Request::JobRetry { job_id },
+        Request::JobLogs { job_id },
+    ] {
+        let envelope = RequestEnvelope::new(request);
+        let encoded = serde_json::to_vec(&envelope)?;
+        assert_eq!(
+            serde_json::from_slice::<RequestEnvelope>(&encoded)?,
+            envelope
+        );
+    }
     Ok(())
 }

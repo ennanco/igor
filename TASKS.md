@@ -276,17 +276,17 @@ each phase separately before starting the next one.
 - [x] `M6.08` Stream logs without blocking process supervision.
 - [x] `M6.09` Persist PID, process start identity, start time, and heartbeat.
 - [x] `M6.10` Record normal exit, nonzero exit, and terminating signal.
-- [ ] `M6.11` Implement manual cancellation with `SIGTERM` and configurable
+- [x] `M6.11` Implement manual cancellation with `SIGTERM` and configurable
   grace period before `SIGKILL`.
-- [ ] `M6.12` Implement `igor cancel JOB_ID`.
-- [ ] `M6.13` Implement `igor retry JOB_ID` without deleting prior attempts.
-- [ ] `M6.14` Implement `igor logs JOB_ID`.
-- [ ] `M6.15` Implement `igor logs --follow JOB_ID`.
+- [x] `M6.12` Implement `igor cancel JOB_ID`.
+- [x] `M6.13` Implement `igor retry JOB_ID` without deleting prior attempts.
+- [x] `M6.14` Implement `igor logs JOB_ID`.
+- [x] `M6.15` Implement `igor logs --follow JOB_ID`.
 - [ ] `M6.16` Reconcile running attempts after worker restart.
 - [ ] `M6.17` Detect PID reuse before reattaching to a process.
 - [ ] `M6.18` Classify unrecoverable missing processes as `lost`.
 - [x] `M6.19` Ensure no timeout is applied unless explicitly configured.
-- [ ] `M6.20` Add process fixtures for success, failure, sleep, signal handling,
+- [x] `M6.20` Add process fixtures for success, failure, sleep, signal handling,
   large output, binary output, and child processes.
 - [ ] `M6.21` Add restart and cancellation integration tests.
 
@@ -296,8 +296,8 @@ each phase separately before starting the next one.
   without being killed when timeout is absent.
 - [ ] `A6.02` Worker restart preserves or correctly classifies the active
   attempt.
-- [ ] `A6.03` Cancellation terminates the complete process group.
-- [ ] `A6.04` A retry creates a new attempt and preserves the failed one.
+- [x] `A6.03` Cancellation terminates the complete process group.
+- [x] `A6.04` A retry creates a new attempt and preserves the failed one.
 - [ ] `A6.05` This milestone forms the first usable `v0.1` process queue.
 
 ## Milestone 7: Resource Scheduling

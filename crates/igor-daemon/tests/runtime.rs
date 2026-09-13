@@ -92,12 +92,12 @@ async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box
         ));
         assert!(matches!(
             client.request(role, Request::Version).await?,
-            Response::Version(version) if version.role == role && version.protocol == 2
+            Response::Version(version) if version.role == role && version.protocol == 3
         ));
         assert!(matches!(
             client.request(role, Request::DatabaseStatus).await?,
             Response::DatabaseStatus(status)
-                if status.role == role && status.schema_version == 5 && status.integrity == "ok"
+                if status.role == role && status.schema_version == 6 && status.integrity == "ok"
         ));
     }
     assert_eq!(
@@ -225,7 +225,7 @@ async fn client_rejects_response_from_the_wrong_role() -> Result<(), Box<dyn Err
             let mut request = String::new();
             let _ = BufReader::new(&stream).read_line(&mut request);
             let _ = stream.write_all(
-                b"{\"protocol_version\":2,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
+                b"{\"protocol_version\":3,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
             );
         }
     });

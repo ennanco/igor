@@ -1,10 +1,17 @@
-use std::{path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    fs::File,
+    io::{Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 
 use clap::{Args, Parser, Subcommand};
 use igor_core::{
     CommandSpec, ConfigOverrides, EffectiveConfig, Environment, EnvironmentPolicy, JobDetail,
-    JobId, JobState, Project, ProjectId, ShellPolicy, StoredEvent, StoredJob, SubmissionInput,
-    TransitionState, initialize_project, load_effective_config, load_job_file, load_project_config,
+    JobId, JobLogs, JobState, Project, ProjectId, ShellPolicy, StoredEvent, StoredJob,
+    SubmissionInput, TransitionState, initialize_project, load_effective_config, load_job_file,
+    load_project_config,
 };
 use igor_daemon::{
     Client, ClientError, DaemonRole, DatabaseStatus, Health, Request, Response, Version,
@@ -119,6 +126,26 @@ enum Command {
         job_id: JobId,
         #[arg(long)]
         json: bool,
+    },
+    /// Cancel a queued or running job.
+    Cancel {
+        job_id: JobId,
+        #[arg(long, default_value_t = 5)]
+        grace_seconds: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Queue a new attempt for a failed, cancelled, or lost job.
+    Retry {
+        job_id: JobId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the latest attempt's stdout and stderr logs.
+    Logs {
+        job_id: JobId,
+        #[arg(long)]
+        follow: bool,
     },
 }
 
@@ -379,6 +406,61 @@ async fn run() -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         }
+        Command::Cancel {
+            job_id,
+            grace_seconds,
+            json,
+        } => {
+            let effective = effective_config(&overrides, &cwd)?;
+            let response = Client::new(&effective.paths)
+                .request(
+                    DaemonRole::Worker,
+                    Request::JobCancel {
+                        job_id,
+                        grace_seconds,
+                    },
+                )
+                .await?;
+            let detail = match response {
+                Response::Cancelled(detail) => detail,
+                response => anyhow::bail!("unexpected {response:?} cancellation response"),
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&detail)?);
+            } else if detail.job.state == JobState::Cancelled {
+                println!("cancelled {}", detail.job.spec.id);
+            } else {
+                println!("cancellation requested for {}", detail.job.spec.id);
+            }
+        }
+        Command::Retry { job_id, json } => {
+            let effective = effective_config(&overrides, &cwd)?;
+            let response = Client::new(&effective.paths)
+                .request(DaemonRole::Worker, Request::JobRetry { job_id })
+                .await?;
+            let detail = match response {
+                Response::Retried(detail) => detail,
+                response => anyhow::bail!("unexpected {response:?} retry response"),
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&detail)?);
+            } else {
+                let attempt = detail
+                    .attempts
+                    .last()
+                    .ok_or_else(|| anyhow::anyhow!("retried job has no attempt"))?;
+                println!(
+                    "retried {} as attempt {} (sequence {})",
+                    detail.job.spec.id,
+                    attempt.spec.id(),
+                    attempt.spec.sequence()
+                );
+            }
+        }
+        Command::Logs { job_id, follow } => {
+            let effective = effective_config(&overrides, &cwd)?;
+            show_logs(&Client::new(&effective.paths), job_id, follow).await?;
+        }
     }
     Ok(())
 }
@@ -527,6 +609,67 @@ async fn request_events(client: &Client, job_id: JobId) -> anyhow::Result<Vec<St
         Response::Events { events } => Ok(events),
         response => anyhow::bail!("unexpected {response:?} event response"),
     }
+}
+
+async fn request_logs(client: &Client, job_id: JobId) -> anyhow::Result<JobLogs> {
+    match client
+        .request(DaemonRole::Worker, Request::JobLogs { job_id })
+        .await?
+    {
+        Response::Logs(logs) => Ok(logs),
+        response => anyhow::bail!("unexpected {response:?} job-logs response"),
+    }
+}
+
+async fn show_logs(client: &Client, job_id: JobId, follow: bool) -> anyhow::Result<()> {
+    let logs = loop {
+        let logs = request_logs(client, job_id).await?;
+        if logs.stdout_path.is_some() && logs.stderr_path.is_some() {
+            break logs;
+        }
+        if !follow || logs.state.is_terminal() {
+            anyhow::bail!("logs are not available for attempt {}", logs.attempt_id);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let (stdout_path, stderr_path) = match (logs.stdout_path, logs.stderr_path) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        _ => anyhow::bail!("logs are not available for attempt {}", logs.attempt_id),
+    };
+    let mut stdout_offset = 0;
+    let mut stderr_offset = 0;
+    loop {
+        stdout_offset += emit_log(&stdout_path, stdout_offset, false)?;
+        stderr_offset += emit_log(&stderr_path, stderr_offset, true)?;
+        if !follow {
+            break;
+        }
+        let detail = request_job(client, job_id).await?;
+        if detail.job.state.is_terminal() {
+            emit_log(&stdout_path, stdout_offset, false)?;
+            emit_log(&stderr_path, stderr_offset, true)?;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+fn emit_log(path: &Path, offset: u64, stderr: bool) -> anyhow::Result<u64> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let copied = if stderr {
+        let mut output = std::io::stderr().lock();
+        let copied = std::io::copy(&mut file, &mut output)?;
+        output.flush()?;
+        copied
+    } else {
+        let mut output = std::io::stdout().lock();
+        let copied = std::io::copy(&mut file, &mut output)?;
+        output.flush()?;
+        copied
+    };
+    Ok(copied)
 }
 
 fn print_project(project: &Project, json: bool) -> anyhow::Result<()> {

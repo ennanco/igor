@@ -23,6 +23,7 @@ use tokio::{process::Command, sync::watch, time};
 
 const CLAIM_DURATION: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const CANCELLATION_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn run(database: Database, paths: RuntimePaths, mut shutdown: watch::Receiver<bool>) {
@@ -156,6 +157,8 @@ async fn execute(
     let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
+    let mut cancellation = time::interval(CANCELLATION_INTERVAL);
+    cancellation.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     let timeout = async {
         match claim.attempt.spec.resources().timeout_seconds {
             Some(seconds) => time::sleep(Duration::from_secs(seconds)).await,
@@ -166,26 +169,111 @@ async fn execute(
     let (status, interruption) = loop {
         tokio::select! {
             result = child.wait() => break (result, None),
+            _ = cancellation.tick() => {
+                match database.jobs().cancellation_grace(claim).await {
+                    Ok(Some(grace)) => {
+                        signal_group(pid, Signal::SIGTERM);
+                        let grace_elapsed = time::sleep(grace);
+                        tokio::pin!(grace_elapsed);
+                        let mut group_poll = time::interval(Duration::from_millis(20));
+                        group_poll.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+                        group_poll.tick().await;
+                        let mut leader_status = None;
+                        let (status, state, reason) = loop {
+                            tokio::select! {
+                                status = child.wait(), if leader_status.is_none() => {
+                                    if process_group_exists(pid) {
+                                        leader_status = Some(status);
+                                    } else {
+                                        break (status, AttemptState::Cancelled, "execution cancelled");
+                                    }
+                                }
+                                _ = group_poll.tick(), if leader_status.is_some() => {
+                                    if !process_group_exists(pid)
+                                        && let Some(status) = leader_status.take()
+                                    {
+                                        break (status, AttemptState::Cancelled, "execution cancelled");
+                                    }
+                                }
+                                _ = cancellation.tick() => {
+                                    match database.jobs().cancellation_grace(claim).await {
+                                        Ok(Some(remaining)) => {
+                                            let deadline = time::Instant::now() + remaining;
+                                            if deadline < grace_elapsed.deadline() {
+                                                grace_elapsed.as_mut().reset(deadline);
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            tracing::error!(%error, job_id = %claim.job.spec.id, "cannot refresh cancellation request");
+                                            terminate_group(pid);
+                                            let status = match leader_status.take() {
+                                                Some(status) => status,
+                                                None => child.wait().await,
+                                            };
+                                            break (status, AttemptState::Failed, "cannot refresh cancellation request");
+                                        }
+                                    }
+                                }
+                                () = &mut grace_elapsed => {
+                                    terminate_group(pid);
+                                    let status = match leader_status.take() {
+                                        Some(status) => status,
+                                        None => child.wait().await,
+                                    };
+                                    break (status, AttemptState::Cancelled, "execution cancelled");
+                                }
+                                _ = shutdown.changed() => {
+                                    terminate_group(pid);
+                                    let status = match leader_status.take() {
+                                        Some(status) => status,
+                                        None => child.wait().await,
+                                    };
+                                    break (status, AttemptState::Failed, "worker shutdown interrupted execution");
+                                }
+                                _ = heartbeat.tick() => {
+                                    if let Err(error) = database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await {
+                                        tracing::error!(%error, job_id = %claim.job.spec.id, "execution heartbeat failed during cancellation");
+                                        terminate_group(pid);
+                                        let status = match leader_status.take() {
+                                            Some(status) => status,
+                                            None => child.wait().await,
+                                        };
+                                        break (status, AttemptState::Failed, "execution heartbeat failed");
+                                    }
+                                }
+                            }
+                        };
+                        break (status, Some((state, reason)));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(%error, job_id = %claim.job.spec.id, "cannot read cancellation request");
+                        terminate_group(pid);
+                        break (child.wait().await, Some((AttemptState::Failed, "cannot read cancellation request")));
+                    }
+                }
+            }
             _ = heartbeat.tick() => {
                 if let Err(error) = database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await {
                     tracing::error!(%error, job_id = %claim.job.spec.id, "execution heartbeat failed");
                     terminate_group(pid);
-                    break (child.wait().await, Some("execution heartbeat failed"));
+                    break (child.wait().await, Some((AttemptState::Failed, "execution heartbeat failed")));
                 }
             }
             () = &mut timeout => {
                 terminate_group(pid);
-                break (child.wait().await, Some("configured execution timeout elapsed"));
+                break (child.wait().await, Some((AttemptState::Failed, "configured execution timeout elapsed")));
             }
             _ = shutdown.changed() => {
                 terminate_group(pid);
-                break (child.wait().await, Some("worker shutdown interrupted execution"));
+                break (child.wait().await, Some((AttemptState::Failed, "worker shutdown interrupted execution")));
             },
         }
     };
     let outcome = match (status, interruption) {
-        (Ok(status), Some(reason)) => ExecutionOutcome {
-            state: AttemptState::Failed,
+        (Ok(status), Some((state, reason))) => ExecutionOutcome {
+            state,
             exit_code: status.code(),
             term_signal: status.signal(),
             error: Some(reason.into()),
@@ -317,7 +405,17 @@ fn process_start_ticks(pid: u32) -> io::Result<i64> {
 }
 
 fn terminate_group(pid: u32) {
+    signal_group(pid, Signal::SIGKILL);
+}
+
+fn signal_group(pid: u32, signal: Signal) {
     if let Ok(pid) = i32::try_from(pid) {
-        let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+        let _ = killpg(Pid::from_raw(pid), signal);
     }
+}
+
+fn process_group_exists(pid: u32) -> bool {
+    i32::try_from(pid)
+        .ok()
+        .is_some_and(|pid| killpg(Pid::from_raw(pid), None::<Signal>).is_ok())
 }

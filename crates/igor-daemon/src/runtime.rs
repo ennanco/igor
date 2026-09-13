@@ -427,6 +427,25 @@ async fn handle_request(
             Ok(None) => ResponseEnvelope::failure(ProtocolError::not_found("job")),
             Err(error) => persistence_response(error),
         },
+        Request::JobCancel {
+            job_id,
+            grace_seconds,
+        } => match database
+            .jobs()
+            .request_cancellation(job_id, Duration::from_secs(u64::from(grace_seconds)))
+            .await
+        {
+            Ok(job) => ResponseEnvelope::success(Response::Cancelled(job)),
+            Err(error) => persistence_response(error),
+        },
+        Request::JobRetry { job_id } => match database.jobs().retry(job_id).await {
+            Ok(job) => ResponseEnvelope::success(Response::Retried(job)),
+            Err(error) => persistence_response(error),
+        },
+        Request::JobLogs { job_id } => match database.jobs().logs_for_job(job_id).await {
+            Ok(logs) => ResponseEnvelope::success(Response::Logs(logs)),
+            Err(error) => persistence_response(error),
+        },
     }
 }
 
@@ -562,7 +581,10 @@ fn validate_response(
         | (Request::Submit { .. }, Response::Submitted(_))
         | (Request::JobList { .. }, Response::Jobs { .. })
         | (Request::JobShow { .. }, Response::Job(_))
-        | (Request::JobEvents { .. }, Response::Events { .. }) => role == DaemonRole::Worker,
+        | (Request::JobEvents { .. }, Response::Events { .. })
+        | (Request::JobCancel { .. }, Response::Cancelled(_))
+        | (Request::JobRetry { .. }, Response::Retried(_))
+        | (Request::JobLogs { .. }, Response::Logs(_)) => role == DaemonRole::Worker,
         _ => false,
     };
     if valid {

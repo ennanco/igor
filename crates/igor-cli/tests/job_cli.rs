@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use igor_core::{AttemptId, Database, JobId, JobState};
+use igor_core::{AttemptId, Database, JobId, JobState, ProcessRecord};
 use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
@@ -127,6 +127,58 @@ fn output_json(output: std::process::Output) -> Result<Value, Box<dyn Error>> {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
     }
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn process_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/process")
+        .join(name)
+}
+
+fn submit_process(fixture: &Fixture, name: &str) -> Result<JobId, Box<dyn Error>> {
+    let script = process_fixture(name);
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--json",
+                "--",
+                "/bin/sh",
+                script.to_str().ok_or("non-UTF-8 process fixture")?,
+            ])
+            .output()?,
+    )?;
+    Ok(submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing submitted job id")?
+        .parse()?)
+}
+
+async fn wait_for_process(
+    database: &Database,
+    job_id: JobId,
+) -> Result<ProcessRecord, Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let detail = database
+                .jobs()
+                .detail(job_id)
+                .await?
+                .ok_or("missing submitted job")?;
+            let attempt = detail.attempts.last().ok_or("missing submitted attempt")?;
+            if let Some(process) = database
+                .jobs()
+                .process_for_attempt(attempt.spec.id())
+                .await?
+            {
+                return Ok::<_, Box<dyn Error>>(process);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "process did not start")?
 }
 
 #[test]
@@ -521,5 +573,181 @@ async fn wait_returns_when_job_is_terminal() -> TestResult {
         interrupted.error.as_deref(),
         Some("worker shutdown interrupted execution")
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_and_retry_preserve_process_and_attempt_contracts() -> TestResult {
+    let fixture = Fixture::new()?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let graceful_job = submit_process(&fixture, "cancel-graceful.sh")?;
+    let graceful_process = wait_for_process(&database, graceful_job).await?;
+    let cancelled = output_json(
+        fixture
+            .run()
+            .args([
+                "cancel",
+                &graceful_job.to_string(),
+                "--grace-seconds",
+                "2",
+                "--json",
+            ])
+            .output()?,
+    )?;
+    assert!(matches!(
+        cancelled["job"]["state"].as_str(),
+        Some("running" | "cancelled")
+    ));
+    let waited = fixture
+        .run()
+        .args(["wait", &graceful_job.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["job"]["state"], "cancelled");
+    let process = database
+        .jobs()
+        .process_for_attempt(graceful_process.attempt_id)
+        .await?
+        .ok_or("missing cancelled process")?;
+    assert_eq!(process.exit_code, Some(0));
+    assert_eq!(process.term_signal, None);
+    assert_eq!(process.error.as_deref(), Some("execution cancelled"));
+    let logs = fixture
+        .run()
+        .args(["logs", &graceful_job.to_string()])
+        .output()?;
+    assert!(logs.status.success());
+    assert_eq!(logs.stdout, b"graceful-cancellation\n");
+
+    let child_job = submit_process(&fixture, "child-process.sh")?;
+    let child_process = wait_for_process(&database, child_job).await?;
+    let identity = loop {
+        let output = fs::read_to_string(&child_process.stdout_path)?;
+        if let Some(line) = output.lines().next() {
+            break line.to_owned();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let child_pid = identity
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("child="))
+        .ok_or("missing child PID")?
+        .parse::<i32>()?;
+    let started = Instant::now();
+    let cancel = fixture
+        .run()
+        .args(["cancel", &child_job.to_string(), "--grace-seconds", "5"])
+        .output()?;
+    assert!(cancel.status.success());
+    let expedite = fixture
+        .run()
+        .args(["cancel", &child_job.to_string(), "--grace-seconds", "0"])
+        .output()?;
+    assert!(expedite.status.success());
+    let waited = fixture
+        .run()
+        .args(["wait", &child_job.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    for _ in 0..100 {
+        if kill(Pid::from_raw(child_pid), None::<Signal>).is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(kill(Pid::from_raw(child_pid), None::<Signal>).is_err());
+
+    let failed_job = submit_process(&fixture, "failure.sh")?;
+    assert_eq!(
+        fixture
+            .run()
+            .args(["wait", &failed_job.to_string()])
+            .output()?
+            .status
+            .code(),
+        Some(1)
+    );
+    let retried = output_json(
+        fixture
+            .run()
+            .args(["retry", &failed_job.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(retried["attempts"].as_array().map(Vec::len), Some(2));
+    assert_eq!(retried["attempts"][0]["state"], "failed");
+    assert_ne!(
+        retried["attempts"][0]["spec"]["id"],
+        retried["attempts"][1]["spec"]["id"]
+    );
+    let waited = fixture
+        .run()
+        .args(["wait", &failed_job.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["attempts"].as_array().map(Vec::len), Some(2));
+    assert!(
+        waited["attempts"]
+            .as_array()
+            .is_some_and(|attempts| attempts.iter().all(|attempt| attempt["state"] == "failed"))
+    );
+    Ok(())
+}
+
+#[test]
+fn logs_follow_and_preserve_large_and_binary_output() -> TestResult {
+    let fixture = Fixture::new()?;
+    let followed = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--shell",
+                "printf 'before\\n'; sleep 1; printf 'after\\n'; printf 'error\\n' >&2",
+                "--json",
+            ])
+            .output()?,
+    )?;
+    let followed_job = followed["spec"]["id"]
+        .as_str()
+        .ok_or("missing followed job id")?;
+    let logs = fixture
+        .run()
+        .args(["logs", "--follow", followed_job])
+        .output()?;
+    assert!(logs.status.success());
+    assert_eq!(logs.stdout, b"before\nafter\n");
+    assert_eq!(logs.stderr, b"error\n");
+
+    let large_job = submit_process(&fixture, "large-output.sh")?;
+    let waited = fixture
+        .run()
+        .args(["wait", &large_job.to_string()])
+        .output()?;
+    assert!(waited.status.success());
+    let logs = fixture
+        .run()
+        .args(["logs", &large_job.to_string()])
+        .output()?;
+    assert!(logs.status.success());
+    assert_eq!(logs.stdout, vec![b'A'; 262_144]);
+    assert_eq!(logs.stderr, vec![b'B'; 262_144]);
+
+    let binary_job = submit_process(&fixture, "binary-output.sh")?;
+    let waited = fixture
+        .run()
+        .args(["wait", &binary_job.to_string()])
+        .output()?;
+    assert!(waited.status.success());
+    let logs = fixture
+        .run()
+        .args(["logs", &binary_job.to_string()])
+        .output()?;
+    assert!(logs.status.success());
+    let expected: Vec<u8> = [0, 1, 128, 255].into_iter().cycle().take(1_024).collect();
+    assert_eq!(logs.stdout, expected);
+    assert_eq!(logs.stderr, expected);
     Ok(())
 }

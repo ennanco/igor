@@ -172,7 +172,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(ledger.len(), 5);
+    assert_eq!(ledger.len(), 6);
     for (index, row) in ledger.iter().enumerate() {
         assert_eq!(row.get::<i64, _>("version"), (index + 1) as i64);
         assert!(row.get::<bool, _>("success"));
@@ -220,7 +220,7 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
             .fetch_all(database.pool())
             .await?;
-    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
     let checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
             .fetch_one(database.pool())
@@ -1305,7 +1305,12 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
     let project = project();
     database.projects().insert(&project).await?;
     let mut jobs = Vec::new();
-    for (name, priority) in [("first", 0), ("second", 0), ("urgent", 10)] {
+    for (name, priority) in [
+        ("first", 0),
+        ("second", 0),
+        ("urgent", 10),
+        ("cancel-me", -1),
+    ] {
         let mut job = job(project.id);
         job.name = name.into();
         let attempt = attempt(&job, 1)?;
@@ -1330,6 +1335,16 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
     assert_eq!(urgent.job.spec.name, "urgent");
     assert_eq!(urgent.job.state, JobState::Running);
     assert_eq!(urgent.attempt.state, AttemptState::Starting);
+    let cancel_job = jobs
+        .iter()
+        .find(|(job, _)| job.name == "cancel-me")
+        .ok_or_else(|| missing("queued cancellation fixture"))?;
+    let cancelled = database
+        .jobs()
+        .request_cancellation(cancel_job.0.id, Duration::from_secs(1))
+        .await?;
+    assert_eq!(cancelled.job.state, JobState::Cancelled);
+    assert_eq!(cancelled.attempts[0].state, AttemptState::Cancelled);
     assert!(
         database
             .jobs()
@@ -1440,6 +1455,60 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
         .await?
         .ok_or_else(|| missing("second FIFO execution was not claimed"))?;
     assert_eq!(next.job.spec.name, "second");
+    database
+        .jobs()
+        .record_process_started(
+            &next,
+            &ProcessStart {
+                pid: 4321,
+                process_group_id: 4321,
+                process_start_ticks: 6789,
+                stdout_path: PathBuf::from("/tmp/igor/retry-stdout.log"),
+                stderr_path: PathBuf::from("/tmp/igor/retry-stderr.log"),
+            },
+        )
+        .await?;
+    let cancellation = database
+        .jobs()
+        .request_cancellation(next.job.spec.id, Duration::from_secs(3))
+        .await?;
+    assert_eq!(cancellation.job.state, JobState::Running);
+    let grace = database
+        .jobs()
+        .cancellation_grace(&next)
+        .await?
+        .ok_or_else(|| missing("cancellation grace period"))?;
+    assert!(grace <= Duration::from_secs(3));
+    assert!(grace > Duration::from_secs(2));
+    database
+        .jobs()
+        .finish_execution(
+            &next,
+            &ExecutionOutcome {
+                state: AttemptState::Cancelled,
+                exit_code: None,
+                term_signal: Some(15),
+                error: Some("execution cancelled".into()),
+            },
+        )
+        .await?;
+    let retried = database.jobs().retry(next.job.spec.id).await?;
+    assert_eq!(retried.job.state, JobState::Queued);
+    assert_eq!(retried.attempts.len(), 2);
+    assert_eq!(retried.attempts[0].state, AttemptState::Cancelled);
+    assert_eq!(retried.attempts[1].state, AttemptState::Pending);
+    assert_eq!(retried.attempts[1].spec.sequence(), 2);
+    assert_eq!(
+        retried.attempts[0].spec.source(),
+        retried.attempts[1].spec.source()
+    );
+    let retry_claim = database
+        .jobs()
+        .claim_execution("worker-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("retry execution was not claimed"))?;
+    assert_eq!(retry_claim.attempt.spec.sequence(), 2);
+    assert_eq!(retry_claim.attempt.spec.id(), retried.attempts[1].spec.id());
     Ok(())
 }
 
