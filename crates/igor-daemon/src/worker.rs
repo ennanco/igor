@@ -13,7 +13,8 @@ use std::{
 
 use igor_core::{
     AttemptState, Database, EnvironmentInheritance, ExecutionClaim, ExecutionOutcome, ExecutorSpec,
-    ProcessIsolation, ProcessStart, RuntimePaths, environment_variable_is_sensitive,
+    ProcessIsolation, ProcessRecord, ProcessStart, RecoveredExecution, RuntimePaths,
+    environment_variable_is_sensitive,
 };
 use nix::{
     sys::signal::{Signal, killpg},
@@ -32,26 +33,226 @@ pub async fn run(database: Database, paths: RuntimePaths, mut shutdown: watch::R
         if *shutdown.borrow() {
             return;
         }
-        match database
-            .jobs()
-            .claim_execution(&owner, CLAIM_DURATION)
-            .await
-        {
-            Ok(Some(claim)) => execute(&database, &paths, &claim, &mut shutdown).await,
-            Ok(None) => {
-                tokio::select! {
-                    _ = time::sleep(IDLE_INTERVAL) => {}
-                    _ = shutdown.changed() => return,
+        match database.jobs().claim_recovery(&owner, CLAIM_DURATION).await {
+            Ok(Some(recovered)) => reconcile(&database, recovered, &mut shutdown).await,
+            Ok(None) => match database
+                .jobs()
+                .claim_execution(&owner, CLAIM_DURATION)
+                .await
+            {
+                Ok(Some(claim)) => execute(&database, &paths, &claim, &mut shutdown).await,
+                Ok(None) => idle(&mut shutdown).await,
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to claim queued execution");
+                    idle(&mut shutdown).await;
                 }
-            }
+            },
             Err(error) => {
-                tracing::error!(%error, "worker failed to claim queued execution");
-                tokio::select! {
-                    _ = time::sleep(IDLE_INTERVAL) => {}
-                    _ = shutdown.changed() => return,
-                }
+                tracing::error!(%error, "worker failed to claim execution recovery");
+                idle(&mut shutdown).await;
             }
         }
+    }
+}
+
+async fn idle(shutdown: &mut watch::Receiver<bool>) {
+    tokio::select! {
+        _ = time::sleep(IDLE_INTERVAL) => {}
+        _ = shutdown.changed() => {}
+    }
+}
+
+async fn reconcile(
+    database: &Database,
+    recovered: RecoveredExecution,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let validation_started = time::Instant::now();
+    let Some(process) = recovered.process else {
+        finish_lost(
+            database,
+            &recovered.claim,
+            "worker restarted before process identity was persisted",
+        )
+        .await;
+        return;
+    };
+    let Ok(pid) = u32::try_from(process.pid) else {
+        finish_lost(
+            database,
+            &recovered.claim,
+            "persisted process PID is invalid",
+        )
+        .await;
+        return;
+    };
+    let Ok(group_id) = u32::try_from(process.process_group_id) else {
+        finish_lost(
+            database,
+            &recovered.claim,
+            "persisted process group ID is invalid",
+        )
+        .await;
+        return;
+    };
+    match process_identity(pid) {
+        Ok(identity)
+            if identity.process_group_id == process.process_group_id
+                && identity.start_ticks == process.process_start_ticks => {}
+        Ok(_) => {
+            finish_lost(
+                database,
+                &recovered.claim,
+                "persisted PID belongs to a different process",
+            )
+            .await;
+            return;
+        }
+        Err(_) => {
+            finish_lost(
+                database,
+                &recovered.claim,
+                "persisted process no longer exists",
+            )
+            .await;
+            return;
+        }
+    }
+    supervise_recovered(
+        database,
+        &recovered.claim,
+        &process,
+        pid,
+        group_id,
+        recovered
+            .timeout_remaining
+            .map(|remaining| remaining.saturating_sub(validation_started.elapsed())),
+        shutdown,
+    )
+    .await;
+}
+
+async fn supervise_recovered(
+    database: &Database,
+    claim: &ExecutionClaim,
+    process: &ProcessRecord,
+    pid: u32,
+    group_id: u32,
+    timeout_remaining: Option<Duration>,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    let mut poll = time::interval(CANCELLATION_INTERVAL);
+    poll.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut leader_present = true;
+    let mut completion: Option<(AttemptState, &'static str)> = None;
+    let mut cancel_deadline = None;
+    let mut timeout_deadline = timeout_remaining.map(|remaining| time::Instant::now() + remaining);
+
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                if leader_present {
+                    match process_identity(pid) {
+                        Ok(identity)
+                            if identity.process_group_id == process.process_group_id
+                                && identity.start_ticks == process.process_start_ticks => {}
+                        Ok(_) => {
+                            finish_lost(database, claim, "PID identity changed during recovery").await;
+                            return;
+                        }
+                        Err(_) if completion.is_none() => {
+                            finish_lost(database, claim, "recovered process leader exited without an observable status").await;
+                            return;
+                        }
+                        Err(_) => leader_present = false,
+                    }
+                }
+                if !process_group_exists(group_id) {
+                    let (state, reason) = completion.unwrap_or((
+                        AttemptState::Lost,
+                        "recovered process exited without an observable status",
+                    ));
+                    finish_recovered(database, claim, state, reason).await;
+                    return;
+                }
+                if completion.is_none() || cancel_deadline.is_some() {
+                    match database.jobs().cancellation_grace(claim).await {
+                        Ok(Some(remaining)) => {
+                            if cancel_deadline.is_none() {
+                                signal_group(group_id, Signal::SIGTERM);
+                            }
+                            let deadline = time::Instant::now() + remaining;
+                            cancel_deadline = Some(cancel_deadline.map_or(deadline, |current| current.min(deadline)));
+                            completion = Some((AttemptState::Cancelled, "execution cancelled after worker recovery"));
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::error!(%error, job_id = %claim.job.spec.id, "cannot read recovered cancellation request");
+                            terminate_group(group_id);
+                            completion = Some((AttemptState::Failed, "cannot read cancellation request after recovery"));
+                        }
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                if let Err(error) = database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await {
+                    tracing::error!(%error, job_id = %claim.job.spec.id, "recovered execution heartbeat failed");
+                    terminate_group(group_id);
+                    completion = Some((AttemptState::Failed, "execution heartbeat failed after recovery"));
+                }
+            }
+            _ = wait_for_deadline(cancel_deadline), if cancel_deadline.is_some() => {
+                terminate_group(group_id);
+                cancel_deadline = None;
+            }
+            _ = wait_for_deadline(timeout_deadline), if timeout_deadline.is_some() => {
+                terminate_group(group_id);
+                timeout_deadline = None;
+                cancel_deadline = None;
+                completion = Some((AttemptState::Failed, "configured execution timeout elapsed after recovery"));
+            }
+            _ = shutdown.changed() => {
+                release_for_restart(database, claim).await;
+                return;
+            },
+        }
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<time::Instant>) {
+    match deadline {
+        Some(deadline) => time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn finish_lost(database: &Database, claim: &ExecutionClaim, reason: &str) {
+    finish_recovered(database, claim, AttemptState::Lost, reason).await;
+}
+
+async fn release_for_restart(database: &Database, claim: &ExecutionClaim) {
+    if let Err(error) = database.jobs().release_execution(claim).await {
+        tracing::error!(%error, job_id = %claim.job.spec.id, "cannot release execution for restart");
+    }
+}
+
+async fn finish_recovered(
+    database: &Database,
+    claim: &ExecutionClaim,
+    state: AttemptState,
+    reason: &str,
+) {
+    let outcome = ExecutionOutcome {
+        state,
+        exit_code: None,
+        term_signal: None,
+        error: Some(reason.into()),
+    };
+    if let Err(error) = database.jobs().finish_execution(claim, &outcome).await {
+        tracing::error!(%error, job_id = %claim.job.spec.id, "cannot persist recovered execution outcome");
     }
 }
 
@@ -224,12 +425,8 @@ async fn execute(
                                     break (status, AttemptState::Cancelled, "execution cancelled");
                                 }
                                 _ = shutdown.changed() => {
-                                    terminate_group(pid);
-                                    let status = match leader_status.take() {
-                                        Some(status) => status,
-                                        None => child.wait().await,
-                                    };
-                                    break (status, AttemptState::Failed, "worker shutdown interrupted execution");
+                                    release_for_restart(database, claim).await;
+                                    return;
                                 }
                                 _ = heartbeat.tick() => {
                                     if let Err(error) = database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await {
@@ -266,8 +463,8 @@ async fn execute(
                 break (child.wait().await, Some((AttemptState::Failed, "configured execution timeout elapsed")));
             }
             _ = shutdown.changed() => {
-                terminate_group(pid);
-                break (child.wait().await, Some((AttemptState::Failed, "worker shutdown interrupted execution")));
+                release_for_restart(database, claim).await;
+                return;
             },
         }
     };
@@ -391,17 +588,34 @@ fn minimal_environment_name(name: &str) -> bool {
 }
 
 fn process_start_ticks(pid: u32) -> io::Result<i64> {
+    Ok(process_identity(pid)?.start_ticks)
+}
+
+struct ProcessIdentity {
+    process_group_id: i64,
+    start_ticks: i64,
+}
+
+fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let end = stat
         .rfind(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process name"))?;
-    let ticks = stat[end + 1..]
-        .split_whitespace()
-        .nth(19)
+    let fields: Vec<_> = stat[end + 1..].split_whitespace().collect();
+    let process_group_id = fields
+        .get(2)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process group"))?
+        .parse::<i64>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let start_ticks = fields
+        .get(19)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?
         .parse::<i64>()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    Ok(ticks)
+    Ok(ProcessIdentity {
+        process_group_id,
+        start_ticks,
+    })
 }
 
 fn terminate_group(pid: u32) {

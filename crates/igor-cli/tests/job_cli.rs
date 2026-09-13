@@ -10,7 +10,7 @@ use std::{
 
 use igor_core::{AttemptId, Database, JobId, JobState, ProcessRecord};
 use nix::{
-    sys::signal::{Signal, kill},
+    sys::signal::{Signal, kill, killpg},
     unistd::Pid,
 };
 use serde_json::{Value, json};
@@ -55,6 +55,19 @@ impl Worker {
     }
 }
 
+fn spawn_worker(home: &Path, project: &Path) -> Result<Worker, Box<dyn Error>> {
+    Ok(Worker(
+        command(home, project)
+            .env("TELEGRAM_BOT_TOKEN", "must-not-leak")
+            .env("OPENCODE_TEST_SECRET", "must-not-leak")
+            .arg("worker")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    ))
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -84,16 +97,7 @@ impl Fixture {
         git(&project, &["config", "user.name", "Igor Test"])?;
         git(&project, &["add", "."])?;
         git(&project, &["commit", "-qm", "initial"])?;
-        let worker = Worker(
-            command(&home, &project)
-                .env("TELEGRAM_BOT_TOKEN", "must-not-leak")
-                .env("OPENCODE_TEST_SECRET", "must-not-leak")
-                .arg("worker")
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?,
-        );
+        let worker = spawn_worker(&home, &project)?;
         for _ in 0..100 {
             if home.join("runtime/igor/worker.sock").exists() {
                 let added = command(&home, &project)
@@ -119,6 +123,24 @@ impl Fixture {
 
     fn run(&self) -> Command {
         command(&self.home, &self.project)
+    }
+
+    fn restart_worker(&mut self) -> Result<(), Box<dyn Error>> {
+        self.worker.stop()?;
+        self.worker = spawn_worker(&self.home, &self.project)?;
+        for _ in 0..100 {
+            if self.home.join("runtime/igor/worker.sock").exists()
+                && self
+                    .run()
+                    .args(["project", "list", "--json"])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Err("restarted worker did not become ready".into())
     }
 }
 
@@ -561,17 +583,160 @@ async fn wait_returns_when_job_is_terminal() -> TestResult {
             .await?
             .ok_or("missing interrupted observed job")?
             .state,
-        JobState::Failed
+        JobState::Running
     );
+    assert!(kill(Pid::from_raw(i32::try_from(observed.pid)?), None::<Signal>).is_ok());
+    fixture.restart_worker()?;
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(observed_job_id)
+            .await?
+            .ok_or("missing recovered observed job")?
+            .state,
+        JobState::Running
+    );
+    assert!(
+        fixture
+            .run()
+            .args([
+                "cancel",
+                &observed_job_id.to_string(),
+                "--grace-seconds",
+                "0"
+            ])
+            .output()?
+            .status
+            .success()
+    );
+    let waited = fixture
+        .run()
+        .args(["wait", &observed_job_id.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["job"]["state"], "cancelled");
     let interrupted = database
         .jobs()
         .process_for_attempt(observed_attempt_id)
         .await?
         .ok_or("missing interrupted process")?;
-    assert_eq!(interrupted.term_signal, Some(9));
+    assert_eq!(interrupted.term_signal, None);
     assert_eq!(
         interrupted.error.as_deref(),
-        Some("worker shutdown interrupted execution")
+        Some("execution cancelled after worker recovery")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_classifies_missing_and_reused_process_identities_as_lost() -> TestResult {
+    let mut fixture = Fixture::new()?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+
+    let missing_job = submit_process(&fixture, "child-process.sh")?;
+    let missing_process = wait_for_process(&database, missing_job).await?;
+    fixture.worker.stop()?;
+    killpg(
+        Pid::from_raw(i32::try_from(missing_process.process_group_id)?),
+        Signal::SIGKILL,
+    )?;
+    for _ in 0..100 {
+        if kill(
+            Pid::from_raw(i32::try_from(missing_process.pid)?),
+            None::<Signal>,
+        )
+        .is_err()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    fixture.restart_worker()?;
+    let waited = fixture
+        .run()
+        .args(["wait", &missing_job.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["job"]["state"], "lost");
+
+    let reused_job = submit_process(&fixture, "child-process.sh")?;
+    let reused_process = wait_for_process(&database, reused_job).await?;
+    fixture.worker.stop()?;
+    sqlx::query(
+        "UPDATE attempt_processes SET process_start_ticks = process_start_ticks + 1
+         WHERE attempt_id = ?",
+    )
+    .bind(reused_process.attempt_id.to_string())
+    .execute(database.pool())
+    .await?;
+    fixture.restart_worker()?;
+    let waited = fixture
+        .run()
+        .args(["wait", &reused_job.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["job"]["state"], "lost");
+    assert!(
+        kill(
+            Pid::from_raw(i32::try_from(reused_process.pid)?),
+            None::<Signal>
+        )
+        .is_ok()
+    );
+    killpg(
+        Pid::from_raw(i32::try_from(reused_process.process_group_id)?),
+        Signal::SIGKILL,
+    )?;
+
+    let timeout_job_file = fixture._temporary.path().join("recovered-timeout.toml");
+    fs::write(
+        &timeout_job_file,
+        format!(
+            "schema_version = 1\n[execution]\nprogram = '/bin/sh'\nargs = ['{}']\n[resources]\ntimeout_seconds = 2\n",
+            process_fixture("timeout.sh").display()
+        ),
+    )?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--json",
+                "--file",
+                timeout_job_file
+                    .to_str()
+                    .ok_or("non-UTF-8 recovered timeout file")?,
+            ])
+            .output()?,
+    )?;
+    let timeout_job: JobId = submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing recovered timeout job id")?
+        .parse()?;
+    let timeout_process = wait_for_process(&database, timeout_job).await?;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+    fixture.restart_worker()?;
+    let started = Instant::now();
+    let waited = fixture
+        .run()
+        .args(["wait", &timeout_job.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["job"]["state"], "failed");
+    assert_eq!(
+        database
+            .jobs()
+            .process_for_attempt(timeout_process.attempt_id)
+            .await?
+            .ok_or("missing recovered timeout process")?
+            .error
+            .as_deref(),
+        Some("configured execution timeout elapsed after recovery")
     );
     Ok(())
 }

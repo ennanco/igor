@@ -1468,6 +1468,29 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
             },
         )
         .await?;
+    let recovered = database
+        .jobs()
+        .claim_recovery("worker-b", Duration::from_secs(30))
+        .await?;
+    assert!(recovered.is_none());
+    database.jobs().release_execution(&next).await?;
+    let recovered = database
+        .jobs()
+        .claim_recovery("worker-b", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("running execution was not recovered"))?;
+    assert_eq!(recovered.claim.attempt.spec.id(), next.attempt.spec.id());
+    assert_eq!(
+        recovered.process.as_ref().map(|process| process.pid),
+        Some(4321)
+    );
+    assert!(
+        database
+            .jobs()
+            .heartbeat_execution(&next, Duration::from_secs(30))
+            .await
+            .is_err()
+    );
     let cancellation = database
         .jobs()
         .request_cancellation(next.job.spec.id, Duration::from_secs(3))
@@ -1475,7 +1498,7 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
     assert_eq!(cancellation.job.state, JobState::Running);
     let grace = database
         .jobs()
-        .cancellation_grace(&next)
+        .cancellation_grace(&recovered.claim)
         .await?
         .ok_or_else(|| missing("cancellation grace period"))?;
     assert!(grace <= Duration::from_secs(3));
@@ -1483,7 +1506,7 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
     database
         .jobs()
         .finish_execution(
-            &next,
+            &recovered.claim,
             &ExecutionOutcome {
                 state: AttemptState::Cancelled,
                 exit_code: None,
@@ -1509,6 +1532,39 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
         .ok_or_else(|| missing("retry execution was not claimed"))?;
     assert_eq!(retry_claim.attempt.spec.sequence(), 2);
     assert_eq!(retry_claim.attempt.spec.id(), retried.attempts[1].spec.id());
+    let interrupted_start = database
+        .jobs()
+        .claim_recovery("worker-b", Duration::from_secs(30))
+        .await?;
+    assert!(interrupted_start.is_none());
+    database.jobs().release_execution(&retry_claim).await?;
+    let interrupted_start = database
+        .jobs()
+        .claim_recovery("worker-b", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("starting execution was not recovered"))?;
+    assert!(interrupted_start.process.is_none());
+    database
+        .jobs()
+        .finish_execution(
+            &interrupted_start.claim,
+            &ExecutionOutcome {
+                state: AttemptState::Lost,
+                exit_code: None,
+                term_signal: None,
+                error: Some("process identity missing".into()),
+            },
+        )
+        .await?;
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(next.job.spec.id)
+            .await?
+            .ok_or_else(|| missing("lost retry job"))?
+            .state,
+        JobState::Lost
+    );
     Ok(())
 }
 

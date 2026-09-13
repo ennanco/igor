@@ -47,8 +47,8 @@ pub use persistence::{
     DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim,
     ExecutionOutcome, Family, FamilyGenerationRepository, Generation, IntegrityCheck,
     JobAttemptRepository, JobDetail, JobLogs, PersistenceError, ProcessRecord, ProcessStart,
-    ProjectRepository, Resource, ResourceLease, ResourceRepository, StoredAttempt, StoredEvent,
-    StoredJob,
+    ProjectRepository, RecoveredExecution, Resource, ResourceLease, ResourceRepository,
+    StoredAttempt, StoredEvent, StoredJob,
 };
 pub use project::{
     PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,

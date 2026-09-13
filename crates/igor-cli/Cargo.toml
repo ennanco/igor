@@ -22,6 +22,7 @@ toml.workspace = true
 
 [dev-dependencies]
 nix.workspace = true
+sqlx.workspace = true
 tempfile.workspace = true
 
 [lints]

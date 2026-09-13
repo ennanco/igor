@@ -448,6 +448,13 @@ pub struct ExecutionClaim {
     pub expires_at: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredExecution {
+    pub claim: ExecutionClaim,
+    pub process: Option<ProcessRecord>,
+    pub timeout_remaining: Option<Duration>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ProcessRecord {
     pub attempt_id: AttemptId,
@@ -1113,6 +1120,168 @@ impl JobAttemptRepository<'_> {
         }))
     }
 
+    pub async fn claim_recovery(
+        &self,
+        owner: &str,
+        duration: Duration,
+    ) -> PersistenceResult<Option<RecoveredExecution>> {
+        let seconds = validate_lease(owner, duration)?;
+        let lease_id = Uuid::new_v4();
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin execution recovery claim", source))?;
+        let job_row = sqlx::query(
+            "WITH candidate AS (
+                 SELECT jobs.id FROM jobs
+                 JOIN attempts ON attempts.id = (
+                     SELECT id FROM attempts AS latest
+                     WHERE latest.job_id = jobs.id ORDER BY sequence DESC LIMIT 1
+                 )
+                 WHERE jobs.state = 'running' AND attempts.state IN ('starting', 'running')
+                     AND jobs.claim_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 ORDER BY jobs.updated_at, jobs.submission_order LIMIT 1
+             )
+             UPDATE jobs SET claim_id = ?, claim_owner = ?,
+                 claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = (SELECT id FROM candidate)
+             RETURNING id, project_id, spec_json, state, priority, submission_order,
+                       submitted_at, updated_at, claim_expires_at",
+        )
+        .bind(lease_id.to_string())
+        .bind(owner)
+        .bind(seconds)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("claim execution recovery", source))?;
+        let Some(job_row) = job_row else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| db("commit empty execution recovery claim", source))?;
+            return Ok(None);
+        };
+        let job_id: JobId = parse_id(job_row.get("id"), "recovered job")?;
+        let expires_at = job_row.get("claim_expires_at");
+        let job = decode_job(job_row)?;
+        let attempt_row = sqlx::query(
+            "SELECT id, spec_json, state, created_at, started_at, finished_at, updated_at
+             FROM attempts WHERE id = (
+                 SELECT id FROM attempts AS latest
+                 WHERE latest.job_id = ? ORDER BY sequence DESC LIMIT 1
+             ) AND state IN ('starting', 'running')",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("read recovered attempt", source))?
+        .ok_or(PersistenceError::Conflict {
+            entity: "recovered attempt",
+        })?;
+        let attempt = decode_attempt(attempt_row)?;
+        let process_row = sqlx::query(
+            "SELECT attempt_id, job_id, project_id, pid, process_group_id,
+                    process_start_ticks, stdout_path, stderr_path, heartbeat_at,
+                    exit_code, term_signal, error
+             FROM attempt_processes WHERE attempt_id = ?",
+        )
+        .bind(attempt.spec.id().to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("read recovered process", source))?;
+        let process = process_row.map(decode_process).transpose()?;
+        if process.is_some() {
+            let heartbeat = sqlx::query(
+                "UPDATE attempt_processes SET
+                     heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE attempt_id = ?",
+            )
+            .bind(attempt.spec.id().to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| db("heartbeat recovered process", source))?;
+            if heartbeat.rows_affected() != 1 {
+                return Err(PersistenceError::Conflict {
+                    entity: "recovered process",
+                });
+            }
+        }
+        let timeout_remaining = if let (Some(_), Some(timeout_seconds)) =
+            (&process, attempt.spec.resources().timeout_seconds)
+        {
+            sqlx::query_scalar::<_, Option<i64>>(
+                "SELECT CAST(MAX(0, ROUND(
+                         (julianday(started_at, '+' || ? || ' seconds')
+                          - julianday('now')) * 86400000
+                     )) AS INTEGER)
+                 FROM attempts
+                 WHERE id = ?",
+            )
+            .bind(
+                i64::try_from(timeout_seconds).map_err(|_| PersistenceError::InvalidValue {
+                    entity: "execution timeout",
+                    value: timeout_seconds.to_string(),
+                })?,
+            )
+            .bind(attempt.spec.id().to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read recovered execution timeout", source))?
+            .flatten()
+            .map(|milliseconds| {
+                u64::try_from(milliseconds)
+                    .map(Duration::from_millis)
+                    .map_err(|_| PersistenceError::InvalidValue {
+                        entity: "recovered execution timeout",
+                        value: milliseconds.to_string(),
+                    })
+            })
+            .transpose()?
+        } else {
+            None
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit execution recovery claim", source))?;
+        Ok(Some(RecoveredExecution {
+            claim: ExecutionClaim {
+                job,
+                attempt,
+                lease_id,
+                owner: owner.into(),
+                expires_at,
+            },
+            process,
+            timeout_remaining,
+        }))
+    }
+
+    pub async fn release_execution(&self, claim: &ExecutionClaim) -> PersistenceResult<()> {
+        let updated = sqlx::query(
+            "UPDATE jobs SET
+                 claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?",
+        )
+        .bind(claim.job.spec.id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .execute(&self.database.pool)
+        .await
+        .map_err(|source| db("release execution claim", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "execution claim",
+            });
+        }
+        Ok(())
+    }
+
     pub async fn record_process_started(
         &self,
         claim: &ExecutionClaim,
@@ -1295,7 +1464,10 @@ impl JobAttemptRepository<'_> {
     ) -> PersistenceResult<()> {
         if !matches!(
             outcome.state,
-            AttemptState::Succeeded | AttemptState::Failed | AttemptState::Cancelled
+            AttemptState::Succeeded
+                | AttemptState::Failed
+                | AttemptState::Cancelled
+                | AttemptState::Lost
         ) {
             return Err(PersistenceError::InvalidValue {
                 entity: "execution outcome",
@@ -1322,6 +1494,7 @@ impl JobAttemptRepository<'_> {
         let job_state = match outcome.state {
             AttemptState::Succeeded => JobState::Succeeded,
             AttemptState::Cancelled => JobState::Cancelled,
+            AttemptState::Lost => JobState::Lost,
             _ => JobState::Failed,
         };
         let attempt_id = claim.attempt.spec.id();

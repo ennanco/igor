@@ -12,9 +12,10 @@ It will execute arbitrary process and Docker workloads, coordinate exclusive
 compute resources, persist execution history, extract structured results, and
 generate project reports.
 
-The project is at the foundation stage and is not ready to manage real
-experiments. See [`DESIGN.md`](DESIGN.md) for the agreed architecture and
-[`TASKS.md`](TASKS.md) for the ordered implementation backlog.
+The project includes its first usable local process queue but remains under
+active development and is not ready for production experiment management. See
+[`DESIGN.md`](DESIGN.md) for the agreed architecture and [`TASKS.md`](TASKS.md)
+for the ordered implementation backlog.
 
 ## Project Setup
 
@@ -45,7 +46,7 @@ cargo test --workspace --all-features
 cargo doc --workspace --no-deps
 ```
 
-Inspect the placeholder CLI:
+Inspect the CLI:
 
 ```bash
 cargo run -p igor-cli -- --version
