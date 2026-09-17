@@ -1,12 +1,12 @@
 use std::{fmt, path::Path};
 
 use igor_core::{
-    JobDetail, JobId, JobLogs, Project, ProjectId, RuntimePaths, StoredEvent, StoredJob,
-    SubmissionInput,
+    JobDetail, JobId, JobLogs, Project, ProjectId, ResourceStatus, RuntimePaths, StoredEvent,
+    StoredJob, SubmissionInput,
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +62,7 @@ pub enum Request {
     Health,
     Version,
     DatabaseStatus,
+    Resources,
     ProjectRegister {
         project: Project,
     },
@@ -130,6 +131,7 @@ pub enum Response {
     Health(Health),
     Version(Version),
     DatabaseStatus(DatabaseStatus),
+    Resources { resources: Vec<ResourceStatus> },
     Project(Project),
     Projects { projects: Vec<Project> },
     OptionalProject { project: Option<Project> },

@@ -11,9 +11,9 @@ use igor_core::{
     ActionId, ActionRecord, ActionState, ArtifactRecord, ArtifactRole, AttemptId, AttemptSpec,
     AttemptState, CommandSpec, ConfigurationIdentity, Database, DatabaseOptions, DeliveryId,
     DeliveryRecord, DeliveryState, EnvironmentPolicy, Event, EventId, EventKind, EventPayload,
-    ExecutionOutcome, Family, FamilyId, Generation, GenerationId, GenerationIdentity,
-    IntegrityCheck, JobId, JobSpec, JobState, PersistenceError, ProcessStart, Project, ProjectId,
-    Resource, ResourceId, ResultContract, ShellPolicy, SourceIdentity,
+    ExecutionOutcome, Family, FamilyId, Generation, GenerationId, GenerationIdentity, HostGpu,
+    HostInventory, IntegrityCheck, JobId, JobSpec, JobState, PersistenceError, ProcessStart,
+    Project, ProjectId, Resource, ResourceId, ResultContract, ShellPolicy, SourceIdentity,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
@@ -1565,6 +1565,100 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
             .state,
         JobState::Lost
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn host_inventory_is_idempotent_and_removes_stale_unleased_resources() -> TestResult {
+    let (_directory, database) = database().await?;
+    let first = HostInventory {
+        detected_cpu_threads: 16,
+        cpu_threads: 8,
+        detected_memory_bytes: 32_000,
+        memory_bytes: 24_000,
+        max_concurrent_jobs: 2,
+        gpus: vec![HostGpu {
+            identity: "GPU-one".into(),
+            display_name: Some("Test GPU".into()),
+        }],
+        gpu_inventory_authoritative: true,
+        named_resources: vec!["scratch".into()],
+    };
+    database.resources().synchronize_inventory(&first).await?;
+    let first_status = database.resources().status().await?;
+    assert_eq!(first_status.len(), 5);
+    let host_id = first_status
+        .iter()
+        .find(|status| status.resource.name == "host")
+        .map(|status| status.resource.id)
+        .ok_or_else(|| missing("host resource was not registered"))?;
+    let memory = first_status
+        .iter()
+        .find(|status| status.resource.name == "memory")
+        .ok_or_else(|| missing("memory resource was not registered"))?;
+    assert_eq!(memory.resource.capacity, 24_000);
+    assert_eq!(memory.resource.metadata["detected_bytes"], 32_000);
+    let gpu_id = first_status
+        .iter()
+        .find(|status| status.resource.name == "gpu:GPU-one")
+        .map(|status| status.resource.id)
+        .ok_or_else(|| missing("GPU resource was not registered"))?;
+    let unavailable = HostInventory {
+        gpus: Vec::new(),
+        gpu_inventory_authoritative: false,
+        ..first.clone()
+    };
+    database
+        .resources()
+        .synchronize_inventory(&unavailable)
+        .await?;
+    let unavailable_status = database.resources().status().await?;
+    let unavailable_gpu = unavailable_status
+        .iter()
+        .find(|status| status.resource.id == gpu_id)
+        .ok_or_else(|| missing("GPU identity was removed after failed discovery"))?;
+    assert_eq!(unavailable_gpu.resource.metadata["available"], false);
+    database.resources().synchronize_inventory(&first).await?;
+    let (_project, job) = insert_project_job(&database).await?;
+    let lease = database
+        .resources()
+        .acquire(gpu_id, job.id, "worker", 1, Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("GPU resource was not leased"))?;
+
+    let second = HostInventory {
+        gpus: Vec::new(),
+        named_resources: Vec::new(),
+        memory_bytes: 20_000,
+        ..first
+    };
+    database.resources().synchronize_inventory(&second).await?;
+    let second_status = database.resources().status().await?;
+    assert_eq!(second_status.len(), 4);
+    assert_eq!(
+        second_status
+            .iter()
+            .find(|status| status.resource.name == "host")
+            .map(|status| status.resource.id),
+        Some(host_id)
+    );
+    assert_eq!(
+        second_status
+            .iter()
+            .find(|status| status.resource.name == "memory")
+            .map(|status| status.resource.capacity),
+        Some(20_000)
+    );
+    assert!(
+        second_status
+            .iter()
+            .any(|status| status.resource.id == gpu_id
+                && status.resource.metadata["available"] == false
+                && status.leases == [lease.clone()])
+    );
+    assert!(database.resources().release(lease.id, "worker").await?);
+    database.resources().synchronize_inventory(&second).await?;
+    assert_eq!(database.resources().status().await?.len(), 3);
     Ok(())
 }
 

@@ -12,7 +12,8 @@ use std::{
 
 use fs2::FileExt;
 use igor_core::{
-    Database, DatabaseOptions, IntegrityCheck, PersistenceError, RuntimePaths, build_submission,
+    ConfigError, Database, DatabaseOptions, GlobalConfig, IntegrityCheck, InventoryError,
+    PersistenceError, RuntimePaths, build_submission, discover_host_inventory, load_global_config,
     load_project_config,
 };
 use serde_json::Value;
@@ -51,6 +52,12 @@ pub enum DaemonError {
     Database(#[from] igor_core::PersistenceError),
     #[error("database initialization task failed: {0}")]
     DatabaseInitialization(String),
+    #[error("resource inventory configuration failed: {0}")]
+    Config(#[from] ConfigError),
+    #[error("resource discovery failed: {0}")]
+    Inventory(#[from] InventoryError),
+    #[error("resource discovery task failed: {0}")]
+    InventoryTask(String),
 }
 
 #[derive(Debug, Error)]
@@ -156,10 +163,13 @@ pub async fn run_until<F>(
 where
     F: Future<Output = ()>,
 {
-    let database = open_database(paths).await?;
     let bound = BoundSocket::bind(role, paths)?;
     let listener = bound.listener;
     let _cleanup = bound.cleanup;
+    let database = open_database(paths).await?;
+    if role == DaemonRole::Worker {
+        synchronize_host_inventory(paths, &database).await?;
+    }
     let mut requests = JoinSet::new();
     let (worker_shutdown, worker_receiver) = watch::channel(false);
     let worker = (role == DaemonRole::Worker).then(|| {
@@ -222,6 +232,25 @@ where
         }
     }
     database.pool().close().await;
+    Ok(())
+}
+
+async fn synchronize_host_inventory(
+    paths: &RuntimePaths,
+    database: &Database,
+) -> Result<(), DaemonError> {
+    let host = if paths.config_file.is_file() {
+        load_global_config(&paths.config_file)?.host
+    } else {
+        GlobalConfig::default().host
+    };
+    let inventory = tokio::task::spawn_blocking(move || discover_host_inventory(&host))
+        .await
+        .map_err(|error| DaemonError::InventoryTask(error.to_string()))??;
+    database
+        .resources()
+        .synchronize_inventory(&inventory)
+        .await?;
     Ok(())
 }
 
@@ -357,6 +386,10 @@ async fn handle_request(
         _request if role != DaemonRole::Worker => ResponseEnvelope::failure(
             ProtocolError::invalid_request("operational requests must be sent to the worker"),
         ),
+        Request::Resources => match database.resources().status().await {
+            Ok(resources) => ResponseEnvelope::success(Response::Resources { resources }),
+            Err(error) => persistence_response(error),
+        },
         Request::ProjectRegister { project } => match normalize_project(project) {
             Ok(project) => match database.projects().register(&project).await {
                 Ok(project) => ResponseEnvelope::success(Response::Project(project)),
@@ -575,6 +608,7 @@ fn validate_response(
         (Request::Health, Response::Health(value)) => value.role == role,
         (Request::Version, Response::Version(value)) => value.role == role,
         (Request::DatabaseStatus, Response::DatabaseStatus(value)) => value.role == role,
+        (Request::Resources, Response::Resources { .. }) => role == DaemonRole::Worker,
         (Request::ProjectRegister { .. }, Response::Project(_))
         | (Request::ProjectList, Response::Projects { .. })
         | (Request::ProjectByRoot { .. }, Response::OptionalProject { .. })

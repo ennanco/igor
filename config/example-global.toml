@@ -11,10 +11,13 @@ schema_version = 1
 # report_dir = "../state/reports"
 
 [host]
-# Optional host identities and observed capacity. They are scheduling metadata,
-# not implicit limits on project workloads.
+# Optional scheduling capacities. They control admission but are not cgroup
+# limits: a process can exceed its declared CPU or memory request.
 # cpu_threads = 16
 # memory_bytes = 68719476736
+# max_concurrent_jobs = 1
+# discover_gpus = true
+# A non-empty list overrides automatic GPU discovery.
 # gpus = ["GPU-uuid"]
 # named_resources = ["scratch-disk"]
 

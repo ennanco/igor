@@ -132,3 +132,65 @@ fn config_check_reports_exact_invalid_field_without_secret() -> Result<(), Box<d
     assert!(!stderr.contains(SENTINEL));
     Ok(())
 }
+
+#[test]
+fn config_set_updates_host_scheduling_limits_and_preserves_secrets() -> Result<(), Box<dyn Error>> {
+    const SENTINEL: &str = "SET-SENTINEL-SECRET";
+    let temporary = TempDir::new()?;
+    let home = temporary.path().join("home");
+    let config = home.join("config/igor/config.toml");
+    fs::create_dir_all(config.parent().ok_or("missing config parent")?)?;
+    fs::write(
+        &config,
+        format!("schema_version = 1\n[telegram]\nbot_token = '{SENTINEL}'\n"),
+    )?;
+    let output = disposable_command(&home, temporary.path())
+        .args([
+            "config",
+            "set",
+            "--max-concurrent-jobs",
+            "2",
+            "--memory-bytes",
+            "8GB",
+            "--gpu",
+            "GPU-one",
+            "--gpu",
+            "GPU-two",
+        ])
+        .output()?;
+    assert!(output.status.success(), "{}", text(output.stderr)?);
+    let raw = fs::read_to_string(&config)?;
+    assert!(raw.contains(SENTINEL));
+
+    let shown = disposable_command(&home, temporary.path())
+        .args(["config", "show", "--json"])
+        .output()?;
+    assert!(shown.status.success(), "{}", text(shown.stderr)?);
+    let shown_output = String::from_utf8(shown.stdout)?;
+    let shown: serde_json::Value = serde_json::from_str(&shown_output)?;
+    assert_eq!(shown["global"]["host"]["max_concurrent_jobs"], 2);
+    assert_eq!(shown["global"]["host"]["memory_bytes"], 8_000_000_000_u64);
+    assert_eq!(shown["global"]["host"]["gpus"][0], "GPU-one");
+    assert_eq!(shown["global"]["host"]["discover_gpus"], false);
+    assert!(!shown_output.contains(SENTINEL));
+
+    let reset = disposable_command(&home, temporary.path())
+        .args([
+            "config",
+            "set",
+            "--auto-memory",
+            "--auto-cpu",
+            "--auto-gpus",
+        ])
+        .output()?;
+    assert!(reset.status.success(), "{}", text(reset.stderr)?);
+    let reset = disposable_command(&home, temporary.path())
+        .args(["config", "show", "--json"])
+        .output()?;
+    let reset: serde_json::Value = serde_json::from_slice(&reset.stdout)?;
+    assert!(reset["global"]["host"]["memory_bytes"].is_null());
+    assert!(reset["global"]["host"]["cpu_threads"].is_null());
+    assert_eq!(reset["global"]["host"]["gpus"], serde_json::json!([]));
+    assert_eq!(reset["global"]["host"]["discover_gpus"], true);
+    Ok(())
+}

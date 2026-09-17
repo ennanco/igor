@@ -533,7 +533,7 @@ pub struct DeliveryRecord {
     pub idempotency_key: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Resource {
     pub id: ResourceId,
     pub name: String,
@@ -542,14 +542,21 @@ pub struct Resource {
     pub metadata: Value,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ResourceLease {
     pub id: Uuid,
     pub resource_id: ResourceId,
     pub job_id: JobId,
     pub owner: String,
     pub quantity: i64,
+    pub heartbeat_at: String,
     pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ResourceStatus {
+    pub resource: Resource,
+    pub leases: Vec<ResourceLease>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2513,6 +2520,183 @@ pub struct ResourceRepository<'a> {
 }
 
 impl ResourceRepository<'_> {
+    pub async fn synchronize_inventory(
+        &self,
+        inventory: &crate::HostInventory,
+    ) -> PersistenceResult<()> {
+        let cpu_capacity = i64::from(inventory.cpu_threads);
+        let memory_capacity =
+            i64::try_from(inventory.memory_bytes).map_err(|_| PersistenceError::InvalidValue {
+                entity: "host memory capacity",
+                value: inventory.memory_bytes.to_string(),
+            })?;
+        let mut resources = vec![
+            Resource {
+                id: ResourceId::new(),
+                name: "host".into(),
+                kind: "host".into(),
+                capacity: 1,
+                metadata: serde_json::json!({
+                    "managed_by": "igor",
+                    "available": true,
+                    "max_concurrent_jobs": inventory.max_concurrent_jobs,
+                }),
+            },
+            Resource {
+                id: ResourceId::new(),
+                name: "cpu".into(),
+                kind: "cpu".into(),
+                capacity: cpu_capacity,
+                metadata: serde_json::json!({
+                    "managed_by": "igor",
+                    "available": true,
+                    "detected_threads": inventory.detected_cpu_threads,
+                }),
+            },
+            Resource {
+                id: ResourceId::new(),
+                name: "memory".into(),
+                kind: "memory".into(),
+                capacity: memory_capacity,
+                metadata: serde_json::json!({
+                    "managed_by": "igor",
+                    "available": true,
+                    "detected_bytes": inventory.detected_memory_bytes,
+                }),
+            },
+        ];
+        resources.extend(inventory.gpus.iter().map(|gpu| Resource {
+            id: ResourceId::new(),
+            name: format!("gpu:{}", gpu.identity),
+            kind: "gpu".into(),
+            capacity: 1,
+            metadata: serde_json::json!({
+                "managed_by": "igor",
+                "available": true,
+                "device": gpu.identity,
+                "display_name": gpu.display_name,
+            }),
+        }));
+        resources.extend(inventory.named_resources.iter().map(|name| Resource {
+            id: ResourceId::new(),
+            name: format!("named:{name}"),
+            kind: "named".into(),
+            capacity: 1,
+            metadata: serde_json::json!({
+                "managed_by": "igor",
+                "available": true,
+                "resource_name": name,
+            }),
+        }));
+
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin resource inventory synchronization", source))?;
+        for resource in &resources {
+            sqlx::query(
+                "INSERT INTO resources (id, name, kind, capacity, metadata_json)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(name) DO UPDATE SET kind = excluded.kind,
+                     capacity = excluded.capacity, metadata_json = excluded.metadata_json",
+            )
+            .bind(resource.id.to_string())
+            .bind(&resource.name)
+            .bind(&resource.kind)
+            .bind(resource.capacity)
+            .bind(json(&resource.metadata, "resource metadata")?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| db("upsert discovered resource", source))?;
+        }
+        let managed: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, kind FROM resources
+             WHERE json_extract(metadata_json, '$.managed_by') = 'igor'",
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|source| db("list managed resources", source))?;
+        for (name, kind) in managed {
+            if resources.iter().any(|resource| resource.name == name) {
+                continue;
+            }
+            if kind == "gpu" && !inventory.gpu_inventory_authoritative {
+                mark_resource_unavailable(&mut transaction, &name).await?;
+                continue;
+            }
+            let deleted = sqlx::query(
+                "DELETE FROM resources WHERE name = ? AND NOT EXISTS (
+                     SELECT 1 FROM resource_leases WHERE resource_id = resources.id
+                 )",
+            )
+            .bind(&name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| db("remove stale managed resource", source))?;
+            if deleted.rows_affected() == 0 {
+                mark_resource_unavailable(&mut transaction, &name).await?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit resource inventory synchronization", source))?;
+        Ok(())
+    }
+
+    pub async fn status(&self) -> PersistenceResult<Vec<ResourceStatus>> {
+        let rows = sqlx::query(
+            "SELECT id, name, kind, capacity, metadata_json
+             FROM resources ORDER BY kind, name",
+        )
+        .fetch_all(&self.database.pool)
+        .await
+        .map_err(|source| db("list resources", source))?;
+        let mut status = rows
+            .into_iter()
+            .map(|row| {
+                Ok(ResourceStatus {
+                    resource: Resource {
+                        id: parse_id(row.get("id"), "resource")?,
+                        name: row.get("name"),
+                        kind: row.get("kind"),
+                        capacity: row.get("capacity"),
+                        metadata: from_json(row.get("metadata_json"), "resource metadata")?,
+                    },
+                    leases: Vec::new(),
+                })
+            })
+            .collect::<PersistenceResult<Vec<_>>>()?;
+        let leases = sqlx::query(
+            "SELECT id, resource_id, job_id, owner, quantity, heartbeat_at, expires_at
+             FROM resource_leases ORDER BY created_at, id",
+        )
+        .fetch_all(&self.database.pool)
+        .await
+        .map_err(|source| db("list resource leases", source))?;
+        for row in leases {
+            let resource_id = parse_id(row.get("resource_id"), "resource lease resource")?;
+            let lease = ResourceLease {
+                id: parse_id(row.get("id"), "resource lease")?,
+                resource_id,
+                job_id: parse_id(row.get("job_id"), "resource lease job")?,
+                owner: row.get("owner"),
+                quantity: row.get("quantity"),
+                heartbeat_at: row.get("heartbeat_at"),
+                expires_at: row.get("expires_at"),
+            };
+            if let Some(resource) = status
+                .iter_mut()
+                .find(|entry| entry.resource.id == resource_id)
+            {
+                resource.leases.push(lease);
+            }
+        }
+        Ok(status)
+    }
+
     pub async fn insert(&self, resource: &Resource) -> PersistenceResult<()> {
         sqlx::query("INSERT INTO resources (id, name, kind, capacity, metadata_json) VALUES (?, ?, ?, ?, ?)")
             .bind(resource.id.to_string()).bind(&resource.name).bind(&resource.kind).bind(resource.capacity)
@@ -2577,7 +2761,7 @@ impl ResourceRepository<'_> {
              ) AND NOT EXISTS (
                  SELECT 1 FROM resource_leases WHERE resource_id = ? AND job_id = ?
              )
-             RETURNING expires_at",
+             RETURNING heartbeat_at, expires_at",
         )
         .bind(lease_id.to_string())
         .bind(job_id.to_string())
@@ -2620,6 +2804,7 @@ impl ResourceRepository<'_> {
                 job_id,
                 owner: owner.into(),
                 quantity,
+                heartbeat_at: row.get("heartbeat_at"),
                 expires_at: row.get("expires_at"),
             })
         } else {
@@ -2677,6 +2862,22 @@ impl ResourceRepository<'_> {
             .map_err(|source| db("commit resource lease release", source))?;
         Ok(row.is_some())
     }
+}
+
+async fn mark_resource_unavailable(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    name: &str,
+) -> PersistenceResult<()> {
+    sqlx::query(
+        "UPDATE resources SET metadata_json = json_set(
+             metadata_json, '$.available', json('false')
+         ) WHERE name = ?",
+    )
+    .bind(name)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|source| db("mark stale managed resource unavailable", source))?;
+    Ok(())
 }
 
 fn parse_job_state(value: &str) -> PersistenceResult<JobState> {

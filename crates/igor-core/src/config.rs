@@ -1,8 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fmt, fs,
+    io::Write,
     os::unix::fs::MetadataExt,
+    os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
 };
 
@@ -15,6 +17,8 @@ pub const GLOBAL_CONFIG_VERSION: u32 = 1;
 pub const PROJECT_CONFIG_RELATIVE_PATH: &str = ".igor/project.toml";
 pub const REPORT_PROMPT_RELATIVE_PATH: &str = ".igor/report-prompt.md";
 pub const REDACTED: &str = "<redacted>";
+pub const DEFAULT_MAX_CONCURRENT_JOBS: u32 = 1;
+pub const MAX_CONCURRENT_JOBS: u32 = 1024;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct SecretString(String);
@@ -127,13 +131,37 @@ pub struct TelegramConfig {
     pub chat_id: Option<SecretString>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HostConfig {
     pub cpu_threads: Option<u32>,
     pub memory_bytes: Option<u64>,
     pub gpus: Vec<String>,
+    pub discover_gpus: bool,
     pub named_resources: Vec<String>,
+    pub max_concurrent_jobs: u32,
+}
+
+impl Default for HostConfig {
+    fn default() -> Self {
+        Self {
+            cpu_threads: None,
+            memory_bytes: None,
+            gpus: Vec::new(),
+            discover_gpus: true,
+            named_resources: Vec::new(),
+            max_concurrent_jobs: DEFAULT_MAX_CONCURRENT_JOBS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostConfigUpdate {
+    pub cpu_threads: Option<Option<u32>>,
+    pub memory_bytes: Option<Option<u64>>,
+    pub gpus: Option<Vec<String>>,
+    pub discover_gpus: Option<bool>,
+    pub max_concurrent_jobs: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -289,29 +317,136 @@ pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
 
 pub fn load_global_config(path: &Path) -> Result<GlobalConfig, ConfigError> {
     let input = read_config(path)?;
-    check_version(path, &input, GLOBAL_CONFIG_VERSION)?;
-    let config: GlobalConfig = parse_toml(path, &input)?;
+    parse_global_config(path, &input)
+}
+
+fn parse_global_config(path: &Path, input: &str) -> Result<GlobalConfig, ConfigError> {
+    check_version(path, input, GLOBAL_CONFIG_VERSION)?;
+    let config: GlobalConfig = parse_toml(path, input)?;
     if config.host.cpu_threads == Some(0) {
         return Err(invalid_field(path, "host.cpu_threads", "must be positive"));
     }
     if config.host.memory_bytes == Some(0) {
         return Err(invalid_field(path, "host.memory_bytes", "must be positive"));
     }
-    if config.host.gpus.iter().any(String::is_empty) {
+    if config
+        .host
+        .memory_bytes
+        .is_some_and(|value| value > i64::MAX as u64)
+    {
         return Err(invalid_field(
             path,
-            "host.gpus",
-            "identities must not be empty",
+            "host.memory_bytes",
+            &format!("must not exceed {}", i64::MAX),
         ));
     }
-    if config.host.named_resources.iter().any(String::is_empty) {
+    validate_unique_names(path, "host.gpus", &config.host.gpus, "identities")?;
+    if !(1..=MAX_CONCURRENT_JOBS).contains(&config.host.max_concurrent_jobs) {
         return Err(invalid_field(
             path,
-            "host.named_resources",
-            "names must not be empty",
+            "host.max_concurrent_jobs",
+            &format!("must be between 1 and {MAX_CONCURRENT_JOBS}"),
         ));
     }
+    validate_unique_names(
+        path,
+        "host.named_resources",
+        &config.host.named_resources,
+        "names",
+    )?;
     Ok(config)
+}
+
+fn validate_unique_names(
+    path: &Path,
+    field: &str,
+    values: &[String],
+    description: &str,
+) -> Result<(), ConfigError> {
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return Err(invalid_field(
+            path,
+            field,
+            &format!("{description} must not be empty"),
+        ));
+    }
+    let unique: BTreeSet<_> = values.iter().collect();
+    if unique.len() != values.len() {
+        return Err(invalid_field(
+            path,
+            field,
+            &format!("{description} must be unique"),
+        ));
+    }
+    Ok(())
+}
+
+pub fn update_global_host_config(
+    path: &Path,
+    update: &HostConfigUpdate,
+) -> Result<GlobalConfig, ConfigError> {
+    let input = if path.is_file() {
+        read_config(path)?
+    } else {
+        format!("schema_version = {GLOBAL_CONFIG_VERSION}\n")
+    };
+    check_version(path, &input, GLOBAL_CONFIG_VERSION)?;
+    // Edit the raw document so serializing SecretString never replaces credentials with REDACTED.
+    let mut document: toml::Table = parse_toml(path, &input)?;
+    let host = document
+        .entry("host")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| invalid_field(path, "host", "must be a table"))?;
+    update_optional_integer(
+        path,
+        host,
+        "cpu_threads",
+        update.cpu_threads.map(|value| value.map(u64::from)),
+    )?;
+    update_optional_integer(path, host, "memory_bytes", update.memory_bytes)?;
+    if let Some(gpus) = &update.gpus {
+        host.insert(
+            "gpus".into(),
+            toml::Value::Array(gpus.iter().cloned().map(toml::Value::String).collect()),
+        );
+    }
+    if let Some(discover_gpus) = update.discover_gpus {
+        host.insert("discover_gpus".into(), toml::Value::Boolean(discover_gpus));
+    }
+    if let Some(max_concurrent_jobs) = update.max_concurrent_jobs {
+        host.insert(
+            "max_concurrent_jobs".into(),
+            toml::Value::Integer(i64::from(max_concurrent_jobs)),
+        );
+    }
+    let output = toml::to_string_pretty(&document).map_err(|source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(source),
+    })?;
+    let config = parse_global_config(path, &output)?;
+    write_atomic(path, &output)?;
+    Ok(config)
+}
+
+fn update_optional_integer(
+    path: &Path,
+    table: &mut toml::Table,
+    key: &str,
+    update: Option<Option<u64>>,
+) -> Result<(), ConfigError> {
+    match update {
+        Some(Some(value)) => {
+            let value = i64::try_from(value)
+                .map_err(|_| invalid_field(path, &format!("host.{key}"), "is too large"))?;
+            table.insert(key.into(), toml::Value::Integer(value));
+        }
+        Some(None) => {
+            table.remove(key);
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 pub fn load_project_config(path: &Path) -> Result<LoadedProjectConfig, ConfigError> {
@@ -611,6 +746,34 @@ fn write_file(path: &Path, contents: &str) -> Result<(), ConfigError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let temporary = parent.join(format!(".igor-config-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok::<_, std::io::Error>(())
+    })();
+    if let Err(source) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
 }
 
 const DEFAULT_REPORT_PROMPT: &str = "# Igor report prompt\n\nGenerate a concise scientific report. Do not mix superseded generations.\n";

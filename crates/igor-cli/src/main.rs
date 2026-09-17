@@ -8,10 +8,11 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use igor_core::{
-    CommandSpec, ConfigOverrides, EffectiveConfig, Environment, EnvironmentPolicy, JobDetail,
-    JobId, JobLogs, JobState, Project, ProjectId, ShellPolicy, StoredEvent, StoredJob,
-    SubmissionInput, TransitionState, initialize_project, load_effective_config, load_job_file,
-    load_project_config,
+    CommandSpec, ConfigOverrides, EffectiveConfig, Environment, EnvironmentPolicy,
+    HostConfigUpdate, JobDetail, JobId, JobLogs, JobState, Project, ProjectId, ResourceStatus,
+    ShellPolicy, StoredEvent, StoredJob, SubmissionInput, TransitionState, initialize_project,
+    load_effective_config, load_job_file, load_project_config, select_global_config_path,
+    update_global_host_config,
 };
 use igor_daemon::{
     Client, ClientError, DaemonRole, DatabaseStatus, Health, Request, Response, Version,
@@ -97,6 +98,11 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// Show host resources and active leases.
+    Resources {
+        #[arg(long)]
+        json: bool,
+    },
     /// Register and inspect projects.
     Project {
         #[command(subcommand)]
@@ -166,6 +172,33 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Set host scheduling limits in the global configuration.
+    Set(ConfigSetArgs),
+}
+
+#[derive(Args, Debug)]
+struct ConfigSetArgs {
+    #[arg(long)]
+    max_concurrent_jobs: Option<u32>,
+    #[arg(
+        long,
+        value_name = "SIZE",
+        value_parser = parse_memory_size,
+        conflicts_with = "auto_memory"
+    )]
+    memory_bytes: Option<u64>,
+    #[arg(long)]
+    auto_memory: bool,
+    #[arg(long, conflicts_with = "auto_cpu")]
+    cpu_threads: Option<u32>,
+    #[arg(long)]
+    auto_cpu: bool,
+    #[arg(long = "gpu", conflicts_with_all = ["disable_gpus", "auto_gpus"])]
+    gpus: Vec<String>,
+    #[arg(long, conflicts_with = "auto_gpus")]
+    disable_gpus: bool,
+    #[arg(long)]
+    auto_gpus: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -256,42 +289,45 @@ async fn run() -> anyhow::Result<()> {
                 println!("{}", created.display());
             }
         }
-        Command::Config { command } => {
-            let effective = effective_config(&overrides, &cwd)?;
-            match command {
-                ConfigCommand::Path { json } => {
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "global": effective.paths.config_file,
-                                "project": effective.project.map(|project| project.config_file),
-                            }))?
-                        );
-                    } else {
-                        println!("global: {}", effective.paths.config_file.display());
-                        match effective.project {
-                            Some(project) => println!("project: {}", project.config_file.display()),
-                            None => println!("project: not found"),
-                        }
-                    }
-                }
-                ConfigCommand::Show { json } => {
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&effective)?);
-                    } else {
-                        print!("{}", toml::to_string_pretty(&effective)?);
-                    }
-                }
-                ConfigCommand::Check { json } => {
-                    if json {
-                        println!("{{\"valid\":true}}");
-                    } else {
-                        println!("configuration is valid");
+        Command::Config { command } => match command {
+            ConfigCommand::Path { json } => {
+                let effective = effective_config(&overrides, &cwd)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "global": effective.paths.config_file,
+                            "project": effective.project.map(|project| project.config_file),
+                        }))?
+                    );
+                } else {
+                    println!("global: {}", effective.paths.config_file.display());
+                    match effective.project {
+                        Some(project) => println!("project: {}", project.config_file.display()),
+                        None => println!("project: not found"),
                     }
                 }
             }
-        }
+            ConfigCommand::Show { json } => {
+                let effective = effective_config(&overrides, &cwd)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&effective)?);
+                } else {
+                    print!("{}", toml::to_string_pretty(&effective)?);
+                }
+            }
+            ConfigCommand::Check { json } => {
+                effective_config(&overrides, &cwd)?;
+                if json {
+                    println!("{{\"valid\":true}}");
+                } else {
+                    println!("configuration is valid");
+                }
+            }
+            ConfigCommand::Set(arguments) => {
+                set_host_config(&overrides, arguments)?;
+            }
+        },
         Command::Worker => {
             let effective = effective_config(&overrides, &cwd)?;
             igor_daemon::run(DaemonRole::Worker, &effective.paths).await?;
@@ -307,6 +343,17 @@ async fn run() -> anyhow::Result<()> {
                 DaemonCommand::Health { json } => show_health(&client, json).await?,
                 DaemonCommand::Status { json } => show_status(&client, json).await?,
             }
+        }
+        Command::Resources { json } => {
+            let effective = effective_config(&overrides, &cwd)?;
+            let resources = match Client::new(&effective.paths)
+                .request(DaemonRole::Worker, Request::Resources)
+                .await?
+            {
+                Response::Resources { resources } => resources,
+                response => anyhow::bail!("unexpected {response:?} resources response"),
+            };
+            print_resources(&resources, json)?;
         }
         Command::Project { command } => {
             let effective = effective_config(&overrides, &cwd)?;
@@ -463,6 +510,83 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn set_host_config(overrides: &ConfigOverrides, arguments: ConfigSetArgs) -> anyhow::Result<()> {
+    let has_update = arguments.max_concurrent_jobs.is_some()
+        || arguments.memory_bytes.is_some()
+        || arguments.auto_memory
+        || arguments.cpu_threads.is_some()
+        || arguments.auto_cpu
+        || !arguments.gpus.is_empty()
+        || arguments.disable_gpus
+        || arguments.auto_gpus;
+    if !has_update {
+        anyhow::bail!("provide at least one host scheduling limit to update");
+    }
+    let (gpus, discover_gpus) = if !arguments.gpus.is_empty() {
+        (Some(arguments.gpus), Some(false))
+    } else if arguments.disable_gpus {
+        (Some(Vec::new()), Some(false))
+    } else if arguments.auto_gpus {
+        (Some(Vec::new()), Some(true))
+    } else {
+        (None, None)
+    };
+    let update = HostConfigUpdate {
+        cpu_threads: arguments
+            .cpu_threads
+            .map(Some)
+            .or(arguments.auto_cpu.then_some(None)),
+        memory_bytes: arguments
+            .memory_bytes
+            .map(Some)
+            .or(arguments.auto_memory.then_some(None)),
+        gpus,
+        discover_gpus,
+        max_concurrent_jobs: arguments.max_concurrent_jobs,
+    };
+    let environment = Environment::from_process()?;
+    let path = select_global_config_path(&environment, overrides);
+    update_global_host_config(&path, &update)?;
+    println!(
+        "updated {}; restart the worker to apply changes",
+        path.display()
+    );
+    Ok(())
+}
+
+fn parse_memory_size(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number = value[..split]
+        .parse::<u64>()
+        .map_err(|_| "memory size must start with a positive integer".to_owned())?;
+    if number == 0 {
+        return Err("memory size must be positive".into());
+    }
+    let unit = value[split..].trim().to_ascii_uppercase();
+    let multiplier = match unit.as_str() {
+        "" | "B" => 1,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "KIB" => 1_024,
+        "MIB" => 1_048_576,
+        "GIB" => 1_073_741_824,
+        "TIB" => 1_099_511_627_776,
+        _ => {
+            return Err(
+                "supported memory units are B, KB, MB, GB, TB, KiB, MiB, GiB, and TiB".into(),
+            );
+        }
+    };
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "memory size is too large".into())
 }
 
 fn effective_config(
@@ -698,6 +822,27 @@ fn print_jobs(jobs: &[StoredJob], json: bool) -> anyhow::Result<()> {
                 job.priority,
                 job.submission_order,
                 job.spec.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_resources(resources: &[ResourceStatus], json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(resources)?);
+    } else {
+        println!("KIND\tNAME\tCAPACITY\tAVAILABLE\tLEASES");
+        for status in resources {
+            println!(
+                "{}\t{}\t{}\t{}\t{}",
+                status.resource.kind,
+                status.resource.name,
+                status.resource.capacity,
+                status.resource.metadata["available"]
+                    .as_bool()
+                    .unwrap_or(true),
+                status.leases.len()
             );
         }
     }

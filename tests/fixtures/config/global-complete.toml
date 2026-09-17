@@ -11,6 +11,8 @@ report_dir = "state/reports"
 [host]
 cpu_threads = 16
 memory_bytes = 68719476736
+max_concurrent_jobs = 2
+discover_gpus = false
 gpus = ["GPU-fixture"]
 named_resources = ["scratch-disk"]
 

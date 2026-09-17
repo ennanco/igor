@@ -17,25 +17,121 @@ active development and is not ready for production experiment management. See
 [`DESIGN.md`](DESIGN.md) for the agreed architecture and [`TASKS.md`](TASKS.md)
 for the ordered implementation backlog.
 
-## Project Setup
-
-Initialize portable configuration in an existing project:
-
-```bash
-igor init /path/to/project
-```
-
-This creates `.igor/project.toml` and the default report prompt. Machine state,
-logs, credentials, and host-specific resources remain outside the project in
-the configured XDG directories.
-
 ## Requirements
 
 - Linux
 - Rust `1.97.1`
-- `systemd --user` for the initial service integration
-- SQLite and Docker capabilities will be provided through Rust libraries and
-  optional runtime integrations
+- Git
+
+Docker and `systemd --user` integration are planned but are not required by the
+current direct-process queue.
+
+## Install From Source
+
+Igor does not have packaged releases yet. Clone the repository and install the
+`igor` binary with the pinned Rust toolchain:
+
+```bash
+git clone https://github.com/ennanco/igor.git
+cd igor
+rustup toolchain install 1.97.1
+cargo install --path crates/igor-cli --locked
+igor --version
+```
+
+Ensure Cargo's binary directory, normally `$HOME/.cargo/bin`, is in `PATH`.
+During development, commands can instead be run without installing:
+
+```bash
+cargo run -p igor-cli -- --version
+```
+
+## Quick Start
+
+Igor projects are Git repositories. Initialize the portable project
+configuration and commit it before submitting work:
+
+```bash
+cd /path/to/project
+igor init .
+git add .igor
+git commit -m "chore: configure Igor"
+```
+
+`igor init` creates `.igor/project.toml` and the default report prompt. Machine
+state, logs, credentials, and host-specific settings remain outside the project
+in the configured XDG directories.
+
+Start the worker from the project in one terminal:
+
+```bash
+igor worker
+```
+
+The worker currently runs in the foreground. Leave it running and use a second
+terminal in the same project to register the project and submit a command:
+
+```bash
+igor project add .
+igor submit --name smoke-test -- /bin/sh -c 'echo started; sleep 2; echo finished'
+```
+
+The submit command prints the job ID. Use it in the remaining commands:
+
+```bash
+igor list
+igor show JOB_ID
+igor events JOB_ID
+igor logs --follow JOB_ID
+igor wait JOB_ID
+```
+
+Running jobs can be cancelled, and failed, cancelled, or lost jobs can be
+retried without deleting their previous attempts:
+
+```bash
+igor cancel JOB_ID
+igor retry JOB_ID
+```
+
+Most inspection commands support machine-readable output through `--json`, for
+example:
+
+```bash
+igor list --json
+igor show JOB_ID --json
+igor wait JOB_ID --json
+```
+
+Use `igor --help` or `igor COMMAND --help` for the complete command reference.
+
+## Host Scheduling Limits
+
+The worker discovers host CPU, memory, and NVIDIA GPUs when it starts. Inspect
+the effective configuration and registered resources with:
+
+```bash
+igor config show
+igor resources
+igor resources --json
+```
+
+Global scheduling capacities can be changed from the CLI. Restart the worker
+after updating them:
+
+```bash
+igor config set --max-concurrent-jobs 1 --memory-bytes 32GB
+igor config set --gpu GPU-uuid-1 --gpu GPU-uuid-2
+igor config set --disable-gpus
+igor config set --auto-memory --auto-cpu --auto-gpus
+```
+
+These values define the capacities that the resource-aware scheduler will use.
+The current worker remains limited to one experiment while M7 scheduling is
+completed. They do not impose hard cgroup limits on an individual process;
+strict process limits will arrive with the planned `systemd` integration. CPU
+and memory remain unrestricted unless a smaller scheduling capacity is
+configured.
 
 ## Development
 

@@ -1,8 +1,9 @@
-use std::{error::Error, ffi::OsString, fs, path::Path};
+use std::{error::Error, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::Path};
 
 use igor_core::{
-    ConfigOverrides, Environment, REDACTED, ResourceMode, ResourceRequest, discover_project_config,
-    initialize_project, load_effective_config, load_global_config, load_project_config,
+    ConfigOverrides, Environment, HostConfigUpdate, REDACTED, ResourceMode, ResourceRequest,
+    discover_project_config, initialize_project, load_effective_config, load_global_config,
+    load_project_config, update_global_host_config,
 };
 use tempfile::TempDir;
 
@@ -303,5 +304,58 @@ fn shipped_fixtures_cover_valid_minimal_complete_and_invalid_documents()
             "accepted {fixture}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn host_limits_update_atomically_without_exposing_secrets() -> Result<(), Box<dyn Error>> {
+    const SECRET: &str = "preserve-this-token";
+    let temporary = TempDir::new()?;
+    let path = temporary.path().join("config/igor/config.toml");
+    write(
+        &path,
+        &format!("schema_version = 1\n[telegram]\nbot_token = '{SECRET}'\n"),
+    )?;
+    let updated = update_global_host_config(
+        &path,
+        &HostConfigUpdate {
+            memory_bytes: Some(Some(8_000_000_000)),
+            gpus: Some(vec!["GPU-one".into()]),
+            discover_gpus: Some(false),
+            max_concurrent_jobs: Some(2),
+            ..HostConfigUpdate::default()
+        },
+    )?;
+    assert_eq!(updated.host.memory_bytes, Some(8_000_000_000));
+    assert_eq!(updated.host.gpus, ["GPU-one"]);
+    assert!(!updated.host.discover_gpus);
+    assert_eq!(updated.host.max_concurrent_jobs, 2);
+    let raw = fs::read_to_string(&path)?;
+    assert!(raw.contains(SECRET));
+    assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+
+    let before = raw;
+    assert!(
+        update_global_host_config(
+            &path,
+            &HostConfigUpdate {
+                max_concurrent_jobs: Some(0),
+                ..HostConfigUpdate::default()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read_to_string(path)?, before);
+
+    assert!(
+        update_global_host_config(
+            &temporary.path().join("config/igor/config.toml"),
+            &HostConfigUpdate {
+                memory_bytes: Some(Some(u64::MAX)),
+                ..HostConfigUpdate::default()
+            }
+        )
+        .is_err()
+    );
     Ok(())
 }

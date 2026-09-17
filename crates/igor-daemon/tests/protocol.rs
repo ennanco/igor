@@ -93,3 +93,14 @@ fn milestone_six_operator_requests_round_trip() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+#[test]
+fn milestone_seven_resource_request_round_trips() -> Result<(), Box<dyn Error>> {
+    let envelope = RequestEnvelope::new(Request::Resources);
+    let encoded = serde_json::to_vec(&envelope)?;
+    assert_eq!(
+        serde_json::from_slice::<RequestEnvelope>(&encoded)?,
+        envelope
+    );
+    Ok(())
+}

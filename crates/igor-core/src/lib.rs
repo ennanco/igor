@@ -7,6 +7,7 @@ mod error;
 mod event;
 mod executor;
 mod id;
+mod inventory;
 mod job;
 pub mod persistence;
 mod project;
@@ -22,11 +23,12 @@ pub use command::{
     environment_variable_is_sensitive,
 };
 pub use config::{
-    ConfigError, ConfigOverrides, EffectiveConfig, Environment, GLOBAL_CONFIG_VERSION,
-    GlobalConfig, GlobalPathConfig, HostConfig, LoadedProjectConfig, PROJECT_CONFIG_RELATIVE_PATH,
-    REDACTED, REPORT_PROMPT_RELATIVE_PATH, RuntimePaths, SecretString, TelegramConfig,
+    ConfigError, ConfigOverrides, DEFAULT_MAX_CONCURRENT_JOBS, EffectiveConfig, Environment,
+    GLOBAL_CONFIG_VERSION, GlobalConfig, GlobalPathConfig, HostConfig, HostConfigUpdate,
+    LoadedProjectConfig, MAX_CONCURRENT_JOBS, PROJECT_CONFIG_RELATIVE_PATH, REDACTED,
+    REPORT_PROMPT_RELATIVE_PATH, RuntimePaths, SecretString, TelegramConfig,
     discover_project_config, initialize_project, load_effective_config, load_global_config,
-    load_project_config, select_global_config_path,
+    load_project_config, select_global_config_path, update_global_host_config,
 };
 pub use error::{DomainError, ErrorCategory, ErrorCode, Result};
 pub use event::{Event, EventKind, EventPayload};
@@ -38,6 +40,7 @@ pub use id::{
     ActionId, AgentSessionId, AttemptId, DeliveryId, EventId, FamilyId, GenerationId, JobId,
     ProjectId, RecoveryId, ReportId, ResourceId,
 };
+pub use inventory::{HostGpu, HostInventory, InventoryError, discover_host_inventory};
 pub use job::{
     AttemptSpec, ConfigurationIdentity, ContentIdentity, ContentRole, FamilyMembership,
     GenerationIdentity, GitIdentity, JobSpec, ResultContract, Seed, SourceIdentity,
@@ -48,7 +51,7 @@ pub use persistence::{
     ExecutionOutcome, Family, FamilyGenerationRepository, Generation, IntegrityCheck,
     JobAttemptRepository, JobDetail, JobLogs, PersistenceError, ProcessRecord, ProcessStart,
     ProjectRepository, RecoveredExecution, Resource, ResourceLease, ResourceRepository,
-    StoredAttempt, StoredEvent, StoredJob,
+    ResourceStatus, StoredAttempt, StoredEvent, StoredJob,
 };
 pub use project::{
     PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,

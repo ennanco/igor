@@ -304,6 +304,12 @@ Resource requests guide scheduling. Enforced cgroup limits are a separate,
 explicit option. Igor must never silently convert a scheduling estimate into a
 hard limit.
 
+The global host configuration may cap the CPU threads and memory considered by
+the scheduler, restrict enabled GPU identities, and limit concurrent jobs. The
+worker defaults to one concurrent experiment to avoid accidental multi-job
+oversubscription. These are admission controls, not hard process limits; strict
+enforcement requires the later cgroup and `systemd` integration.
+
 ### 9.3 Scheduling Policy
 
 - Priority first.

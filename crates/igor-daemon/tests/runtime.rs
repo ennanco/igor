@@ -92,7 +92,7 @@ async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box
         ));
         assert!(matches!(
             client.request(role, Request::Version).await?,
-            Response::Version(version) if version.role == role && version.protocol == 3
+            Response::Version(version) if version.role == role && version.protocol == 4
         ));
         assert!(matches!(
             client.request(role, Request::DatabaseStatus).await?,
@@ -100,6 +100,13 @@ async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box
                 if status.role == role && status.schema_version == 6 && status.integrity == "ok"
         ));
     }
+    assert!(matches!(
+        client.request(DaemonRole::Worker, Request::Resources).await?,
+        Response::Resources { resources }
+            if resources.iter().any(|status| status.resource.name == "host")
+                && resources.iter().any(|status| status.resource.name == "cpu")
+                && resources.iter().any(|status| status.resource.name == "memory")
+    ));
     assert_eq!(
         fs::metadata(&paths.runtime_dir)?.permissions().mode() & 0o777,
         0o700
@@ -164,7 +171,10 @@ async fn stale_socket_is_removed_but_regular_file_is_preserved() -> Result<(), B
         .await
         .err()
         .ok_or("worker replaced a regular file")?;
-    assert!(matches!(error, DaemonError::InsecureRuntime { .. }));
+    assert!(
+        matches!(error, DaemonError::InsecureRuntime { .. }),
+        "unexpected error: {error:?}"
+    );
     assert_eq!(fs::read_to_string(&paths.worker_socket)?, "do not remove");
     Ok(())
 }
@@ -225,7 +235,7 @@ async fn client_rejects_response_from_the_wrong_role() -> Result<(), Box<dyn Err
             let mut request = String::new();
             let _ = BufReader::new(&stream).read_line(&mut request);
             let _ = stream.write_all(
-                b"{\"protocol_version\":3,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
+                b"{\"protocol_version\":4,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
             );
         }
     });
@@ -250,6 +260,12 @@ async fn supervisor_rejects_worker_operations() -> Result<(), Box<dyn Error>> {
         .await
         .err()
         .ok_or("supervisor accepted a worker operation")?;
+    assert!(matches!(error, ClientError::InvalidRequest { .. }));
+    let error = Client::new(&paths)
+        .request(DaemonRole::Supervisor, Request::Resources)
+        .await
+        .err()
+        .ok_or("supervisor accepted a resources request")?;
     assert!(matches!(error, ClientError::InvalidRequest { .. }));
     let _ = stop.send(());
     supervisor.await??;

@@ -304,12 +304,25 @@ each phase separately before starting the next one.
 
 Dependencies: milestone 6.
 
+### Implementation Phases
+
+- **Phase 1: inventory and observability.** Discover host resources, register a
+  stable inventory, expose scheduling limits through `igor config`, and add
+  `igor resources`.
+- **Phase 2: atomic scheduling.** Reserve host, GPU, and named resources in the
+  execution claim transaction, then heartbeat, recover, and release every
+  lease safely.
+- **Phase 3: concurrent execution.** Supervise compatible jobs concurrently,
+  enforce concrete GPU visibility, and retain exclusive-host isolation.
+- **Phase 4: aging and acceptance.** Add deterministic priority aging and
+  complete simulated contention and acceptance coverage.
+
 ### Tasks
 
-- [ ] `M7.01` Discover host CPU count and total memory for diagnostics only.
-- [ ] `M7.02` Discover NVIDIA GPUs when available without making NVIDIA a core
+- [x] `M7.01` Discover host CPU count and total memory for diagnostics only.
+- [x] `M7.02` Discover NVIDIA GPUs when available without making NVIDIA a core
   requirement.
-- [ ] `M7.03` Register host, GPU, and named resources in SQLite.
+- [x] `M7.03` Register host, GPU, and named resources in SQLite.
 - [ ] `M7.04` Implement `exclusive-host` as the default for unknown jobs.
 - [ ] `M7.05` Implement exclusive allocation of a specific GPU.
 - [ ] `M7.06` Set the assigned device in `CUDA_VISIBLE_DEVICES` for direct jobs.
@@ -320,15 +333,15 @@ Dependencies: milestone 6.
 - [ ] `M7.10` Release leases on every terminal transition and failed launch.
 - [ ] `M7.11` Implement priority aging without reordering equal effective
   priorities unpredictably.
-- [ ] `M7.12` Implement `igor resources` and JSON output.
+- [x] `M7.12` Implement `igor resources` and JSON output.
 - [ ] `M7.13` Add simulated multi-GPU and named-resource tests.
-- [ ] `M7.14` Add tests proving CPU and memory discovery does not impose limits.
+- [x] `M7.14` Add tests proving CPU and memory discovery does not impose limits.
 
 ### Acceptance
 
 - [ ] `A7.01` Two exclusive-host jobs never run concurrently.
 - [ ] `A7.02` Two jobs never receive the same exclusive GPU lease.
-- [ ] `A7.03` A job can use all host CPU and memory by default.
+- [x] `A7.03` A job can use all host CPU and memory by default.
 - [ ] `A7.04` Stale leases recover without allowing two live owners.
 
 ## Milestone 8: Docker Executor
