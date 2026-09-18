@@ -18,12 +18,14 @@ use uuid::Uuid;
 use crate::{
     ActionId, ActionState, ArtifactRole, AttemptId, AttemptSpec, AttemptState, DeliveryId,
     DeliveryState, DomainError, Event, EventId, EventKind, EventPayload, FamilyId, GenerationId,
-    GenerationIdentity, JobId, JobSpec, JobState, Project, ProjectId, ResourceId, TransitionState,
+    GenerationIdentity, GpuRequest, JobId, JobSpec, JobState, Project, ProjectId, ResourceId,
+    ResourceMode, ResourceRequest, TransitionState,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!();
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_LEASE_SECONDS: u64 = 24 * 60 * 60;
+const PRIORITY_AGING_INTERVAL_SECONDS: i64 = 60 * 60;
 
 pub type PersistenceResult<T> = std::result::Result<T, PersistenceError>;
 
@@ -446,6 +448,8 @@ pub struct ExecutionClaim {
     pub lease_id: Uuid,
     pub owner: String,
     pub expires_at: String,
+    pub resource_leases: Vec<ResourceLease>,
+    pub assigned_gpus: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -557,6 +561,463 @@ pub struct ResourceLease {
 pub struct ResourceStatus {
     pub resource: Resource,
     pub leases: Vec<ResourceLease>,
+}
+
+#[derive(Clone)]
+struct SchedulingResource {
+    resource: Resource,
+    used: i64,
+    available: bool,
+}
+
+struct PlannedLease {
+    resource_id: ResourceId,
+    quantity: i64,
+    assigned_gpu: Option<String>,
+}
+
+struct LeasedResource {
+    lease: ResourceLease,
+    resource: Resource,
+}
+
+fn execution_resource_conflict() -> PersistenceError {
+    PersistenceError::Conflict {
+        entity: "execution resource leases",
+    }
+}
+
+fn assigned_gpus(plan: &[PlannedLease]) -> Vec<String> {
+    plan.iter()
+        .filter_map(|lease| lease.assigned_gpu.clone())
+        .collect()
+}
+
+async fn lock_execution_scheduler(
+    transaction: &mut Transaction<'_, Sqlite>,
+    operation: &'static str,
+) -> PersistenceResult<bool> {
+    let locked = sqlx::query("UPDATE resources SET capacity = capacity WHERE name = 'host'")
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| db(operation, source))?;
+    Ok(locked.rows_affected() == 1)
+}
+
+async fn scheduling_resources(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> PersistenceResult<Vec<SchedulingResource>> {
+    let rows = sqlx::query(
+        "SELECT resources.id, resources.name, resources.kind, resources.capacity,
+                resources.metadata_json, COALESCE(SUM(resource_leases.quantity), 0) AS used
+         FROM resources
+         LEFT JOIN resource_leases ON resource_leases.resource_id = resources.id
+         GROUP BY resources.id
+         ORDER BY resources.kind, resources.name",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|source| db("read scheduling resources", source))?;
+    rows.into_iter()
+        .map(|row| {
+            let metadata: Value = from_json(row.get("metadata_json"), "resource metadata")?;
+            Ok(SchedulingResource {
+                available: metadata["available"].as_bool().unwrap_or(true),
+                resource: Resource {
+                    id: parse_id(row.get("id"), "scheduling resource")?,
+                    name: row.get("name"),
+                    kind: row.get("kind"),
+                    capacity: row.get("capacity"),
+                    metadata,
+                },
+                used: row.get("used"),
+            })
+        })
+        .collect()
+}
+
+fn plan_resource_leases(
+    request: &ResourceRequest,
+    inventory: &[SchedulingResource],
+) -> PersistenceResult<Option<Vec<PlannedLease>>> {
+    request.validate()?;
+    let mut inventory = inventory.to_vec();
+    let host_capacity = inventory
+        .iter()
+        .find(|resource| resource.resource.name == "host" && resource.available)
+        .map(|resource| resource.resource.capacity);
+    let Some(host_capacity) = host_capacity else {
+        return Ok(None);
+    };
+    let host_quantity = match request.mode {
+        ResourceMode::ExclusiveHost => host_capacity,
+        ResourceMode::Shared => 1,
+    };
+    let mut plan = Vec::new();
+    if !plan_named_resource(&mut inventory, &mut plan, "host", host_quantity, None) {
+        return Ok(None);
+    }
+    if let Some(cpu_threads) = request.cpu_threads
+        && !plan_named_resource(
+            &mut inventory,
+            &mut plan,
+            "cpu",
+            i64::from(cpu_threads),
+            None,
+        )
+    {
+        return Ok(None);
+    }
+    if let Some(memory_bytes) = request.memory_bytes {
+        let quantity = i64::try_from(memory_bytes).map_err(|_| PersistenceError::InvalidValue {
+            entity: "execution memory request",
+            value: memory_bytes.to_string(),
+        })?;
+        if !plan_named_resource(&mut inventory, &mut plan, "memory", quantity, None) {
+            return Ok(None);
+        }
+    }
+    match &request.gpu {
+        GpuRequest::None => {}
+        GpuRequest::Specific(device) => {
+            if !plan_named_resource(
+                &mut inventory,
+                &mut plan,
+                &format!("gpu:{device}"),
+                1,
+                Some(device.clone()),
+            ) {
+                return Ok(None);
+            }
+        }
+        GpuRequest::Any => {
+            for _ in 0..request.gpu_count {
+                let Some(index) = inventory.iter().position(|resource| {
+                    resource.resource.kind == "gpu"
+                        && resource.available
+                        && resource.used < resource.resource.capacity
+                }) else {
+                    return Ok(None);
+                };
+                let device = inventory[index].resource.metadata["device"]
+                    .as_str()
+                    .ok_or_else(|| PersistenceError::InvalidValue {
+                        entity: "GPU resource metadata",
+                        value: inventory[index].resource.metadata.to_string(),
+                    })?
+                    .to_owned();
+                inventory[index].used += 1;
+                plan.push(PlannedLease {
+                    resource_id: inventory[index].resource.id,
+                    quantity: 1,
+                    assigned_gpu: Some(device),
+                });
+            }
+        }
+    }
+    for resource in &request.named {
+        if !plan_named_resource(
+            &mut inventory,
+            &mut plan,
+            &format!("named:{}", resource.name),
+            1,
+            None,
+        ) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(plan))
+}
+
+fn plan_named_resource(
+    inventory: &mut [SchedulingResource],
+    plan: &mut Vec<PlannedLease>,
+    name: &str,
+    quantity: i64,
+    assigned_gpu: Option<String>,
+) -> bool {
+    let Some(resource) = inventory.iter_mut().find(|resource| {
+        resource.resource.name == name
+            && resource.available
+            && resource.resource.capacity - resource.used >= quantity
+    }) else {
+        return false;
+    };
+    resource.used += quantity;
+    plan.push(PlannedLease {
+        resource_id: resource.resource.id,
+        quantity,
+        assigned_gpu,
+    });
+    true
+}
+
+async fn reserve_execution_resources(
+    transaction: &mut Transaction<'_, Sqlite>,
+    project_id: ProjectId,
+    job_id: JobId,
+    owner: &str,
+    seconds: i64,
+    plan: &[PlannedLease],
+) -> PersistenceResult<Vec<ResourceLease>> {
+    let mut leases = Vec::with_capacity(plan.len());
+    for planned in plan {
+        let lease_id = Uuid::new_v4();
+        let row = sqlx::query(
+            "INSERT INTO resource_leases
+                 (id, resource_id, job_id, owner, quantity, expires_at)
+             VALUES (?, ?, ?, ?, ?,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'))
+             RETURNING heartbeat_at, expires_at",
+        )
+        .bind(lease_id.to_string())
+        .bind(planned.resource_id.to_string())
+        .bind(job_id.to_string())
+        .bind(owner)
+        .bind(planned.quantity)
+        .bind(seconds)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|source| db("reserve execution resource", source))?;
+        let event = claim_event(
+            EventKind::ResourceReserved,
+            lease_id,
+            owner,
+            "reserved",
+            "resource_lease",
+            &lease_id.to_string(),
+        )?;
+        insert_event(transaction, project_id, Some(job_id), None, &event).await?;
+        leases.push(ResourceLease {
+            id: lease_id,
+            resource_id: planned.resource_id,
+            job_id,
+            owner: owner.into(),
+            quantity: planned.quantity,
+            heartbeat_at: row.get("heartbeat_at"),
+            expires_at: row.get("expires_at"),
+        });
+    }
+    Ok(leases)
+}
+
+async fn execution_resource_leases(
+    transaction: &mut Transaction<'_, Sqlite>,
+    job_id: JobId,
+) -> PersistenceResult<Vec<LeasedResource>> {
+    let rows = sqlx::query(
+        "SELECT resource_leases.id AS lease_id, resource_leases.resource_id,
+                resource_leases.job_id, resource_leases.owner, resource_leases.quantity,
+                resource_leases.heartbeat_at, resource_leases.expires_at,
+                resources.name, resources.kind, resources.capacity, resources.metadata_json
+         FROM resource_leases
+         JOIN resources ON resources.id = resource_leases.resource_id
+         WHERE resource_leases.job_id = ?
+         ORDER BY resources.kind, resources.name",
+    )
+    .bind(job_id.to_string())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|source| db("read execution resource leases", source))?;
+    rows.into_iter()
+        .map(|row| {
+            let resource_id = parse_id(row.get("resource_id"), "execution lease resource")?;
+            Ok(LeasedResource {
+                lease: ResourceLease {
+                    id: parse_id(row.get("lease_id"), "execution resource lease")?,
+                    resource_id,
+                    job_id: parse_id(row.get("job_id"), "execution resource lease job")?,
+                    owner: row.get("owner"),
+                    quantity: row.get("quantity"),
+                    heartbeat_at: row.get("heartbeat_at"),
+                    expires_at: row.get("expires_at"),
+                },
+                resource: Resource {
+                    id: resource_id,
+                    name: row.get("name"),
+                    kind: row.get("kind"),
+                    capacity: row.get("capacity"),
+                    metadata: from_json(row.get("metadata_json"), "resource metadata")?,
+                },
+            })
+        })
+        .collect()
+}
+
+fn validate_execution_resource_leases(
+    request: &ResourceRequest,
+    leased: &[LeasedResource],
+) -> PersistenceResult<Vec<String>> {
+    let host = leased
+        .iter()
+        .find(|leased| leased.resource.name == "host")
+        .ok_or_else(execution_resource_conflict)?;
+    let expected_host = match request.mode {
+        ResourceMode::ExclusiveHost => host.resource.capacity,
+        ResourceMode::Shared => 1,
+    };
+    if host.lease.quantity != expected_host {
+        return Err(execution_resource_conflict());
+    }
+    let exact_quantity = |name: &str, expected: Option<i64>| {
+        let actual = leased
+            .iter()
+            .find(|leased| leased.resource.name == name)
+            .map(|leased| leased.lease.quantity);
+        (actual == expected).then_some(())
+    };
+    if exact_quantity("cpu", request.cpu_threads.map(i64::from)).is_none()
+        || exact_quantity(
+            "memory",
+            request
+                .memory_bytes
+                .and_then(|value| i64::try_from(value).ok()),
+        )
+        .is_none()
+    {
+        return Err(execution_resource_conflict());
+    }
+    let gpu_leases: Vec<_> = leased
+        .iter()
+        .filter(|leased| leased.resource.kind == "gpu")
+        .collect();
+    let assigned_gpus = match &request.gpu {
+        GpuRequest::None if gpu_leases.is_empty() => Vec::new(),
+        GpuRequest::Specific(device)
+            if gpu_leases.len() == 1
+                && gpu_leases[0].resource.metadata["device"].as_str() == Some(device) =>
+        {
+            vec![device.clone()]
+        }
+        GpuRequest::Any
+            if gpu_leases.len()
+                == usize::try_from(request.gpu_count).map_err(|_| {
+                    PersistenceError::InvalidValue {
+                        entity: "GPU count",
+                        value: request.gpu_count.to_string(),
+                    }
+                })? =>
+        {
+            gpu_leases
+                .iter()
+                .map(|leased| {
+                    leased.resource.metadata["device"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| PersistenceError::InvalidValue {
+                            entity: "GPU resource metadata",
+                            value: leased.resource.metadata.to_string(),
+                        })
+                })
+                .collect::<PersistenceResult<Vec<_>>>()?
+        }
+        _ => return Err(execution_resource_conflict()),
+    };
+    let named: std::collections::BTreeSet<_> = leased
+        .iter()
+        .filter(|leased| leased.resource.kind == "named")
+        .filter_map(|leased| leased.resource.name.strip_prefix("named:"))
+        .collect();
+    let expected_named: std::collections::BTreeSet<_> = request
+        .named
+        .iter()
+        .map(|resource| resource.name.as_str())
+        .collect();
+    if named != expected_named {
+        return Err(execution_resource_conflict());
+    }
+    let expected_count = 1
+        + usize::from(request.cpu_threads.is_some())
+        + usize::from(request.memory_bytes.is_some())
+        + gpu_leases.len()
+        + expected_named.len();
+    if leased.len() != expected_count {
+        return Err(execution_resource_conflict());
+    }
+    Ok(assigned_gpus)
+}
+
+async fn release_claim_resources(
+    transaction: &mut Transaction<'_, Sqlite>,
+    claim: &ExecutionClaim,
+) -> PersistenceResult<()> {
+    let rows = sqlx::query(
+        "DELETE FROM resource_leases
+         WHERE job_id = ? AND owner = ?
+         RETURNING id",
+    )
+    .bind(claim.job.spec.id.to_string())
+    .bind(&claim.owner)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|source| db("release execution resources", source))?;
+    if rows.len() != claim.resource_leases.len() {
+        return Err(execution_resource_conflict());
+    }
+    for row in rows {
+        let lease_id: Uuid = parse_id(row.get("id"), "released execution resource lease")?;
+        let event = claim_event(
+            EventKind::ResourceReleased,
+            lease_id,
+            &claim.owner,
+            "released",
+            "resource_lease",
+            &lease_id.to_string(),
+        )?;
+        insert_event(
+            transaction,
+            claim.job.spec.project_id,
+            Some(claim.job.spec.id),
+            None,
+            &event,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn release_reclaimable_resource_leases(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> PersistenceResult<()> {
+    let rows = sqlx::query(
+        "DELETE FROM resource_leases
+         WHERE expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             AND NOT EXISTS (
+                 SELECT 1 FROM jobs
+                 WHERE jobs.id = resource_leases.job_id AND jobs.state = 'running'
+             )
+         RETURNING id, job_id, owner",
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|source| db("release reclaimable resource leases", source))?;
+    for row in rows {
+        let lease_id: Uuid = parse_id(row.get("id"), "reclaimed resource lease")?;
+        let job_id: JobId = parse_id(row.get("job_id"), "reclaimed resource lease job")?;
+        let owner: String = row.get("owner");
+        let project_id: String = sqlx::query_scalar("SELECT project_id FROM jobs WHERE id = ?")
+            .bind(job_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|source| db("read reclaimed resource lease project", source))?;
+        let event = claim_event(
+            EventKind::ResourceReleased,
+            lease_id,
+            &owner,
+            "expired",
+            "resource_lease",
+            &lease_id.to_string(),
+        )?;
+        insert_event(
+            transaction,
+            parse_id(&project_id, "reclaimed resource lease project")?,
+            Some(job_id),
+            None,
+            &event,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -974,7 +1435,10 @@ impl JobAttemptRepository<'_> {
             "WITH candidate AS (
                 SELECT id FROM jobs
                 WHERE state = 'queued' OR (state = 'running' AND claim_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                ORDER BY priority DESC, submission_order ASC LIMIT 1
+                ORDER BY priority + MAX(0,
+                    CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', submitted_at) AS INTEGER)
+                ) / ? DESC,
+                         submission_order ASC LIMIT 1
              )
              UPDATE jobs SET state = 'running', claim_id = ?, claim_owner = ?,
                  claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
@@ -982,6 +1446,7 @@ impl JobAttemptRepository<'_> {
              WHERE id = (SELECT id FROM candidate)
              RETURNING id, project_id, claim_expires_at",
         )
+        .bind(PRIORITY_AGING_INTERVAL_SECONDS)
         .bind(lease_id.to_string())
         .bind(owner)
         .bind(seconds)
@@ -1035,52 +1500,103 @@ impl JobAttemptRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin execution claim", source))?;
-        let job_row = sqlx::query(
-            "WITH candidate AS (
-                SELECT jobs.id FROM jobs
-                JOIN attempts ON attempts.id = (
-                    SELECT id FROM attempts AS latest
-                    WHERE latest.job_id = jobs.id ORDER BY sequence DESC LIMIT 1
-                )
-                WHERE jobs.state = 'queued' AND attempts.state = 'pending'
-                    AND NOT EXISTS (SELECT 1 FROM jobs AS active WHERE active.state = 'running')
-                ORDER BY jobs.priority DESC, jobs.submission_order ASC LIMIT 1
+        // Acquire SQLite's write lock before reading candidates so concurrent
+        // schedulers cannot plan from the same lease snapshot.
+        if !lock_execution_scheduler(&mut transaction, "lock execution scheduler").await? {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| db("commit execution claim without inventory", source))?;
+            return Ok(None);
+        }
+        release_reclaimable_resource_leases(&mut transaction).await?;
+        let inventory = scheduling_resources(&mut transaction).await?;
+        let candidates = sqlx::query(
+            "SELECT jobs.id, jobs.project_id, jobs.spec_json, jobs.state, jobs.priority,
+                    jobs.submission_order, jobs.submitted_at, jobs.updated_at
+             FROM jobs
+             JOIN attempts ON attempts.id = (
+                 SELECT id FROM attempts AS latest
+                 WHERE latest.job_id = jobs.id ORDER BY sequence DESC LIMIT 1
              )
-             UPDATE jobs SET state = 'running', claim_id = ?, claim_owner = ?,
-                 claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = (SELECT id FROM candidate)
-             RETURNING id, project_id, spec_json, state, priority, submission_order,
-                       submitted_at, updated_at, claim_expires_at",
+             WHERE jobs.state = 'queued' AND attempts.state = 'pending'
+             ORDER BY jobs.priority + MAX(0,
+                 CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', jobs.submitted_at) AS INTEGER)
+             ) / ? DESC,
+                      jobs.submission_order ASC",
         )
-        .bind(lease_id.to_string())
-        .bind(owner)
-        .bind(seconds)
-        .fetch_optional(&mut *transaction)
+        .bind(PRIORITY_AGING_INTERVAL_SECONDS)
+        .fetch_all(&mut *transaction)
         .await
-        .map_err(|source| db("claim execution job", source))?;
-        let Some(job_row) = job_row else {
+        .map_err(|source| db("list execution candidates", source))?;
+        let mut selected = None;
+        for job_row in candidates {
+            let job = decode_job(job_row)?;
+            let attempt_row = sqlx::query(
+                "SELECT id, spec_json, state, created_at, started_at, finished_at, updated_at
+                 FROM attempts WHERE id = (
+                     SELECT id FROM attempts AS latest
+                     WHERE latest.job_id = ? ORDER BY sequence DESC LIMIT 1
+                 ) AND state = 'pending'",
+            )
+            .bind(job.spec.id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read execution candidate attempt", source))?
+            .ok_or(PersistenceError::Conflict {
+                entity: "execution attempt",
+            })?;
+            let attempt = decode_attempt(attempt_row)?;
+            if let Some(plan) = plan_resource_leases(attempt.spec.resources(), &inventory)? {
+                selected = Some((job, attempt, plan));
+                break;
+            }
+        }
+        let Some((candidate_job, candidate_attempt, plan)) = selected else {
             transaction
                 .commit()
                 .await
                 .map_err(|source| db("commit empty execution claim", source))?;
             return Ok(None);
         };
-        let job_id: JobId = parse_id(job_row.get("id"), "claimed execution job")?;
-        let project_id: ProjectId =
-            parse_id(job_row.get("project_id"), "claimed execution project")?;
+        let job_id = candidate_job.spec.id;
+        let project_id = candidate_job.spec.project_id;
+        let resource_leases = reserve_execution_resources(
+            &mut transaction,
+            project_id,
+            job_id,
+            owner,
+            seconds,
+            &plan,
+        )
+        .await?;
+        let job_row = sqlx::query(
+            "UPDATE jobs SET state = 'running', claim_id = ?, claim_owner = ?,
+                 claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'queued'
+             RETURNING id, project_id, spec_json, state, priority, submission_order,
+                       submitted_at, updated_at, claim_expires_at",
+        )
+        .bind(lease_id.to_string())
+        .bind(owner)
+        .bind(seconds)
+        .bind(job_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("claim execution job", source))?
+        .ok_or(PersistenceError::Conflict {
+            entity: "execution job",
+        })?;
         let expires_at = job_row.get("claim_expires_at");
         let job = decode_job(job_row)?;
         let attempt_row = sqlx::query(
             "UPDATE attempts SET state = 'starting',
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = (
-                 SELECT id FROM attempts AS latest
-                 WHERE latest.job_id = ? ORDER BY sequence DESC LIMIT 1
-             ) AND state = 'pending'
+             WHERE id = ? AND state = 'pending'
              RETURNING id, spec_json, state, created_at, started_at, finished_at, updated_at",
         )
-        .bind(job_id.to_string())
+        .bind(candidate_attempt.spec.id().to_string())
         .fetch_optional(&mut *transaction)
         .await
         .map_err(|source| db("claim execution attempt", source))?
@@ -1124,6 +1640,8 @@ impl JobAttemptRepository<'_> {
             lease_id,
             owner: owner.into(),
             expires_at,
+            assigned_gpus: assigned_gpus(&plan),
+            resource_leases,
         }))
     }
 
@@ -1140,6 +1658,8 @@ impl JobAttemptRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin execution recovery claim", source))?;
+        lock_execution_scheduler(&mut transaction, "lock execution recovery scheduler").await?;
+        release_reclaimable_resource_leases(&mut transaction).await?;
         let job_row = sqlx::query(
             "WITH candidate AS (
                  SELECT jobs.id FROM jobs
@@ -1174,6 +1694,7 @@ impl JobAttemptRepository<'_> {
         let job_id: JobId = parse_id(job_row.get("id"), "recovered job")?;
         let expires_at = job_row.get("claim_expires_at");
         let job = decode_job(job_row)?;
+        let project_id = job.spec.project_id;
         let attempt_row = sqlx::query(
             "SELECT id, spec_json, state, created_at, started_at, finished_at, updated_at
              FROM attempts WHERE id = (
@@ -1189,6 +1710,51 @@ impl JobAttemptRepository<'_> {
             entity: "recovered attempt",
         })?;
         let attempt = decode_attempt(attempt_row)?;
+        let existing_leases = execution_resource_leases(&mut transaction, job_id).await?;
+        let (resource_leases, assigned_gpus) = if existing_leases.is_empty() {
+            let inventory = scheduling_resources(&mut transaction).await?;
+            let plan = plan_resource_leases(attempt.spec.resources(), &inventory)?.ok_or(
+                PersistenceError::Conflict {
+                    entity: "recovered execution resources",
+                },
+            )?;
+            let assigned_gpus = assigned_gpus(&plan);
+            let leases = reserve_execution_resources(
+                &mut transaction,
+                project_id,
+                job_id,
+                owner,
+                seconds,
+                &plan,
+            )
+            .await?;
+            (leases, assigned_gpus)
+        } else {
+            let assigned_gpus =
+                validate_execution_resource_leases(attempt.spec.resources(), &existing_leases)?;
+            let updated = sqlx::query(
+                "UPDATE resource_leases SET owner = ?,
+                     expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
+                     heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 WHERE job_id = ?",
+            )
+            .bind(owner)
+            .bind(seconds)
+            .bind(job_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| db("transfer recovered resource leases", source))?;
+            if usize::try_from(updated.rows_affected()).ok() != Some(existing_leases.len()) {
+                return Err(PersistenceError::Conflict {
+                    entity: "recovered execution resources",
+                });
+            }
+            let transferred = execution_resource_leases(&mut transaction, job_id).await?;
+            (
+                transferred.into_iter().map(|leased| leased.lease).collect(),
+                assigned_gpus,
+            )
+        };
         let process_row = sqlx::query(
             "SELECT attempt_id, job_id, project_id, pid, process_group_id,
                     process_start_ticks, stdout_path, stderr_path, heartbeat_at,
@@ -1262,6 +1828,8 @@ impl JobAttemptRepository<'_> {
                 lease_id,
                 owner: owner.into(),
                 expires_at,
+                resource_leases,
+                assigned_gpus,
             },
             process,
             timeout_remaining,
@@ -1269,6 +1837,12 @@ impl JobAttemptRepository<'_> {
     }
 
     pub async fn release_execution(&self, claim: &ExecutionClaim) -> PersistenceResult<()> {
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin execution claim release", source))?;
         let updated = sqlx::query(
             "UPDATE jobs SET
                  claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -1278,7 +1852,7 @@ impl JobAttemptRepository<'_> {
         .bind(claim.job.spec.id.to_string())
         .bind(claim.lease_id.to_string())
         .bind(&claim.owner)
-        .execute(&self.database.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|source| db("release execution claim", source))?;
         if updated.rows_affected() != 1 {
@@ -1286,6 +1860,24 @@ impl JobAttemptRepository<'_> {
                 entity: "execution claim",
             });
         }
+        let resources = sqlx::query(
+            "UPDATE resource_leases SET
+                 expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE job_id = ? AND owner = ?",
+        )
+        .bind(claim.job.spec.id.to_string())
+        .bind(&claim.owner)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("release execution resource claims", source))?;
+        if usize::try_from(resources.rows_affected()).ok() != Some(claim.resource_leases.len()) {
+            return Err(execution_resource_conflict());
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit execution claim release", source))?;
         Ok(())
     }
 
@@ -1309,17 +1901,31 @@ impl JobAttemptRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin process start", source))?;
+        lock_execution_scheduler(&mut transaction, "lock process start").await?;
         let attempt_id = claim.attempt.spec.id();
         let job_id = claim.job.spec.id;
         let project_id = claim.job.spec.project_id;
+        let resource_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM resource_leases
+             WHERE job_id = ? AND owner = ?",
+        )
+        .bind(job_id.to_string())
+        .bind(&claim.owner)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|source| db("validate process execution resources", source))?;
+        if usize::try_from(resource_count).ok() != Some(claim.resource_leases.len()) {
+            return Err(execution_resource_conflict());
+        }
         let inserted = sqlx::query(
             "INSERT INTO attempt_processes
                  (attempt_id, job_id, project_id, pid, process_group_id, process_start_ticks,
                   stdout_path, stderr_path)
              SELECT ?, ?, ?, ?, ?, ?, ?, ?
              WHERE EXISTS (
-                 SELECT 1 FROM jobs WHERE id = ? AND state = 'running'
-                     AND claim_id = ? AND claim_owner = ?
+                  SELECT 1 FROM jobs WHERE id = ? AND state = 'running'
+                      AND claim_id = ? AND claim_owner = ?
+                      AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              )",
         )
         .bind(attempt_id.to_string())
@@ -1395,7 +2001,8 @@ impl JobAttemptRepository<'_> {
             "UPDATE jobs SET
                  claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?",
+             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?
+                 AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
         )
         .bind(seconds)
         .bind(claim.job.spec.id.to_string())
@@ -1408,6 +2015,21 @@ impl JobAttemptRepository<'_> {
             return Err(PersistenceError::Conflict {
                 entity: "execution claim",
             });
+        }
+        let resources = sqlx::query(
+            "UPDATE resource_leases SET
+                 expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
+                 heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE job_id = ? AND owner = ?",
+        )
+        .bind(seconds)
+        .bind(claim.job.spec.id.to_string())
+        .bind(&claim.owner)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("heartbeat execution resources", source))?;
+        if usize::try_from(resources.rows_affected()).ok() != Some(claim.resource_leases.len()) {
+            return Err(execution_resource_conflict());
         }
         let process = sqlx::query(
             "UPDATE attempt_processes SET
@@ -1560,6 +2182,7 @@ impl JobAttemptRepository<'_> {
                 entity: "execution claim",
             });
         }
+        release_claim_resources(&mut transaction, claim).await?;
         let details = serde_json::json!({
             "exit_code": outcome.exit_code,
             "term_signal": outcome.term_signal,
@@ -2535,7 +3158,7 @@ impl ResourceRepository<'_> {
                 id: ResourceId::new(),
                 name: "host".into(),
                 kind: "host".into(),
-                capacity: 1,
+                capacity: i64::from(inventory.max_concurrent_jobs),
                 metadata: serde_json::json!({
                     "managed_by": "igor",
                     "available": true,
@@ -2600,7 +3223,11 @@ impl ResourceRepository<'_> {
                 "INSERT INTO resources (id, name, kind, capacity, metadata_json)
                  VALUES (?, ?, ?, ?, ?)
                  ON CONFLICT(name) DO UPDATE SET kind = excluded.kind,
-                     capacity = excluded.capacity, metadata_json = excluded.metadata_json",
+                     capacity = CASE WHEN EXISTS (
+                         SELECT 1 FROM resource_leases
+                         WHERE resource_id = resources.id
+                     ) THEN resources.capacity ELSE excluded.capacity END,
+                     metadata_json = excluded.metadata_json",
             )
             .bind(resource.id.to_string())
             .bind(&resource.name)
@@ -2744,14 +3371,7 @@ impl ResourceRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin resource lease claim", source))?;
-        sqlx::query(
-            "DELETE FROM resource_leases
-             WHERE resource_id = ? AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-        )
-        .bind(resource_id.to_string())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| db("remove expired resource leases", source))?;
+        release_reclaimable_resource_leases(&mut transaction).await?;
         let row = sqlx::query(
             "INSERT INTO resource_leases (id, resource_id, job_id, owner, quantity, expires_at)
              SELECT ?, id, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds')

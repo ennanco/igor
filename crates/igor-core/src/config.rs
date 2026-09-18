@@ -326,18 +326,15 @@ fn parse_global_config(path: &Path, input: &str) -> Result<GlobalConfig, ConfigE
     if config.host.cpu_threads == Some(0) {
         return Err(invalid_field(path, "host.cpu_threads", "must be positive"));
     }
-    if config.host.memory_bytes == Some(0) {
-        return Err(invalid_field(path, "host.memory_bytes", "must be positive"));
-    }
     if config
         .host
         .memory_bytes
-        .is_some_and(|value| value > i64::MAX as u64)
+        .is_some_and(|value| !(1..=i64::MAX as u64).contains(&value))
     {
         return Err(invalid_field(
             path,
             "host.memory_bytes",
-            &format!("must not exceed {}", i64::MAX),
+            &format!("must be between 1 and {}", i64::MAX),
         ));
     }
     validate_unique_names(path, "host.gpus", &config.host.gpus, "identities")?;

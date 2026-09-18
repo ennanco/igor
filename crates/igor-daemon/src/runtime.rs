@@ -12,9 +12,9 @@ use std::{
 
 use fs2::FileExt;
 use igor_core::{
-    ConfigError, Database, DatabaseOptions, GlobalConfig, IntegrityCheck, InventoryError,
-    PersistenceError, RuntimePaths, build_submission, discover_host_inventory, load_global_config,
-    load_project_config,
+    ConfigError, Database, DatabaseOptions, GlobalConfig, HostConfig, IntegrityCheck,
+    InventoryError, PersistenceError, RuntimePaths, build_submission, discover_host_inventory,
+    load_global_config, load_project_config,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -34,6 +34,7 @@ use crate::protocol::{
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const MAX_DATABASE_CONNECTIONS: u32 = 32;
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -166,19 +167,32 @@ where
     let bound = BoundSocket::bind(role, paths)?;
     let listener = bound.listener;
     let _cleanup = bound.cleanup;
-    let database = open_database(paths).await?;
-    if role == DaemonRole::Worker {
-        synchronize_host_inventory(paths, &database).await?;
+    let host = if role == DaemonRole::Worker {
+        Some(if paths.config_file.is_file() {
+            load_global_config(&paths.config_file)?.host
+        } else {
+            GlobalConfig::default().host
+        })
+    } else {
+        None
+    };
+    let worker_count = host.as_ref().map_or(0, |host| host.max_concurrent_jobs);
+    let database = open_database(paths, worker_count).await?;
+    if let Some(host) = &host {
+        synchronize_host_inventory(&database, host).await?;
     }
     let mut requests = JoinSet::new();
     let (worker_shutdown, worker_receiver) = watch::channel(false);
-    let worker = (role == DaemonRole::Worker).then(|| {
-        tokio::spawn(crate::worker::run(
+    let mut workers = JoinSet::new();
+    for _ in 0..worker_count {
+        let receiver = worker_receiver.clone();
+        workers.spawn(crate::worker::run(
             database.clone(),
             paths.clone(),
-            worker_receiver,
-        ))
-    });
+            receiver,
+        ));
+    }
+    drop(worker_receiver);
     tokio::pin!(shutdown);
 
     loop {
@@ -215,6 +229,7 @@ where
             }
         }
     }
+    drop(listener);
 
     if timeout(SHUTDOWN_GRACE, drain_requests(&mut requests))
         .await
@@ -224,29 +239,29 @@ where
         while requests.join_next().await.is_some() {}
     }
     let _ = worker_shutdown.send(true);
-    if let Some(worker) = worker {
-        match timeout(SHUTDOWN_GRACE, worker).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "worker execution loop failed"),
-            Err(_) => tracing::warn!("worker execution loop did not stop before shutdown"),
-        }
+    if timeout(SHUTDOWN_GRACE, drain_workers(&mut workers))
+        .await
+        .is_err()
+    {
+        tracing::warn!("worker execution loops did not stop before shutdown");
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
     }
     database.pool().close().await;
+    drop(_cleanup);
     Ok(())
 }
 
 async fn synchronize_host_inventory(
-    paths: &RuntimePaths,
     database: &Database,
+    host: &HostConfig,
 ) -> Result<(), DaemonError> {
-    let host = if paths.config_file.is_file() {
-        load_global_config(&paths.config_file)?.host
-    } else {
-        GlobalConfig::default().host
-    };
-    let inventory = tokio::task::spawn_blocking(move || discover_host_inventory(&host))
-        .await
-        .map_err(|error| DaemonError::InventoryTask(error.to_string()))??;
+    let inventory = tokio::task::spawn_blocking({
+        let host = host.clone();
+        move || discover_host_inventory(&host)
+    })
+    .await
+    .map_err(|error| DaemonError::InventoryTask(error.to_string()))??;
     database
         .resources()
         .synchronize_inventory(&inventory)
@@ -254,7 +269,7 @@ async fn synchronize_host_inventory(
     Ok(())
 }
 
-async fn open_database(paths: &RuntimePaths) -> Result<Database, DaemonError> {
+async fn open_database(paths: &RuntimePaths, worker_count: u32) -> Result<Database, DaemonError> {
     let database_path = paths.database.clone();
     let file_name = database_path
         .file_name()
@@ -281,10 +296,13 @@ async fn open_database(paths: &RuntimePaths) -> Result<Database, DaemonError> {
     })
     .await
     .map_err(|error| DaemonError::DatabaseInitialization(error.to_string()))??;
+    let max_connections = worker_count
+        .saturating_add(3)
+        .clamp(4, MAX_DATABASE_CONNECTIONS);
     let database = Database::open_with_options(
         &paths.database,
         DatabaseOptions {
-            max_connections: 4,
+            max_connections,
             ..DatabaseOptions::default()
         },
     )
@@ -297,6 +315,14 @@ async fn drain_requests(requests: &mut JoinSet<()>) {
     while let Some(result) = requests.join_next().await {
         if let Err(error) = result {
             tracing::warn!(%error, "daemon request task failed during shutdown");
+        }
+    }
+}
+
+async fn drain_workers(workers: &mut JoinSet<()>) {
+    while let Some(result) = workers.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "worker execution loop failed during shutdown");
         }
     }
 }

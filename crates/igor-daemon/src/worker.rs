@@ -27,6 +27,12 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const CANCELLATION_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_INTERVAL: Duration = Duration::from_millis(100);
 
+struct RecoveredProcessState {
+    leader_present: bool,
+    completion: Option<(AttemptState, &'static str)>,
+    timeout_remaining: Option<Duration>,
+}
+
 pub async fn run(database: Database, paths: RuntimePaths, mut shutdown: watch::Receiver<bool>) {
     let owner = format!("worker:{}", std::process::id());
     loop {
@@ -95,38 +101,40 @@ async fn reconcile(
         .await;
         return;
     };
-    match process_identity(pid) {
+    let state = match process_identity(pid) {
         Ok(identity)
             if identity.process_group_id == process.process_group_id
-                && identity.start_ticks == process.process_start_ticks => {}
-        Ok(_) => {
-            finish_lost(
-                database,
-                &recovered.claim,
+                && identity.start_ticks == process.process_start_ticks =>
+        {
+            RecoveredProcessState {
+                leader_present: true,
+                completion: None,
+                timeout_remaining: recovered
+                    .timeout_remaining
+                    .map(|remaining| remaining.saturating_sub(validation_started.elapsed())),
+            }
+        }
+        Ok(_) => RecoveredProcessState {
+            leader_present: false,
+            completion: Some((
+                AttemptState::Lost,
                 "persisted PID belongs to a different process",
-            )
-            .await;
-            return;
-        }
-        Err(_) => {
-            finish_lost(
-                database,
-                &recovered.claim,
-                "persisted process no longer exists",
-            )
-            .await;
-            return;
-        }
-    }
+            )),
+            timeout_remaining: None,
+        },
+        Err(_) => RecoveredProcessState {
+            leader_present: false,
+            completion: Some((AttemptState::Lost, "persisted process no longer exists")),
+            timeout_remaining: None,
+        },
+    };
     supervise_recovered(
         database,
         &recovered.claim,
         &process,
         pid,
         group_id,
-        recovered
-            .timeout_remaining
-            .map(|remaining| remaining.saturating_sub(validation_started.elapsed())),
+        state,
         shutdown,
     )
     .await;
@@ -138,16 +146,19 @@ async fn supervise_recovered(
     process: &ProcessRecord,
     pid: u32,
     group_id: u32,
-    timeout_remaining: Option<Duration>,
+    state: RecoveredProcessState,
     shutdown: &mut watch::Receiver<bool>,
 ) {
+    let RecoveredProcessState {
+        mut leader_present,
+        mut completion,
+        timeout_remaining,
+    } = state;
     let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
     heartbeat.tick().await;
     let mut poll = time::interval(CANCELLATION_INTERVAL);
     poll.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-    let mut leader_present = true;
-    let mut completion: Option<(AttemptState, &'static str)> = None;
     let mut cancel_deadline = None;
     let mut timeout_deadline = timeout_remaining.map(|remaining| time::Instant::now() + remaining);
 
@@ -160,12 +171,16 @@ async fn supervise_recovered(
                             if identity.process_group_id == process.process_group_id
                                 && identity.start_ticks == process.process_start_ticks => {}
                         Ok(_) => {
-                            finish_lost(database, claim, "PID identity changed during recovery").await;
-                            return;
+                            leader_present = false;
+                            completion = Some((AttemptState::Lost, "PID identity changed during recovery"));
+                            cancel_deadline = None;
+                            timeout_deadline = None;
                         }
                         Err(_) if completion.is_none() => {
-                            finish_lost(database, claim, "recovered process leader exited without an observable status").await;
-                            return;
+                            leader_present = false;
+                            completion = Some((AttemptState::Lost, "recovered process leader exited without an observable status"));
+                            cancel_deadline = None;
+                            timeout_deadline = None;
                         }
                         Err(_) => leader_present = false,
                     }
@@ -309,7 +324,11 @@ async fn execute(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     child_command.as_std_mut().process_group(0);
-    if let Err(error) = configure_environment(&mut child_command, &command.environment) {
+    if let Err(error) = configure_execution_environment(
+        &mut child_command,
+        &command.environment,
+        &claim.assigned_gpus,
+    ) {
         finish_launch_failure(database, claim, &error.to_string()).await;
         return;
     }
@@ -580,6 +599,16 @@ fn configure_environment(
     Ok(())
 }
 
+fn configure_execution_environment(
+    command: &mut Command,
+    policy: &igor_core::EnvironmentPolicy,
+    assigned_gpus: &[String],
+) -> io::Result<()> {
+    configure_environment(command, policy)?;
+    command.env("CUDA_VISIBLE_DEVICES", assigned_gpus.join(","));
+    Ok(())
+}
+
 fn minimal_environment_name(name: &str) -> bool {
     matches!(
         name,
@@ -632,4 +661,43 @@ fn process_group_exists(pid: u32) -> bool {
     i32::try_from(pid)
         .ok()
         .is_some_and(|pid| killpg(Pid::from_raw(pid), None::<Signal>).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn assigned_gpus_override_the_requested_process_environment() -> io::Result<()> {
+        let mut policy = igor_core::EnvironmentPolicy::default();
+        policy
+            .set
+            .insert("CUDA_VISIBLE_DEVICES".into(), "unreserved".into());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf %s \"$CUDA_VISIBLE_DEVICES\""]);
+        configure_execution_environment(
+            &mut command,
+            &policy,
+            &["GPU-two".into(), "GPU-one".into()],
+        )?;
+        let output = command.output().await?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"GPU-two,GPU-one");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn jobs_without_gpu_leases_cannot_inherit_gpu_visibility() -> io::Result<()> {
+        let mut policy = igor_core::EnvironmentPolicy::default();
+        policy
+            .set
+            .insert("CUDA_VISIBLE_DEVICES".into(), "unreserved".into());
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf %s \"$CUDA_VISIBLE_DEVICES\""]);
+        configure_execution_environment(&mut command, &policy, &[])?;
+        let output = command.output().await?;
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        Ok(())
+    }
 }

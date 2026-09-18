@@ -21,6 +21,10 @@ use tokio::{
     time::sleep,
 };
 
+// Startup and shutdown lock assertions are timing-sensitive when daemon tests
+// share one process, so keep those lifecycles serialized.
+static RUNTIME_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn paths(root: &Path) -> RuntimePaths {
     let runtime_dir = root.join("runtime/igor");
     let state_dir = root.join("state/igor");
@@ -77,6 +81,7 @@ fn spawn_daemon(
 
 #[tokio::test]
 async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box<dyn Error>> {
+    let _guard = RUNTIME_TEST.lock().await;
     let temporary = TempDir::new()?;
     let paths = paths(temporary.path());
     let (stop_worker, worker) = spawn_daemon(DaemonRole::Worker, paths.clone());
@@ -131,6 +136,7 @@ async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box
 
 #[tokio::test]
 async fn duplicate_role_cannot_replace_a_live_socket() -> Result<(), Box<dyn Error>> {
+    let _guard = RUNTIME_TEST.lock().await;
     let temporary = TempDir::new()?;
     let paths = paths(temporary.path());
     let (stop, worker) = spawn_daemon(DaemonRole::Worker, paths.clone());
@@ -151,6 +157,7 @@ async fn duplicate_role_cannot_replace_a_live_socket() -> Result<(), Box<dyn Err
 
 #[tokio::test]
 async fn stale_socket_is_removed_but_regular_file_is_preserved() -> Result<(), Box<dyn Error>> {
+    let _guard = RUNTIME_TEST.lock().await;
     let temporary = TempDir::new()?;
     let paths = paths(temporary.path());
     fs::create_dir_all(&paths.runtime_dir)?;
@@ -181,6 +188,7 @@ async fn stale_socket_is_removed_but_regular_file_is_preserved() -> Result<(), B
 
 #[tokio::test]
 async fn protocol_mismatch_and_invalid_request_are_distinct() -> Result<(), Box<dyn Error>> {
+    let _guard = RUNTIME_TEST.lock().await;
     let temporary = TempDir::new()?;
     let paths = paths(temporary.path());
     let (stop, worker) = spawn_daemon(DaemonRole::Worker, paths.clone());
@@ -211,6 +219,7 @@ async fn protocol_mismatch_and_invalid_request_are_distinct() -> Result<(), Box<
 
 #[tokio::test]
 async fn missing_daemon_is_reported_as_unavailable() -> Result<(), Box<dyn Error>> {
+    let _guard = RUNTIME_TEST.lock().await;
     let temporary = TempDir::new()?;
     let paths = paths(temporary.path());
     let error = Client::new(&paths)
@@ -224,6 +233,7 @@ async fn missing_daemon_is_reported_as_unavailable() -> Result<(), Box<dyn Error
 
 #[tokio::test]
 async fn client_rejects_response_from_the_wrong_role() -> Result<(), Box<dyn Error>> {
+    let _guard = RUNTIME_TEST.lock().await;
     let temporary = TempDir::new()?;
     let paths = paths(temporary.path());
     fs::create_dir_all(&paths.runtime_dir)?;
@@ -251,6 +261,7 @@ async fn client_rejects_response_from_the_wrong_role() -> Result<(), Box<dyn Err
 
 #[tokio::test]
 async fn supervisor_rejects_worker_operations() -> Result<(), Box<dyn Error>> {
+    let _guard = RUNTIME_TEST.lock().await;
     let temporary = TempDir::new()?;
     let paths = paths(temporary.path());
     let (stop, supervisor) = spawn_daemon(DaemonRole::Supervisor, paths.clone());

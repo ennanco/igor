@@ -312,12 +312,18 @@ enforcement requires the later cgroup and `systemd` integration.
 
 ### 9.3 Scheduling Policy
 
-- Priority first.
-- Submission order within equal priority.
+- Effective priority first. While queued, a job gains one priority point for
+  every complete hour since submission. Aging is uncapped and computed at claim
+  time; it never changes the submitted priority stored with the job.
+- Global submission order within equal effective priority.
 - Resource fit.
-- Aging to prevent starvation.
 - Atomic reservation of all requested resources.
 - Host-global GPU and named-resource leases.
+
+The scheduler considers candidates in that order and selects the first complete
+resource request that currently fits. An older incompatible job therefore does
+not block compatible work, while uncapped aging ensures an old job eventually
+outranks newly submitted work with any fixed finite priority.
 
 Future staged jobs may declare CPU preparation, GPU execution, CPU analysis,
 and publication separately. Until then, one command holds its declared

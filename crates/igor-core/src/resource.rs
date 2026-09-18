@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{DomainError, ErrorCode, Result};
@@ -165,6 +167,16 @@ impl ResourceRequest {
                 "must be positive when specified",
             ));
         }
+        if self
+            .memory_bytes
+            .is_some_and(|value| value > i64::MAX as u64)
+        {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidResourceRequest,
+                "resources.memory_bytes",
+                &format!("must not exceed {}", i64::MAX),
+            ));
+        }
         if self.timeout_seconds == Some(0) {
             return Err(DomainError::validation(
                 ErrorCode::InvalidResourceRequest,
@@ -179,11 +191,57 @@ impl ResourceRequest {
                 "must be positive when a GPU is requested",
             ));
         }
-        if let Some(resource) = self.named.iter().find(|resource| resource.name.is_empty()) {
+        if self.gpu != GpuRequest::None && !self.gpu_exclusive {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidResourceRequest,
+                "resources.gpu_exclusive",
+                "shared GPU scheduling is not supported",
+            ));
+        }
+        if let GpuRequest::Specific(device) = &self.gpu {
+            if device.trim().is_empty() {
+                return Err(DomainError::validation(
+                    ErrorCode::InvalidResourceRequest,
+                    "resources.gpu.device",
+                    "must not be empty",
+                ));
+            }
+            if self.gpu_count != 1 {
+                return Err(DomainError::validation(
+                    ErrorCode::InvalidResourceRequest,
+                    "resources.gpu_count",
+                    "must be one when a specific GPU is requested",
+                ));
+            }
+        }
+        if let Some(resource) = self
+            .named
+            .iter()
+            .find(|resource| resource.name.trim().is_empty())
+        {
             return Err(DomainError::validation(
                 ErrorCode::InvalidResourceRequest,
                 "resources.named.name",
                 &format!("must not be empty ({:?})", resource.mode),
+            ));
+        }
+        if self
+            .named
+            .iter()
+            .any(|resource| resource.mode == NamedResourceMode::Shared)
+        {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidResourceRequest,
+                "resources.named.mode",
+                "shared named-resource scheduling is not supported",
+            ));
+        }
+        let unique_names: BTreeSet<_> = self.named.iter().map(|resource| &resource.name).collect();
+        if unique_names.len() != self.named.len() {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidResourceRequest,
+                "resources.named.name",
+                "names must be unique",
             ));
         }
         Ok(())

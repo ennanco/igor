@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use igor_core::{AttemptId, Database, JobId, JobState, ProcessRecord};
+use igor_core::{AttemptId, Database, JobId, JobState, ProcessRecord, TransitionState};
 use nix::{
     sys::signal::{Signal, kill, killpg},
     unistd::Pid,
@@ -17,6 +17,27 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+struct WorkerTestGuard(std::path::PathBuf);
+
+impl Drop for WorkerTestGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+fn worker_test_guard() -> Result<WorkerTestGuard, Box<dyn Error>> {
+    let path = std::env::temp_dir().join(format!("igor-job-cli-tests-{}", std::process::id()));
+    loop {
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(WorkerTestGuard(path)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
 
 fn command(home: &Path, cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_igor"));
@@ -84,6 +105,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self, Box<dyn Error>> {
+        Self::with_global_config(None)
+    }
+
+    fn with_global_config(global_config: Option<&str>) -> Result<Self, Box<dyn Error>> {
         let temporary = TempDir::new()?;
         let home = temporary.path().join("home");
         let project = temporary.path().join("project");
@@ -97,6 +122,11 @@ impl Fixture {
         git(&project, &["config", "user.name", "Igor Test"])?;
         git(&project, &["add", "."])?;
         git(&project, &["commit", "-qm", "initial"])?;
+        if let Some(global_config) = global_config {
+            let config = home.join("config/igor/config.toml");
+            fs::create_dir_all(config.parent().ok_or("missing config parent")?)?;
+            fs::write(config, global_config)?;
+        }
         let worker = spawn_worker(&home, &project)?;
         for _ in 0..100 {
             if home.join("runtime/igor/worker.sock").exists() {
@@ -157,6 +187,17 @@ fn process_fixture(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+fn wait_for_marker(marker: &Path) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        if Instant::now() >= deadline {
+            return Err(format!("marker did not appear: {}", marker.display()).into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
 fn submit_process(fixture: &Fixture, name: &str) -> Result<JobId, Box<dyn Error>> {
     let script = process_fixture(name);
     let submitted = output_json(
@@ -181,7 +222,7 @@ async fn wait_for_process(
     database: &Database,
     job_id: JobId,
 ) -> Result<ProcessRecord, Box<dyn Error>> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let detail = database
                 .jobs()
@@ -196,6 +237,21 @@ async fn wait_for_process(
             {
                 return Ok::<_, Box<dyn Error>>(process);
             }
+            if detail.job.state.is_terminal() {
+                let payload: Option<String> = sqlx::query_scalar(
+                    "SELECT payload_json FROM events WHERE job_id = ? ORDER BY occurred_at DESC, id DESC LIMIT 1",
+                )
+                .bind(job_id.to_string())
+                .fetch_optional(database.pool())
+                .await?;
+                return Err(format!(
+                    "job became {} before its process identity was persisted (attempt {}, event {})",
+                    detail.job.state.as_str(),
+                    attempt.state.as_str(),
+                    payload.as_deref().unwrap_or("missing")
+                )
+                .into());
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -203,8 +259,391 @@ async fn wait_for_process(
     .map_err(|_| "process did not start")?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_jobs_overlap_up_to_the_host_concurrency_limit() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::with_global_config(Some(
+        "schema_version = 1\n[host]\nmax_concurrent_jobs = 2\n",
+    ))?;
+    let barrier_root = fixture._temporary.path().join("barriers");
+    let script = process_fixture("barrier.sh");
+    let mut jobs = Vec::new();
+
+    for name in ["first", "second", "third"] {
+        let barrier = barrier_root.join(name);
+        fs::create_dir_all(&barrier)?;
+        let job_file = fixture._temporary.path().join(format!("{name}.toml"));
+        fs::write(
+            &job_file,
+            format!(
+                "schema_version = 1\nname = '{name}'\n[execution]\nprogram = '/bin/sh'\nargs = ['{}', '{}']\n[resources]\nmode = 'shared'\n",
+                script.display(),
+                barrier.display()
+            ),
+        )?;
+        let submitted = output_json(
+            fixture
+                .run()
+                .args([
+                    "submit",
+                    "--json",
+                    "--file",
+                    job_file.to_str().ok_or("non-UTF-8 job file")?,
+                ])
+                .output()?,
+        )?;
+        jobs.push(
+            submitted["spec"]["id"]
+                .as_str()
+                .ok_or("missing submitted job id")?
+                .parse::<JobId>()?,
+        );
+    }
+
+    wait_for_marker(&barrier_root.join("first/started"))?;
+    wait_for_marker(&barrier_root.join("second/started"))?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let first_process = wait_for_process(&database, jobs[0]).await?;
+    let second_process = wait_for_process(&database, jobs[1]).await?;
+    assert!(
+        kill(
+            Pid::from_raw(i32::try_from(first_process.pid)?),
+            None::<Signal>
+        )
+        .is_ok()
+    );
+    assert!(
+        kill(
+            Pid::from_raw(i32::try_from(second_process.pid)?),
+            None::<Signal>
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(jobs[2])
+            .await?
+            .ok_or("missing third job")?
+            .state,
+        JobState::Queued
+    );
+    assert!(!barrier_root.join("third/started").exists());
+
+    fs::write(barrier_root.join("first/release"), b"")?;
+    wait_for_marker(&barrier_root.join("third/started"))?;
+    assert!(
+        kill(
+            Pid::from_raw(i32::try_from(second_process.pid)?),
+            None::<Signal>
+        )
+        .is_ok()
+    );
+
+    fs::write(barrier_root.join("second/release"), b"")?;
+    fs::write(barrier_root.join("third/release"), b"")?;
+    for job in jobs {
+        let waited = output_json(
+            fixture
+                .run()
+                .args(["wait", &job.to_string(), "--json"])
+                .output()?,
+        )?;
+        assert_eq!(waited["job"]["state"], "succeeded");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_one_shared_job_preserves_the_other_execution() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::with_global_config(Some(
+        "schema_version = 1\n[host]\nmax_concurrent_jobs = 2\n",
+    ))?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let barrier_root = fixture._temporary.path().join("cancellation-barriers");
+    let script = process_fixture("barrier.sh");
+    let mut jobs = Vec::new();
+
+    for name in ["first", "second"] {
+        let barrier = barrier_root.join(name);
+        fs::create_dir_all(&barrier)?;
+        let job_file = fixture
+            ._temporary
+            .path()
+            .join(format!("cancellation-{name}.toml"));
+        fs::write(
+            &job_file,
+            format!(
+                "schema_version = 1\nname = 'cancellation-{name}'\n[execution]\nprogram = '/bin/sh'\nargs = ['{}', '{}']\n[resources]\nmode = 'shared'\n",
+                script.display(),
+                barrier.display()
+            ),
+        )?;
+        let submitted = output_json(
+            fixture
+                .run()
+                .args([
+                    "submit",
+                    "--json",
+                    "--file",
+                    job_file.to_str().ok_or("non-UTF-8 job file")?,
+                ])
+                .output()?,
+        )?;
+        jobs.push(
+            submitted["spec"]["id"]
+                .as_str()
+                .ok_or("missing submitted job id")?
+                .parse::<JobId>()?,
+        );
+    }
+
+    wait_for_marker(&barrier_root.join("first/started"))?;
+    wait_for_marker(&barrier_root.join("second/started"))?;
+    let first_process = wait_for_process(&database, jobs[0]).await?;
+    let second_process = wait_for_process(&database, jobs[1]).await?;
+    for process in [&first_process, &second_process] {
+        assert!(kill(Pid::from_raw(i32::try_from(process.pid)?), None::<Signal>).is_ok());
+    }
+    let second_leases: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, resource_id, owner, quantity FROM resource_leases
+         WHERE job_id = ? ORDER BY id",
+    )
+    .bind(jobs[1].to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert!(!second_leases.is_empty());
+
+    let cancelled = fixture
+        .run()
+        .args(["cancel", &jobs[0].to_string(), "--grace-seconds", "0"])
+        .output()?;
+    assert!(cancelled.status.success());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state = database
+                .jobs()
+                .get_job(jobs[0])
+                .await?
+                .ok_or("missing cancelled job")?
+                .state;
+            let process_group_gone = killpg(
+                Pid::from_raw(i32::try_from(first_process.process_group_id)?),
+                None::<Signal>,
+            )
+            .is_err();
+            if state == JobState::Cancelled && process_group_gone {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "cancelled process group did not exit")??;
+
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(jobs[1])
+            .await?
+            .ok_or("missing second job")?
+            .state,
+        JobState::Running
+    );
+    assert!(
+        kill(
+            Pid::from_raw(i32::try_from(second_process.pid)?),
+            None::<Signal>
+        )
+        .is_ok()
+    );
+    let current_second_leases: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, resource_id, owner, quantity FROM resource_leases
+         WHERE job_id = ? ORDER BY id",
+    )
+    .bind(jobs[1].to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(current_second_leases, second_leases);
+
+    fs::write(barrier_root.join("second/release"), b"")?;
+    let waited = output_json(
+        fixture
+            .run()
+            .args(["wait", &jobs[1].to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(waited["job"]["state"], "succeeded");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exclusive_host_job_blocks_a_later_shared_job() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::with_global_config(Some(
+        "schema_version = 1\n[host]\nmax_concurrent_jobs = 2\n",
+    ))?;
+    let barrier_root = fixture._temporary.path().join("exclusive-barriers");
+    let script = process_fixture("barrier.sh");
+    let mut jobs = Vec::new();
+
+    for (name, mode) in [("exclusive", "exclusive-host"), ("shared", "shared")] {
+        let barrier = barrier_root.join(name);
+        fs::create_dir_all(&barrier)?;
+        let job_file = fixture._temporary.path().join(format!("{name}.toml"));
+        fs::write(
+            &job_file,
+            format!(
+                "schema_version = 1\nname = '{name}'\n[execution]\nprogram = '/bin/sh'\nargs = ['{}', '{}']\n[resources]\nmode = '{mode}'\n",
+                script.display(),
+                barrier.display()
+            ),
+        )?;
+        let submitted = output_json(
+            fixture
+                .run()
+                .args([
+                    "submit",
+                    "--json",
+                    "--file",
+                    job_file.to_str().ok_or("non-UTF-8 job file")?,
+                ])
+                .output()?,
+        )?;
+        jobs.push(
+            submitted["spec"]["id"]
+                .as_str()
+                .ok_or("missing submitted job id")?
+                .parse::<JobId>()?,
+        );
+        if name == "exclusive" {
+            wait_for_marker(&barrier.join("started"))?;
+        }
+    }
+
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let exclusive_pid = fs::read_to_string(barrier_root.join("exclusive/pid"))?
+        .trim()
+        .parse::<i32>()?;
+    for _ in 0..10 {
+        assert_eq!(
+            database
+                .jobs()
+                .get_job(jobs[0])
+                .await?
+                .ok_or("missing exclusive job")?
+                .state,
+            JobState::Running
+        );
+        assert_eq!(
+            database
+                .jobs()
+                .get_job(jobs[1])
+                .await?
+                .ok_or("missing shared job")?
+                .state,
+            JobState::Queued
+        );
+        assert!(!barrier_root.join("shared/started").exists());
+        assert!(kill(Pid::from_raw(exclusive_pid), None::<Signal>).is_ok());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    fs::write(barrier_root.join("exclusive/release"), b"")?;
+    wait_for_marker(&barrier_root.join("shared/started"))?;
+    fs::write(barrier_root.join("shared/release"), b"")?;
+    for job in jobs {
+        let waited = output_json(
+            fixture
+                .run()
+                .args(["wait", &job.to_string(), "--json"])
+                .output()?,
+        )?;
+        assert_eq!(waited["job"]["state"], "succeeded");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn distinct_exclusive_resources_allow_shared_jobs_to_overlap() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::with_global_config(Some(
+        "schema_version = 1\n[host]\nmax_concurrent_jobs = 2\ndiscover_gpus = false\ngpus = ['GPU-one', 'GPU-two']\nnamed_resources = ['scratch-one', 'scratch-two']\n",
+    ))?;
+    let barrier_root = fixture._temporary.path().join("resource-barriers");
+    let script = process_fixture("barrier.sh");
+    let mut jobs = Vec::new();
+
+    for (name, named_resource) in [("first", "scratch-one"), ("second", "scratch-two")] {
+        let barrier = barrier_root.join(name);
+        fs::create_dir_all(&barrier)?;
+        let job_file = fixture
+            ._temporary
+            .path()
+            .join(format!("resource-{name}.toml"));
+        fs::write(
+            &job_file,
+            format!(
+                "schema_version = 1\nname = '{name}'\n[execution]\nprogram = '/bin/sh'\nargs = ['{}', '{}']\n[resources]\nmode = 'shared'\ngpu = {{ selection = 'any' }}\ngpu_count = 1\ngpu_exclusive = true\nnamed = [{{ name = '{named_resource}', mode = 'exclusive' }}]\n",
+                script.display(),
+                barrier.display()
+            ),
+        )?;
+        let submitted = output_json(
+            fixture
+                .run()
+                .args([
+                    "submit",
+                    "--json",
+                    "--file",
+                    job_file.to_str().ok_or("non-UTF-8 job file")?,
+                ])
+                .output()?,
+        )?;
+        jobs.push(
+            submitted["spec"]["id"]
+                .as_str()
+                .ok_or("missing submitted job id")?
+                .parse::<JobId>()?,
+        );
+    }
+
+    wait_for_marker(&barrier_root.join("first/started"))?;
+    wait_for_marker(&barrier_root.join("second/started"))?;
+    let first_pid = fs::read_to_string(barrier_root.join("first/pid"))?
+        .trim()
+        .parse::<i32>()?;
+    let second_pid = fs::read_to_string(barrier_root.join("second/pid"))?
+        .trim()
+        .parse::<i32>()?;
+    assert!(kill(Pid::from_raw(first_pid), None::<Signal>).is_ok());
+    assert!(kill(Pid::from_raw(second_pid), None::<Signal>).is_ok());
+    let first_gpu = fs::read_to_string(barrier_root.join("first/cuda-visible-devices"))?;
+    let second_gpu = fs::read_to_string(barrier_root.join("second/cuda-visible-devices"))?;
+    let first_gpu = first_gpu.trim();
+    let second_gpu = second_gpu.trim();
+    assert_ne!(first_gpu, second_gpu);
+    assert!(["GPU-one", "GPU-two"].contains(&first_gpu));
+    assert!(["GPU-one", "GPU-two"].contains(&second_gpu));
+
+    fs::write(barrier_root.join("first/release"), b"")?;
+    fs::write(barrier_root.join("second/release"), b"")?;
+    for job in jobs {
+        let waited = output_json(
+            fixture
+                .run()
+                .args(["wait", &job.to_string(), "--json"])
+                .output()?,
+        )?;
+        assert_eq!(waited["job"]["state"], "succeeded");
+    }
+    Ok(())
+}
+
 #[test]
 fn project_submission_and_reads_preserve_argument_contracts() -> TestResult {
+    let _guard = worker_test_guard()?;
     let fixture = Fixture::new()?;
     let projects = output_json(fixture.run().args(["project", "list", "--json"]).output()?)?;
     assert_eq!(projects.as_array().map(Vec::len), Some(1));
@@ -315,6 +754,7 @@ fn project_submission_and_reads_preserve_argument_contracts() -> TestResult {
 
 #[test]
 fn job_file_dirty_policy_and_frozen_attempt_are_enforced() -> TestResult {
+    let _guard = worker_test_guard()?;
     let fixture = Fixture::new()?;
     let job_file = fixture._temporary.path().join("job.toml");
     fs::write(
@@ -359,6 +799,7 @@ fn job_file_dirty_policy_and_frozen_attempt_are_enforced() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wait_returns_when_job_is_terminal() -> TestResult {
+    let _guard = worker_test_guard()?;
     let mut fixture = Fixture::new()?;
     let success = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/process/success.sh");
     let job_file = fixture._temporary.path().join("process-success.toml");
@@ -630,7 +1071,174 @@ async fn wait_returns_when_job_is_terminal() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_recovers_two_active_shared_executions_concurrently() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::with_global_config(Some(
+        "schema_version = 1\n[host]\nmax_concurrent_jobs = 2\n",
+    ))?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let barrier_root = fixture._temporary.path().join("recovery-barriers");
+    let script = process_fixture("barrier.sh");
+    let mut jobs = Vec::new();
+
+    for name in ["first", "second"] {
+        let barrier = barrier_root.join(name);
+        fs::create_dir_all(&barrier)?;
+        let job_file = fixture
+            ._temporary
+            .path()
+            .join(format!("recovery-{name}.toml"));
+        fs::write(
+            &job_file,
+            format!(
+                "schema_version = 1\nname = 'recovery-{name}'\n[execution]\nprogram = '/bin/sh'\nargs = ['{}', '{}']\n[resources]\nmode = 'shared'\n",
+                script.display(),
+                barrier.display()
+            ),
+        )?;
+        let submitted = output_json(
+            fixture
+                .run()
+                .args([
+                    "submit",
+                    "--json",
+                    "--file",
+                    job_file.to_str().ok_or("non-UTF-8 recovery job file")?,
+                ])
+                .output()?,
+        )?;
+        jobs.push(
+            submitted["spec"]["id"]
+                .as_str()
+                .ok_or("missing recovery job id")?
+                .parse::<JobId>()?,
+        );
+    }
+
+    wait_for_marker(&barrier_root.join("first/started"))?;
+    wait_for_marker(&barrier_root.join("second/started"))?;
+    let mut original_processes = Vec::new();
+    let mut old_claim_ids = Vec::new();
+    let old_owner = format!("worker:{}", fixture.worker.0.id());
+    for (job, name) in jobs.iter().zip(["first", "second"]) {
+        let process = wait_for_process(&database, *job).await?;
+        let barrier_pid = fs::read_to_string(barrier_root.join(name).join("pid"))?
+            .trim()
+            .parse::<i64>()?;
+        assert_eq!(process.pid, barrier_pid);
+        assert!(kill(Pid::from_raw(i32::try_from(process.pid)?), None::<Signal>).is_ok());
+        let (claim_id, claim_owner): (String, String) =
+            sqlx::query_as("SELECT claim_id, claim_owner FROM jobs WHERE id = ?")
+                .bind(job.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(claim_owner, old_owner);
+        old_claim_ids.push(claim_id);
+        original_processes.push(process);
+    }
+
+    fixture.restart_worker()?;
+    let replacement_owner = format!("worker:{}", fixture.worker.0.id());
+    assert_ne!(replacement_owner, old_owner);
+    let recovered_processes = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut processes = Vec::new();
+            let mut both_recovered = true;
+            for (index, job) in jobs.iter().enumerate() {
+                let claim: Option<(String, String, String)> =
+                    sqlx::query_as("SELECT state, claim_id, claim_owner FROM jobs WHERE id = ?")
+                        .bind(job.to_string())
+                        .fetch_optional(database.pool())
+                        .await?;
+                let replacement_leases: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM resource_leases WHERE job_id = ? AND owner = ?",
+                )
+                .bind(job.to_string())
+                .bind(&replacement_owner)
+                .fetch_one(database.pool())
+                .await?;
+                let other_leases: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM resource_leases WHERE job_id = ? AND owner != ?",
+                )
+                .bind(job.to_string())
+                .bind(&replacement_owner)
+                .fetch_one(database.pool())
+                .await?;
+                let process = database
+                    .jobs()
+                    .process_for_attempt(original_processes[index].attempt_id)
+                    .await?;
+                if !matches!(
+                    claim,
+                    Some((ref state, ref claim_id, ref owner))
+                        if state == "running"
+                            && claim_id != &old_claim_ids[index]
+                            && owner == &replacement_owner
+                ) || replacement_leases == 0
+                    || other_leases != 0
+                    || process.is_none()
+                {
+                    both_recovered = false;
+                    break;
+                }
+                processes.push(process.ok_or("missing recovered process")?);
+            }
+            if both_recovered {
+                return Ok::<_, Box<dyn Error>>(processes);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "both executions were not recovered by the replacement worker")??;
+
+    let old_job_claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE claim_owner = ?")
+        .bind(&old_owner)
+        .fetch_one(database.pool())
+        .await?;
+    let old_resource_claims: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE owner = ?")
+            .bind(&old_owner)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(old_job_claims, 0);
+    assert_eq!(old_resource_claims, 0);
+    for ((job, original), recovered) in jobs
+        .iter()
+        .zip(&original_processes)
+        .zip(&recovered_processes)
+    {
+        let detail = database
+            .jobs()
+            .detail(*job)
+            .await?
+            .ok_or("missing recovered job")?;
+        assert_eq!(detail.attempts.len(), 1);
+        assert_eq!(detail.attempts[0].spec.id(), original.attempt_id);
+        assert_eq!(recovered.attempt_id, original.attempt_id);
+        assert_eq!(recovered.pid, original.pid);
+        assert_eq!(recovered.process_group_id, original.process_group_id);
+        assert_eq!(recovered.process_start_ticks, original.process_start_ticks);
+        assert!(kill(Pid::from_raw(i32::try_from(recovered.pid)?), None::<Signal>).is_ok());
+    }
+
+    fs::write(barrier_root.join("first/release"), b"")?;
+    fs::write(barrier_root.join("second/release"), b"")?;
+    for job in jobs {
+        let waited = fixture
+            .run()
+            .args(["wait", &job.to_string(), "--json"])
+            .output()?;
+        assert_eq!(waited.status.code(), Some(1));
+        let waited: Value = serde_json::from_slice(&waited.stdout)?;
+        assert_eq!(waited["job"]["state"], "lost");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_classifies_missing_and_reused_process_identities_as_lost() -> TestResult {
+    let _guard = worker_test_guard()?;
     let mut fixture = Fixture::new()?;
     let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
 
@@ -672,13 +1280,23 @@ async fn recovery_classifies_missing_and_reused_process_identities_as_lost() -> 
     .execute(database.pool())
     .await?;
     fixture.restart_worker()?;
-    let waited = fixture
-        .run()
-        .args(["wait", &reused_job.to_string(), "--json"])
-        .output()?;
-    assert_eq!(waited.status.code(), Some(1));
-    let waited: Value = serde_json::from_slice(&waited.stdout)?;
-    assert_eq!(waited["job"]["state"], "lost");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(reused_job)
+            .await?
+            .ok_or("missing reused-PID job")?
+            .state,
+        JobState::Running
+    );
+    assert!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+            .bind(reused_job.to_string())
+            .fetch_one(database.pool())
+            .await?
+            > 0
+    );
     assert!(
         kill(
             Pid::from_raw(i32::try_from(reused_process.pid)?),
@@ -690,6 +1308,20 @@ async fn recovery_classifies_missing_and_reused_process_identities_as_lost() -> 
         Pid::from_raw(i32::try_from(reused_process.process_group_id)?),
         Signal::SIGKILL,
     )?;
+    let waited = fixture
+        .run()
+        .args(["wait", &reused_job.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["job"]["state"], "lost");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+            .bind(reused_job.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
 
     let timeout_job_file = fixture._temporary.path().join("recovered-timeout.toml");
     fs::write(
@@ -743,6 +1375,7 @@ async fn recovery_classifies_missing_and_reused_process_identities_as_lost() -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancellation_and_retry_preserve_process_and_attempt_contracts() -> TestResult {
+    let _guard = worker_test_guard()?;
     let fixture = Fixture::new()?;
     let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
     let graceful_job = submit_process(&fixture, "cancel-graceful.sh")?;
@@ -863,6 +1496,7 @@ async fn cancellation_and_retry_preserve_process_and_attempt_contracts() -> Test
 
 #[test]
 fn logs_follow_and_preserve_large_and_binary_output() -> TestResult {
+    let _guard = worker_test_guard()?;
     let fixture = Fixture::new()?;
     let followed = output_json(
         fixture

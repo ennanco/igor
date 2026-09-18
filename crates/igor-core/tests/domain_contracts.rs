@@ -173,6 +173,41 @@ fn omitted_execution_fields_have_safe_defaults() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn unsupported_shared_and_ambiguous_resource_requests_are_rejected() {
+    let mut request = ResourceRequest {
+        gpu: GpuRequest::Any,
+        gpu_exclusive: false,
+        ..ResourceRequest::default()
+    };
+    assert!(request.validate().is_err());
+
+    request.gpu = GpuRequest::Specific("GPU-one".into());
+    request.gpu_exclusive = true;
+    request.gpu_count = 2;
+    assert!(request.validate().is_err());
+
+    request.gpu = GpuRequest::None;
+    request.gpu_count = 1;
+    request.named = vec![NamedResourceRequest {
+        name: "license".into(),
+        mode: NamedResourceMode::Shared,
+    }];
+    assert!(request.validate().is_err());
+
+    request.named = vec![
+        NamedResourceRequest {
+            name: "license".into(),
+            mode: NamedResourceMode::Exclusive,
+        },
+        NamedResourceRequest {
+            name: "license".into(),
+            mode: NamedResourceMode::Exclusive,
+        },
+    ];
+    assert!(request.validate().is_err());
+}
+
+#[test]
 fn legacy_git_revision_identity_remains_readable() -> Result<(), Box<dyn Error>> {
     let source: SourceIdentity = serde_json::from_value(json!({
         "kind": "git_revision",

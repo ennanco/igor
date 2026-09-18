@@ -11,9 +11,10 @@ use igor_core::{
     ActionId, ActionRecord, ActionState, ArtifactRecord, ArtifactRole, AttemptId, AttemptSpec,
     AttemptState, CommandSpec, ConfigurationIdentity, Database, DatabaseOptions, DeliveryId,
     DeliveryRecord, DeliveryState, EnvironmentPolicy, Event, EventId, EventKind, EventPayload,
-    ExecutionOutcome, Family, FamilyId, Generation, GenerationId, GenerationIdentity, HostGpu,
-    HostInventory, IntegrityCheck, JobId, JobSpec, JobState, PersistenceError, ProcessStart,
-    Project, ProjectId, Resource, ResourceId, ResultContract, ShellPolicy, SourceIdentity,
+    ExecutionOutcome, Family, FamilyId, Generation, GenerationId, GenerationIdentity, GpuRequest,
+    HostGpu, HostInventory, IntegrityCheck, JobId, JobSpec, JobState, NamedResourceMode,
+    NamedResourceRequest, PersistenceError, ProcessStart, Project, ProjectId, Resource, ResourceId,
+    ResourceMode, ResultContract, ShellPolicy, SourceIdentity,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
@@ -99,6 +100,27 @@ async fn insert_project_job(database: &Database) -> Result<(Project, JobSpec), B
         )
         .await?;
     Ok((project, job))
+}
+
+async fn synchronize_test_inventory(
+    database: &Database,
+    max_concurrent_jobs: u32,
+    gpus: Vec<HostGpu>,
+) -> Result<(), Box<dyn Error>> {
+    database
+        .resources()
+        .synchronize_inventory(&HostInventory {
+            detected_cpu_threads: 8,
+            cpu_threads: 8,
+            detected_memory_bytes: 16_000,
+            memory_bytes: 16_000,
+            max_concurrent_jobs,
+            gpus,
+            gpu_inventory_authoritative: true,
+            named_resources: vec!["scratch".into()],
+        })
+        .await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -1302,6 +1324,7 @@ async fn concurrent_submissions_receive_distinct_global_order() -> TestResult {
 #[tokio::test]
 async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestResult {
     let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
     let project = project();
     database.projects().insert(&project).await?;
     let mut jobs = Vec::new();
@@ -1569,6 +1592,382 @@ async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestR
 }
 
 #[tokio::test]
+async fn execution_claims_age_priority_and_break_effective_ties_by_submission_order() -> TestResult
+{
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+
+    let mut aged = job(project.id);
+    aged.name = "aged".into();
+    let aged_attempt = attempt(&aged, 1)?;
+    database
+        .jobs()
+        .submit(
+            &aged,
+            &aged_attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+
+    let mut later_aged = job(project.id);
+    later_aged.name = "later-aged".into();
+    let later_aged_attempt = attempt(&later_aged, 1)?;
+    database
+        .jobs()
+        .submit(
+            &later_aged,
+            &later_aged_attempt,
+            1,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+
+    let mut recent_high = job(project.id);
+    recent_high.name = "recent-high".into();
+    let recent_high_attempt = attempt(&recent_high, 1)?;
+    database
+        .jobs()
+        .submit(
+            &recent_high,
+            &recent_high_attempt,
+            10,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+
+    sqlx::query(
+        "UPDATE jobs SET submitted_at = CASE id
+             WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-11 hours')
+             WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-10 hours')
+             ELSE submitted_at END",
+    )
+    .bind(aged.id.to_string())
+    .bind(later_aged.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let claim = database
+        .jobs()
+        .claim_execution("worker-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("aged execution was not claimed"))?;
+    assert_eq!(claim.job.spec.id, aged.id);
+    assert_eq!(claim.job.priority, 0);
+    assert_eq!(claim.job.submission_order, 1);
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(aged.id)
+            .await?
+            .ok_or_else(|| missing("aged job missing"))?
+            .priority,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scheduler_skips_blocked_jobs_and_preserves_gpu_assignment_during_recovery() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(
+        &database,
+        2,
+        vec![
+            HostGpu {
+                identity: "GPU-one".into(),
+                display_name: Some("Test GPU".into()),
+            },
+            HostGpu {
+                identity: "GPU-two".into(),
+                display_name: Some("Second Test GPU".into()),
+            },
+        ],
+    )
+    .await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+
+    let mut blocked = job(project.id);
+    blocked.name = "blocked".into();
+    blocked.resources.mode = ResourceMode::Shared;
+    blocked.resources.gpu = GpuRequest::Specific("GPU-missing".into());
+    let blocked_attempt = attempt(&blocked, 1)?;
+    database
+        .jobs()
+        .submit(
+            &blocked,
+            &blocked_attempt,
+            20,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    sqlx::query(
+        "UPDATE jobs SET submitted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours') WHERE id = ?",
+    )
+    .bind(blocked.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let mut runnable = job(project.id);
+    runnable.name = "runnable".into();
+    runnable.resources.mode = ResourceMode::Shared;
+    runnable.resources.cpu_threads = Some(2);
+    runnable.resources.memory_bytes = Some(4_000);
+    runnable.resources.gpu = GpuRequest::Any;
+    runnable.resources.gpu_count = 2;
+    runnable.resources.named = vec![NamedResourceRequest {
+        name: "scratch".into(),
+        mode: NamedResourceMode::Exclusive,
+    }];
+    let runnable_attempt = attempt(&runnable, 1)?;
+    database
+        .jobs()
+        .submit(
+            &runnable,
+            &runnable_attempt,
+            10,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+
+    let mut competing = job(project.id);
+    competing.name = "competing".into();
+    competing.resources.mode = ResourceMode::Shared;
+    competing.resources.gpu = GpuRequest::Any;
+    let competing_attempt = attempt(&competing, 1)?;
+    database
+        .jobs()
+        .submit(
+            &competing,
+            &competing_attempt,
+            5,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+
+    let claim = database
+        .jobs()
+        .claim_execution("worker-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("runnable execution was not claimed"))?;
+    assert_eq!(claim.job.spec.id, runnable.id);
+    assert_eq!(claim.assigned_gpus, ["GPU-one", "GPU-two"]);
+    assert_eq!(claim.resource_leases.len(), 6);
+    assert!(
+        database
+            .jobs()
+            .claim_execution("worker-c", Duration::from_secs(30))
+            .await?
+            .is_none()
+    );
+    database.jobs().release_execution(&claim).await?;
+
+    let recovered = database
+        .jobs()
+        .claim_recovery("worker-b", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("released execution was not recovered"))?;
+    assert_eq!(recovered.claim.assigned_gpus, claim.assigned_gpus);
+    assert!(
+        recovered
+            .claim
+            .resource_leases
+            .iter()
+            .all(|lease| lease.owner == "worker-b")
+    );
+    database
+        .jobs()
+        .finish_execution(
+            &recovered.claim,
+            &ExecutionOutcome {
+                state: AttemptState::Lost,
+                exit_code: None,
+                term_signal: None,
+                error: Some("test recovery complete".into()),
+            },
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM resource_leases")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    let competing_claim = database
+        .jobs()
+        .claim_execution("worker-c", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("competing GPU execution was not claimed after release"))?;
+    assert_eq!(competing_claim.job.spec.id, competing.id);
+    assert_eq!(competing_claim.assigned_gpus.len(), 1);
+    database
+        .jobs()
+        .finish_execution(
+            &competing_claim,
+            &ExecutionOutcome {
+                state: AttemptState::Failed,
+                exit_code: None,
+                term_signal: None,
+                error: Some("test complete".into()),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn atomic_scheduler_never_overcommits_and_rolls_back_failed_reservations() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let mut submitted_jobs = Vec::new();
+    for name in ["first", "second"] {
+        let mut submitted = job(project.id);
+        submitted.name = name.into();
+        let submitted_attempt = attempt(&submitted, 1)?;
+        database
+            .jobs()
+            .submit(
+                &submitted,
+                &submitted_attempt,
+                0,
+                &event(EventKind::JobSubmitted, json!({}))?,
+                &event(EventKind::AttemptCreated, json!({}))?,
+            )
+            .await?;
+        submitted_jobs.push(submitted.id);
+    }
+
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+    for owner in ["worker-a", "worker-b"] {
+        let database = database.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            database
+                .jobs()
+                .claim_execution(owner, Duration::from_secs(30))
+                .await
+        }));
+    }
+    barrier.wait().await;
+    let mut claimed = Vec::new();
+    for handle in handles {
+        if let Some(claim) = handle.await?? {
+            claimed.push(claim);
+        }
+    }
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM resource_leases")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    sqlx::query(
+        "UPDATE resource_leases SET expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second')
+         WHERE job_id = ?",
+    )
+    .bind(claimed[0].job.spec.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let host_id = database
+        .resources()
+        .status()
+        .await?
+        .into_iter()
+        .find(|status| status.resource.name == "host")
+        .map(|status| status.resource.id)
+        .ok_or_else(|| missing("host resource missing"))?;
+    let queued_job = submitted_jobs
+        .iter()
+        .copied()
+        .find(|job_id| *job_id != claimed[0].job.spec.id)
+        .ok_or_else(|| missing("queued job missing"))?;
+    assert!(
+        database
+            .resources()
+            .acquire(host_id, queued_job, "worker-c", 1, Duration::from_secs(30),)
+            .await?
+            .is_none()
+    );
+    database
+        .jobs()
+        .record_process_started(
+            &claimed[0],
+            &ProcessStart {
+                pid: 1234,
+                process_group_id: 1234,
+                process_start_ticks: 5678,
+                stdout_path: PathBuf::from("/tmp/igor/atomic-stdout.log"),
+                stderr_path: PathBuf::from("/tmp/igor/atomic-stderr.log"),
+            },
+        )
+        .await?;
+    database
+        .jobs()
+        .heartbeat_execution(&claimed[0], Duration::from_secs(30))
+        .await?;
+    database
+        .jobs()
+        .finish_execution(
+            &claimed[0],
+            &ExecutionOutcome {
+                state: AttemptState::Failed,
+                exit_code: None,
+                term_signal: None,
+                error: Some("test complete".into()),
+            },
+        )
+        .await?;
+
+    sqlx::query(
+        "CREATE TRIGGER reject_resource_reservation BEFORE INSERT ON events
+         WHEN NEW.kind = 'resource_reserved'
+         BEGIN SELECT RAISE(ABORT, 'reject resource reservation'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .jobs()
+            .claim_execution("worker-c", Duration::from_secs(30))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM resource_leases")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs WHERE state = 'queued'")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM attempts WHERE state = 'pending'")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn host_inventory_is_idempotent_and_removes_stale_unleased_resources() -> TestResult {
     let (_directory, database) = database().await?;
     let first = HostInventory {
@@ -1592,6 +1991,13 @@ async fn host_inventory_is_idempotent_and_removes_stale_unleased_resources() -> 
         .find(|status| status.resource.name == "host")
         .map(|status| status.resource.id)
         .ok_or_else(|| missing("host resource was not registered"))?;
+    assert_eq!(
+        first_status
+            .iter()
+            .find(|status| status.resource.id == host_id)
+            .map(|status| status.resource.capacity),
+        Some(2)
+    );
     let memory = first_status
         .iter()
         .find(|status| status.resource.name == "memory")

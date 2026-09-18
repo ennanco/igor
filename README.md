@@ -127,11 +127,17 @@ igor config set --auto-memory --auto-cpu --auto-gpus
 ```
 
 These values define the capacities that the resource-aware scheduler will use.
-The current worker remains limited to one experiment while M7 scheduling is
-completed. They do not impose hard cgroup limits on an individual process;
-strict process limits will arrive with the planned `systemd` integration. CPU
-and memory remain unrestricted unless a smaller scheduling capacity is
-configured.
+Compatible experiments can run concurrently up to `max_concurrent_jobs`; jobs
+using the default exclusive-host mode remain isolated. The scheduler orders
+work by submitted priority, adds one priority point per complete hour in the
+queue to prevent starvation, uses global submission order to break effective
+priority ties, and skips requests that do not currently fit. Aging never changes
+the submitted priority shown by `igor list` or `igor show`.
+
+Scheduling capacities do not impose hard cgroup limits on an individual
+process; strict process limits will arrive with the planned `systemd`
+integration. CPU and memory remain unrestricted unless a smaller scheduling
+capacity is configured.
 
 ## Development
 

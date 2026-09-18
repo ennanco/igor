@@ -317,32 +317,89 @@ Dependencies: milestone 6.
 - **Phase 4: aging and acceptance.** Add deterministic priority aging and
   complete simulated contention and acceptance coverage.
 
+#### Phase 2 Checklist
+
+- [x] `M7.P2.01` Reject unsupported shared GPU and shared named-resource
+  requests before persistence.
+- [x] `M7.P2.02` Select the first priority/FIFO candidate whose complete
+  resource request fits.
+- [x] `M7.P2.03` Reserve the concurrency slot, host, CPU, memory, GPU, and named
+  resources atomically with the job claim and attempt transition.
+- [x] `M7.P2.04` Persist concrete GPU assignments in the execution claim and set
+  authoritative `CUDA_VISIBLE_DEVICES` for direct processes.
+- [x] `M7.P2.05` Renew job, process, and resource leases in one heartbeat
+  transaction.
+- [x] `M7.P2.06` Transfer and validate resource leases during process recovery
+  without allowing an expired lease to be stolen first.
+- [x] `M7.P2.07` Release every resource lease in the same transaction as each
+  terminal transition or failed launch.
+- [x] `M7.P2.08` Add contention, all-or-nothing rollback, heartbeat, recovery,
+  environment, and release tests.
+
+#### Phase 3 Checklist
+
+- [x] `M7.P3.01` Replace the single blocking worker execution with a bounded
+  set of supervised execution tasks.
+- [x] `M7.P3.02` Enforce `host.max_concurrent_jobs` while continuing to claim
+  compatible work.
+- [x] `M7.P3.03` Preserve exclusive-host isolation while allowing distinct GPU
+  and named-resource assignments to overlap.
+- [x] `M7.P3.04` Coordinate cancellation, heartbeat failure, timeout, shutdown,
+  and restart across all active tasks.
+- [x] `M7.P3.05` Add end-to-end overlap and isolation tests with simulated GPUs
+  and named resources.
+
+#### Phase 4 Checklist
+
+- [x] `M7.P4.01` Compute effective priority at claim time without mutating the
+  submitted priority.
+- [x] `M7.P4.02` Preserve `submission_order` as the deterministic tie-breaker
+  for equal effective priorities.
+- [x] `M7.P4.03` Prove that temporarily unfit jobs do not block compatible work
+  and that aging prevents starvation.
+- [x] `M7.P4.04` Re-run `A7.01-A7.04`, update operator documentation, and run the
+  full milestone review and quality gates.
+
+#### Completion Evidence
+
+- Aging adds one effective priority point per complete queued hour without a cap
+  or mutation of submitted priority; equal effective priorities use global
+  `submission_order`.
+- Persistence tests advance stored timestamps directly to prove aging, stable
+  effective-priority ties, and skipping an older incompatible candidate.
+- The milestone received a final concurrency-focused review, and `cargo fmt
+  --check`, Clippy with warnings denied, the full workspace test suite, and
+  rustdoc passed on 2026-09-18.
+
+Strict CPU/RAM enforcement, Docker GPU attachment, and scheduling across
+multiple hosts remain outside milestone 7.
+
 ### Tasks
 
 - [x] `M7.01` Discover host CPU count and total memory for diagnostics only.
 - [x] `M7.02` Discover NVIDIA GPUs when available without making NVIDIA a core
   requirement.
 - [x] `M7.03` Register host, GPU, and named resources in SQLite.
-- [ ] `M7.04` Implement `exclusive-host` as the default for unknown jobs.
-- [ ] `M7.05` Implement exclusive allocation of a specific GPU.
-- [ ] `M7.06` Set the assigned device in `CUDA_VISIBLE_DEVICES` for direct jobs.
-- [ ] `M7.07` Implement named exclusive resources.
-- [ ] `M7.08` Implement lease heartbeats and expiry reconciliation.
-- [ ] `M7.09` Reserve all required resources atomically before creating a running
+- [x] `M7.04` Implement `exclusive-host` as the default for unknown jobs.
+- [x] `M7.05` Implement exclusive allocation of a specific GPU.
+- [x] `M7.06` Set the assigned device in `CUDA_VISIBLE_DEVICES` for direct jobs.
+- [x] `M7.07` Implement named exclusive resources.
+- [x] `M7.08` Implement lease heartbeats and expiry reconciliation.
+- [x] `M7.09` Reserve all required resources atomically before creating a running
   attempt.
-- [ ] `M7.10` Release leases on every terminal transition and failed launch.
-- [ ] `M7.11` Implement priority aging without reordering equal effective
+- [x] `M7.10` Release leases on every terminal transition and failed launch.
+- [x] `M7.11` Implement priority aging without reordering equal effective
   priorities unpredictably.
 - [x] `M7.12` Implement `igor resources` and JSON output.
-- [ ] `M7.13` Add simulated multi-GPU and named-resource tests.
+- [x] `M7.13` Add simulated multi-GPU and named-resource tests.
 - [x] `M7.14` Add tests proving CPU and memory discovery does not impose limits.
 
 ### Acceptance
 
-- [ ] `A7.01` Two exclusive-host jobs never run concurrently.
-- [ ] `A7.02` Two jobs never receive the same exclusive GPU lease.
+- [x] `A7.01` Two exclusive-host jobs never run concurrently.
+- [x] `A7.02` Two jobs never receive the same exclusive GPU lease.
 - [x] `A7.03` A job can use all host CPU and memory by default.
-- [ ] `A7.04` Stale leases recover without allowing two live owners.
+- [x] `A7.04` Stale leases recover without allowing two live owners.
 
 ## Milestone 8: Docker Executor
 
