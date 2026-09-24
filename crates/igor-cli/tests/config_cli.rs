@@ -32,6 +32,14 @@ fn version_is_preserved() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn operator_cli_does_not_expose_internal_docker_diagnostics() -> Result<(), Box<dyn Error>> {
+    let output = igor().arg("--help").output()?;
+    assert!(output.status.success());
+    assert!(!text(output.stdout)?.contains("\n  docker"));
+    Ok(())
+}
+
+#[test]
 fn init_does_not_overwrite_without_force() -> Result<(), Box<dyn Error>> {
     let temporary = TempDir::new()?;
     let home = temporary.path().join("home");

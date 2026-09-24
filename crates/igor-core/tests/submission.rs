@@ -8,6 +8,23 @@ use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+#[test]
+fn shipped_docker_job_example_is_valid() -> TestResult {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/example-docker-job.toml");
+    let project = TempDir::new()?;
+    let input = load_job_file(&path)?.into_input(project.path())?;
+    input.command.validate()?;
+    input
+        .executor
+        .ok_or("missing Docker executor")?
+        .validate()?;
+    input
+        .resources
+        .ok_or("missing Docker resources")?
+        .validate()?;
+    Ok(())
+}
+
 fn git(root: &Path, args: &[&str]) -> TestResult {
     let status = Command::new("git")
         .arg("-C")

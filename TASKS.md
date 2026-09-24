@@ -233,6 +233,8 @@ Dependencies: milestone 4.
 - [x] `M5.16` Add CLI tests for spaces, empty arguments, Unicode, and arguments
   beginning with `-`.
 - [x] `M5.17` Add tests proving direct submission never invokes a shell.
+- [x] `M5.18` Implement reversible `igor project remove [PATH]` without deleting
+  project files or history and reject projects with queued or running jobs.
 
 ### Acceptance
 
@@ -304,76 +306,6 @@ each phase separately before starting the next one.
 
 Dependencies: milestone 6.
 
-### Implementation Phases
-
-- **Phase 1: inventory and observability.** Discover host resources, register a
-  stable inventory, expose scheduling limits through `igor config`, and add
-  `igor resources`.
-- **Phase 2: atomic scheduling.** Reserve host, GPU, and named resources in the
-  execution claim transaction, then heartbeat, recover, and release every
-  lease safely.
-- **Phase 3: concurrent execution.** Supervise compatible jobs concurrently,
-  enforce concrete GPU visibility, and retain exclusive-host isolation.
-- **Phase 4: aging and acceptance.** Add deterministic priority aging and
-  complete simulated contention and acceptance coverage.
-
-#### Phase 2 Checklist
-
-- [x] `M7.P2.01` Reject unsupported shared GPU and shared named-resource
-  requests before persistence.
-- [x] `M7.P2.02` Select the first priority/FIFO candidate whose complete
-  resource request fits.
-- [x] `M7.P2.03` Reserve the concurrency slot, host, CPU, memory, GPU, and named
-  resources atomically with the job claim and attempt transition.
-- [x] `M7.P2.04` Persist concrete GPU assignments in the execution claim and set
-  authoritative `CUDA_VISIBLE_DEVICES` for direct processes.
-- [x] `M7.P2.05` Renew job, process, and resource leases in one heartbeat
-  transaction.
-- [x] `M7.P2.06` Transfer and validate resource leases during process recovery
-  without allowing an expired lease to be stolen first.
-- [x] `M7.P2.07` Release every resource lease in the same transaction as each
-  terminal transition or failed launch.
-- [x] `M7.P2.08` Add contention, all-or-nothing rollback, heartbeat, recovery,
-  environment, and release tests.
-
-#### Phase 3 Checklist
-
-- [x] `M7.P3.01` Replace the single blocking worker execution with a bounded
-  set of supervised execution tasks.
-- [x] `M7.P3.02` Enforce `host.max_concurrent_jobs` while continuing to claim
-  compatible work.
-- [x] `M7.P3.03` Preserve exclusive-host isolation while allowing distinct GPU
-  and named-resource assignments to overlap.
-- [x] `M7.P3.04` Coordinate cancellation, heartbeat failure, timeout, shutdown,
-  and restart across all active tasks.
-- [x] `M7.P3.05` Add end-to-end overlap and isolation tests with simulated GPUs
-  and named resources.
-
-#### Phase 4 Checklist
-
-- [x] `M7.P4.01` Compute effective priority at claim time without mutating the
-  submitted priority.
-- [x] `M7.P4.02` Preserve `submission_order` as the deterministic tie-breaker
-  for equal effective priorities.
-- [x] `M7.P4.03` Prove that temporarily unfit jobs do not block compatible work
-  and that aging prevents starvation.
-- [x] `M7.P4.04` Re-run `A7.01-A7.04`, update operator documentation, and run the
-  full milestone review and quality gates.
-
-#### Completion Evidence
-
-- Aging adds one effective priority point per complete queued hour without a cap
-  or mutation of submitted priority; equal effective priorities use global
-  `submission_order`.
-- Persistence tests advance stored timestamps directly to prove aging, stable
-  effective-priority ties, and skipping an older incompatible candidate.
-- The milestone received a final concurrency-focused review, and `cargo fmt
-  --check`, Clippy with warnings denied, the full workspace test suite, and
-  rustdoc passed on 2026-09-18.
-
-Strict CPU/RAM enforcement, Docker GPU attachment, and scheduling across
-multiple hosts remain outside milestone 7.
-
 ### Tasks
 
 - [x] `M7.01` Discover host CPU count and total memory for diagnostics only.
@@ -407,29 +339,79 @@ Dependencies: milestones 6-7.
 
 ### Tasks
 
-- [ ] `M8.01` Implement Docker capability detection.
-- [ ] `M8.02` Validate and resolve configured image references and digests.
-- [ ] `M8.03` Build `docker create` arguments structurally without shell parsing.
-- [ ] `M8.04` Implement configured read-only and read-write mounts.
-- [ ] `M8.05` Pass only the minimal configured environment.
-- [ ] `M8.06` Attach the assigned GPU using a concrete device selection.
-- [ ] `M8.07` Label containers with project, job, attempt, and generation IDs.
-- [ ] `M8.08` Persist container ID before declaring the attempt running.
-- [ ] `M8.09` Capture Docker logs and exit status.
-- [ ] `M8.10` Implement graceful Docker cancellation.
-- [ ] `M8.11` Recover by container ID and use labels only as a fallback.
-- [ ] `M8.12` Distinguish missing daemon, missing image, OOM, cancelled, and
-  application failures.
-- [ ] `M8.13` Remove disposable containers idempotently after finalization.
-- [ ] `M8.14` Add tests for command construction without requiring Docker.
-- [ ] `M8.15` Add opt-in integration tests using disposable CPU containers.
+- [x] `M8.01` Detect the Docker CLI and daemon only when a Docker job requires it;
+  process-only startup must not fail when Docker is absent.
+- [x] `M8.02` Validate non-empty image references and canonical `sha256` digests,
+  resolve availability according to the frozen pull policy, inspect the resolved
+  image, and reject a configured digest mismatch before container creation.
+- [x] `M8.03` Build `docker create`, `start`, `wait`, `logs`, `stop`, `kill`,
+  `inspect`, and `rm` invocations as program plus argument vectors without shell
+  parsing.
+- [x] `M8.04` Validate structured read-only and read-write mounts, preserve paths
+  containing spaces, reject duplicate targets, and enforce the mount policy
+  frozen in `DESIGN.md`.
+- [x] `M8.05` Preserve image-declared environment defaults and add only the frozen
+  attempt's explicit `environment.set` values; never forward ambient Telegram,
+  coding-agent, cloud, SSH, or Git credentials from the host.
+- [x] `M8.06` Translate the GPUs already assigned by the M7 scheduler into an
+  exact Docker device request; never use an all-GPU shortcut.
+- [x] `M8.07` Generate deterministic container names and labels containing Igor's
+  project, job, attempt, and optional generation IDs.
+- [x] `M8.08` Run `docker create`, persist the returned container ID atomically,
+  then run `docker start`; never mark the attempt running before both durable
+  identity and successful start are established.
+- [x] `M8.09` Stream stdout and stderr into Igor log files, obtain the authoritative
+  exit status from Docker, and persist the final attempt and job outcome.
+- [x] `M8.10` On cancellation, run `docker stop` with the configured grace period,
+  escalate to `docker kill` when necessary, then inspect and persist the terminal
+  result before cleanup, and classify cancellation distinctly from application
+  failure.
+- [x] `M8.11` Recover first by persisted container ID. Use exact Igor labels only
+  when no durable ID exists, accept exactly one match, and treat zero or multiple
+  matches as explicit recovery outcomes rather than starting a replacement.
+- [x] `M8.12` Classify CLI unavailable, daemon unavailable, image missing, digest
+  mismatch, create/start failure, OOM, application nonzero exit, and lost
+  container without collapsing them into one launch error.
+- [x] `M8.13` Remove disposable containers only after logs and final status are
+  durable; make repeated cleanup and already-missing containers successful.
+- [x] `M8.14` Unit-test validation and every command-planning branch without a
+  Docker daemon, including spaces, mounts, environment filtering, labels,
+  digest mismatch, and concrete GPU arguments.
+- [x] `M8.15` Add opt-in disposable CPU-container tests for success, nonzero exit,
+  log capture, cancellation, worker restart, digest checking, and idempotent
+  removal; skip with an explicit reason when Docker is unavailable.
+- [x] `M8.P2.01` Add a numbered migration for one durable container record per
+  attempt, with container ID, name, image identity, lifecycle timestamps, and
+  last observed status; preserve upgrade coverage from every existing fixture.
+- [x] `M8.P2.02` Add repository operations that create, read, and advance
+  container records to running only through valid attempt and claim transitions.
+- [x] `M8.P2.03` If persistence fails after creation, remove the unowned container
+  best-effort and leave the attempt in a durable failed state with the original
+  error recorded; retained labels must make failed cleanup discoverable.
+- [x] `M8.P3.01` Keep job claims and M7 resource leases alive throughout create,
+  execution, log capture, and finalization, releasing them in the same terminal
+  transaction used by direct execution.
+- [x] `M8.P4.01` Reattach supervision to running containers, finalize exited
+  containers from inspect data, and classify missing containers without
+  releasing a live container's GPU or named-resource leases.
+- [x] `M8.P4.02` Add crash-boundary tests for created-not-started,
+  started-not-marked-running, running, exited-not-finalized, and
+  finalized-not-removed containers.
+- [x] `M8.P5.01` Re-run process-only suites on a path with no Docker CLI to prove
+  Docker remains optional.
+- [x] `M8.P5.02` Update `README.md`, `DESIGN.md`, example configuration, and
+  operator diagnostics with image, mount, environment, GPU, recovery, cleanup,
+  and opt-in test behavior.
+- [x] `M8.P5.03` Complete a security-focused review, run `A8.01-A8.04`, and pass
+  format, Clippy, full workspace tests, opt-in Docker tests where available, and
+  rustdoc.
 
 ### Acceptance
 
-- [ ] `A8.01` Docker remains optional for process-only installations.
-- [ ] `A8.02` A daemon restart can recover a live container.
-- [ ] `A8.03` Docker jobs cannot inherit Telegram or coding-agent credentials.
-- [ ] `A8.04` A configured image digest is checked before launch.
+- [x] `A8.01` Docker remains optional for process-only installations.
+- [x] `A8.02` A daemon restart can recover a live container.
+- [x] `A8.03` Docker jobs cannot inherit Telegram or coding-agent credentials.
+- [x] `A8.04` A configured image digest is checked before launch.
 
 ## Milestone 9: systemd Installation And Runtime Integration
 
@@ -449,7 +431,7 @@ Dependencies: milestones 6-8.
 - [ ] `M9.09` Implement service start, stop, and restart.
 - [ ] `M9.10` Implement `igor service status`.
 - [ ] `M9.11` Implement `igor service logs`.
-- [ ] `M9.12` Implement `igor service uninstall --user` with explicit
+- [x] `M9.12` Implement `igor service uninstall --user` with explicit
   confirmation.
 - [ ] `M9.13` Ensure service commands never invoke `sudo` implicitly.
 - [ ] `M9.14` Validate generated units with `systemd-analyze --user verify`.
@@ -457,6 +439,8 @@ Dependencies: milestones 6-8.
 - [ ] `M9.16` Evaluate transient user units for direct attempts and implement
   them if recovery is more reliable than process groups.
 - [ ] `M9.17` Preserve the process-group backend as a portable fallback.
+- [x] `M9.18` Implement conservative `igor uninstall` as user-service removal
+  while preserving the binary, configuration, database, logs, and history.
 
 ### Acceptance
 

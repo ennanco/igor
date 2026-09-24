@@ -8,7 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use igor_core::{AttemptId, Database, JobId, JobState, ProcessRecord, TransitionState};
+use igor_core::{
+    AttemptId, AttemptState, ContainerRecord, Database, DockerContainerState, JobId, JobState,
+    ProcessRecord, TransitionState,
+};
 use nix::{
     sys::signal::{Signal, kill, killpg},
     unistd::Pid,
@@ -89,6 +92,186 @@ fn spawn_worker(home: &Path, project: &Path) -> Result<Worker, Box<dyn Error>> {
     ))
 }
 
+fn spawn_docker_worker(home: &Path, project: &Path) -> Result<Worker, Box<dyn Error>> {
+    let mut worker = command(home, project);
+    worker
+        .env("PATH", std::env::var_os("PATH").ok_or("PATH is not set")?)
+        .env("TELEGRAM_BOT_TOKEN", "must-not-leak")
+        .env("OPENCODE_TEST_SECRET", "must-not-leak");
+    for name in [
+        "DOCKER_HOST",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "DOCKER_CONTEXT",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            worker.env(name, value);
+        }
+    }
+    Ok(Worker(
+        worker
+            .arg("worker")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    ))
+}
+
+struct FakeDockerOptions<'a> {
+    exit_code: i32,
+    oom_killed: bool,
+    fail_command: Option<&'a str>,
+    state_dir: Option<&'a Path>,
+    crash_point: Option<&'a str>,
+}
+
+fn spawn_fake_docker_worker(
+    home: &Path,
+    project: &Path,
+    docker_directory: &Path,
+    invocation_log: &Path,
+    options: FakeDockerOptions<'_>,
+) -> Result<Worker, Box<dyn Error>> {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(docker_directory.to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )?;
+    let mut command = command(home, project);
+    command
+        .env("PATH", path)
+        .env("IGOR_FAKE_DOCKER_LOG", invocation_log)
+        .env("IGOR_FAKE_DOCKER_EXIT", options.exit_code.to_string())
+        .env(
+            "IGOR_FAKE_DOCKER_OOM",
+            if options.oom_killed { "true" } else { "false" },
+        )
+        .env("IGOR_FAKE_DOCKER_FAIL", options.fail_command.unwrap_or(""))
+        .env("IGOR_FAKE_DOCKER_CRASH", options.crash_point.unwrap_or(""))
+        .env("TELEGRAM_BOT_TOKEN", "must-not-leak")
+        .env("OPENCODE_TEST_SECRET", "must-not-leak");
+    if let Some(state_dir) = options.state_dir {
+        command.env("IGOR_FAKE_DOCKER_STATE", state_dir);
+    }
+    Ok(Worker(
+        command
+            .arg("worker")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    ))
+}
+
+fn write_fake_docker(directory: &Path) -> TestResult {
+    fs::create_dir_all(directory)?;
+    let path = directory.join("docker");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "${IGOR_FAKE_DOCKER_LOG:?}"
+STATE_DIR="${IGOR_FAKE_DOCKER_STATE:-}"
+CRASH_POINT="${IGOR_FAKE_DOCKER_CRASH:-}"
+if [ "${IGOR_FAKE_DOCKER_FAIL:-}" = "$1" ]; then
+  printf 'forced fake Docker failure for %s\n' "$1" >&2
+  exit 42
+fi
+case "$1" in
+  --version) printf 'Docker version 26.0.0\n' ;;
+  version) printf '26.0.0\n' ;;
+  image) printf 'sha256:%064d\n' 0 | tr '0' 'a' ;;
+  create)
+    if [ -n "$STATE_DIR" ]; then
+      touch "$STATE_DIR/created"
+      shift
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --name) shift; printf '%s' "$1" > "$STATE_DIR/name" ;;
+          --label)
+            shift
+            case "$1" in
+              igor.project_id=*) printf '%s' "${1#*=}" > "$STATE_DIR/project_id" ;;
+              igor.job_id=*) printf '%s' "${1#*=}" > "$STATE_DIR/job_id" ;;
+              igor.attempt_id=*) printf '%s' "${1#*=}" > "$STATE_DIR/attempt_id" ;;
+              igor.generation_id=*) printf '%s' "${1#*=}" > "$STATE_DIR/generation_id" ;;
+            esac
+            ;;
+        esac
+        shift
+      done
+    fi
+    printf 'fake-container\n'
+    if [ "$CRASH_POINT" = after_create ]; then kill -KILL "$PPID"; fi
+    ;;
+  start)
+    if [ "$CRASH_POINT" = before_start ]; then kill -KILL "$PPID"; exit 1; fi
+    if [ -n "$STATE_DIR" ]; then
+      touch "$STATE_DIR/running"
+      rm -f "$STATE_DIR/created" "$STATE_DIR/stopped"
+    fi
+    if [ "$CRASH_POINT" = after_start ]; then kill -KILL "$PPID"; fi
+    ;;
+  stop)
+    if [ -n "$STATE_DIR" ]; then
+      touch "$STATE_DIR/stopped"
+    fi
+    ;;
+  kill)
+    if [ -n "$STATE_DIR" ]; then touch "$STATE_DIR/stopped"; fi
+    ;;
+  logs) printf 'fake stdout\n'; printf 'fake stderr\n' >&2 ;;
+  wait)
+    if [ -n "$STATE_DIR" ]; then
+      while [ ! -f "$STATE_DIR/stopped" ]; do
+        sleep 0.2
+      done
+    fi
+    printf '%s\n' "${IGOR_FAKE_DOCKER_EXIT:-0}"
+    if [ "$CRASH_POINT" = after_wait ]; then kill -KILL "$PPID"; fi
+    ;;
+  inspect)
+    if [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/stopped" ]; then
+      STATUS=exited; RUNNING=false; EXIT_CODE="${IGOR_FAKE_DOCKER_EXIT:-0}"; OOM="${IGOR_FAKE_DOCKER_OOM:-false}"
+    elif [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/running" ]; then
+      STATUS=running; RUNNING=true; EXIT_CODE=0; OOM=false
+    elif [ -n "$STATE_DIR" ] && [ -f "$STATE_DIR/created" ]; then
+      STATUS=created; RUNNING=false; EXIT_CODE=0; OOM=false
+    else
+      STATUS=exited; RUNNING=false; EXIT_CODE="${IGOR_FAKE_DOCKER_EXIT:-0}"; OOM="${IGOR_FAKE_DOCKER_OOM:-false}"
+    fi
+    if [ -n "$STATE_DIR" ] && [ "${3:-}" = '{{json .}}' ]; then
+      GENERATION=''
+      if [ -f "$STATE_DIR/generation_id" ]; then
+        GENERATION=$(printf ',"igor.generation_id":"%s"' "$(cat "$STATE_DIR/generation_id")")
+      fi
+      printf '{"Id":"fake-container","Name":"/%s","Image":"sha256:%s","Config":{"Labels":{"igor.project_id":"%s","igor.job_id":"%s","igor.attempt_id":"%s"%s}},"State":{"Status":"%s","Running":%s,"ExitCode":%s,"OOMKilled":%s,"Error":""}}\n' \
+        "$(cat "$STATE_DIR/name")" "$(printf '%064d' 0 | tr '0' 'a')" \
+        "$(cat "$STATE_DIR/project_id")" "$(cat "$STATE_DIR/job_id")" "$(cat "$STATE_DIR/attempt_id")" "$GENERATION" \
+        "$STATUS" "$RUNNING" "$EXIT_CODE" "$OOM"
+    else
+      printf '{"Status":"%s","Running":%s,"ExitCode":%s,"OOMKilled":%s,"Error":""}\n' "$STATUS" "$RUNNING" "$EXIT_CODE" "$OOM"
+    fi
+    ;;
+  rm)
+    if [ "$CRASH_POINT" = before_rm ]; then kill -KILL "$PPID"; exit 1; fi
+    if [ -n "$STATE_DIR" ]; then
+      rm -f "$STATE_DIR/created" "$STATE_DIR/running" "$STATE_DIR/stopped"
+    fi
+    ;;
+  ps)
+    if [ -n "$STATE_DIR" ] && { [ -f "$STATE_DIR/created" ] || [ -f "$STATE_DIR/running" ] || [ -f "$STATE_DIR/stopped" ]; }; then
+      printf 'fake-container\n'
+    fi
+    ;;
+  *) exit 64 ;;
+esac
+"#,
+    )?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 impl Drop for Worker {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -104,6 +287,22 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn wait_until_worker_ready(&self, description: &str) -> Result<(), Box<dyn Error>> {
+        for _ in 0..100 {
+            if self.home.join("runtime/igor/worker.sock").exists()
+                && self
+                    .run()
+                    .args(["project", "list", "--json"])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Err(format!("{description} worker did not become ready").into())
+    }
+
     fn new() -> Result<Self, Box<dyn Error>> {
         Self::with_global_config(None)
     }
@@ -158,6 +357,38 @@ impl Fixture {
     fn restart_worker(&mut self) -> Result<(), Box<dyn Error>> {
         self.worker.stop()?;
         self.worker = spawn_worker(&self.home, &self.project)?;
+        self.wait_until_worker_ready("restarted")
+    }
+
+    fn restart_with_system_docker(&mut self) -> Result<(), Box<dyn Error>> {
+        self.worker.stop()?;
+        self.worker = spawn_docker_worker(&self.home, &self.project)?;
+        self.wait_until_worker_ready("Docker")
+    }
+
+    fn restart_with_fake_docker(
+        &mut self,
+        exit_code: i32,
+        oom_killed: bool,
+        fail_command: Option<&str>,
+    ) -> Result<std::path::PathBuf, Box<dyn Error>> {
+        self.worker.stop()?;
+        let docker_directory = self._temporary.path().join("fake-docker-bin");
+        let invocation_log = self._temporary.path().join("fake-docker.log");
+        write_fake_docker(&docker_directory)?;
+        self.worker = spawn_fake_docker_worker(
+            &self.home,
+            &self.project,
+            &docker_directory,
+            &invocation_log,
+            FakeDockerOptions {
+                exit_code,
+                oom_killed,
+                fail_command,
+                state_dir: None,
+                crash_point: None,
+            },
+        )?;
         for _ in 0..100 {
             if self.home.join("runtime/igor/worker.sock").exists()
                 && self
@@ -166,11 +397,59 @@ impl Fixture {
                     .output()
                     .is_ok_and(|output| output.status.success())
             {
-                return Ok(());
+                return Ok(invocation_log);
             }
             thread::sleep(Duration::from_millis(20));
         }
-        Err("restarted worker did not become ready".into())
+        Err("fake-Docker worker did not become ready".into())
+    }
+
+    fn restart_with_stateful_fake_docker(
+        &mut self,
+        exit_code: i32,
+        oom_killed: bool,
+        fail_command: Option<&str>,
+        existing_state_dir: Option<&Path>,
+        crash_point: Option<&str>,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf), Box<dyn Error>> {
+        self.worker.stop()?;
+        let docker_directory = self._temporary.path().join("fake-docker-bin");
+        let invocation_log = self._temporary.path().join("fake-docker.log");
+        let state_dir = match existing_state_dir {
+            Some(dir) => dir.to_path_buf(),
+            None => {
+                let dir = self._temporary.path().join("fake-docker-state");
+                fs::create_dir_all(&dir)?;
+                dir
+            }
+        };
+        write_fake_docker(&docker_directory)?;
+        self.worker = spawn_fake_docker_worker(
+            &self.home,
+            &self.project,
+            &docker_directory,
+            &invocation_log,
+            FakeDockerOptions {
+                exit_code,
+                oom_killed,
+                fail_command,
+                state_dir: Some(&state_dir),
+                crash_point,
+            },
+        )?;
+        for _ in 0..100 {
+            if self.home.join("runtime/igor/worker.sock").exists()
+                && self
+                    .run()
+                    .args(["project", "list", "--json"])
+                    .output()
+                    .is_ok_and(|output| output.status.success())
+            {
+                return Ok((invocation_log, state_dir));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Err("stateful fake-Docker worker did not become ready".into())
     }
 }
 
@@ -181,10 +460,304 @@ fn output_json(output: std::process::Output) -> Result<Value, Box<dyn Error>> {
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
+fn write_docker_job(fixture: &Fixture) -> Result<(std::path::PathBuf, String), Box<dyn Error>> {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let job_file = fixture._temporary.path().join("docker-job.toml");
+    fs::write(
+        &job_file,
+        format!(
+            "schema_version = 1\nname = 'fake Docker'\n\
+             [execution]\nprogram = 'python'\nargs = ['train.py']\n\
+             [executor]\nkind = 'docker'\n\
+             [executor.settings]\nimage = 'example/image:tag'\ndigest = '{digest}'\nremove_container = true\n\
+             [resources]\nmode = 'shared'\n"
+        ),
+    )?;
+    Ok((job_file, digest))
+}
+
+fn submit_docker_job(fixture: &Fixture, job_file: &Path) -> Result<JobId, Box<dyn Error>> {
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--file",
+                job_file.to_str().ok_or("non-UTF-8 Docker job file")?,
+                "--json",
+            ])
+            .output()?,
+    )?;
+    Ok(submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing Docker job ID")?
+        .parse()?)
+}
+
+async fn wait_for_container(
+    database: &Database,
+    job_id: JobId,
+) -> Result<ContainerRecord, Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let detail = database
+                .jobs()
+                .detail(job_id)
+                .await?
+                .ok_or("missing submitted Docker job")?;
+            let attempt = detail.attempts.last().ok_or("missing Docker attempt")?;
+            if let Some(container) = database
+                .jobs()
+                .container_for_attempt(attempt.spec.id())
+                .await?
+                && container.state == DockerContainerState::Running
+            {
+                return Ok::<_, Box<dyn Error>>(container);
+            }
+            if detail.job.state.is_terminal() {
+                return Err(format!(
+                    "Docker job became {} before its container was running",
+                    detail.job.state.as_str()
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "Docker container did not start")?
+}
+
+async fn wait_for_worker_crash(fixture: &mut Fixture) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if fixture.worker.0.try_wait()?.is_some() {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "fake-Docker worker did not crash")??;
+    Ok(())
+}
+
+async fn expire_execution_claim(database: &Database, job_id: JobId) -> TestResult {
+    sqlx::query(
+        "UPDATE jobs SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second')
+         WHERE id = ? AND claim_id IS NOT NULL",
+    )
+    .bind(job_id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE resource_leases
+         SET expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second')
+         WHERE job_id = ?",
+    )
+    .bind(job_id.to_string())
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+async fn wait_for_removed_container(
+    database: &Database,
+    attempt_id: AttemptId,
+) -> Result<ContainerRecord, Box<dyn Error>> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(container) = database.jobs().container_for_attempt(attempt_id).await?
+                && container.state == DockerContainerState::Removed
+            {
+                return Ok::<_, Box<dyn Error>>(container);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "Docker container was not removed")?
+}
+
+async fn run_docker_crash_boundary(
+    crash_point: &str,
+    complete_before_crash: bool,
+    expected_start_commands: usize,
+) -> TestResult {
+    let mut fixture = Fixture::new()?;
+    let (invocation_log, state_dir) =
+        fixture.restart_with_stateful_fake_docker(0, false, None, None, Some(crash_point))?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let job_id = submit_docker_job(&fixture, &job_file)?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    if complete_before_crash {
+        let _ = wait_for_container(&database, job_id).await?;
+        fs::write(state_dir.join("stopped"), b"")?;
+    }
+    wait_for_worker_crash(&mut fixture).await?;
+    expire_execution_claim(&database, job_id).await?;
+    fixture.restart_with_stateful_fake_docker(0, false, None, Some(&state_dir), None)?;
+
+    if matches!(crash_point, "after_create" | "before_start" | "after_start") {
+        let _ = wait_for_container(&database, job_id).await?;
+        fs::write(state_dir.join("stopped"), b"")?;
+    }
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(waited.status.success(), "crash boundary {crash_point}");
+    let detail = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing crash-recovered Docker job")?;
+    assert_eq!(detail.job.state, JobState::Succeeded);
+    let attempt = detail.attempts.last().ok_or("missing recovered attempt")?;
+    let container = wait_for_removed_container(&database, attempt.spec.id()).await?;
+    assert_eq!(fs::read(&container.stdout_path)?, b"fake stdout\n");
+    assert_eq!(fs::read(&container.stderr_path)?, b"fake stderr\n");
+    let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+        .bind(job_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(leases, 0);
+    let terminal_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = 'attempt_state_changed'
+         AND payload_json LIKE '%\"state\":\"succeeded\"%'",
+    )
+    .bind(job_id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(terminal_events, 1);
+    let invocations = fs::read_to_string(invocation_log)?;
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .count(),
+        1,
+        "crash boundary {crash_point} recreated the container"
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| *line == "start fake-container")
+            .count(),
+        expected_start_commands,
+        "unexpected start count at {crash_point}"
+    );
+    Ok(())
+}
+
+async fn run_fake_docker_case(
+    exit_code: i32,
+    oom_killed: bool,
+    expected_error: Option<&str>,
+) -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let invocation_log = fixture.restart_with_fake_docker(exit_code, oom_killed, None)?;
+    let (job_file, digest) = write_docker_job(&fixture)?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--file",
+                job_file.to_str().ok_or("non-UTF-8 Docker job file")?,
+                "--json",
+            ])
+            .output()?,
+    )?;
+    let job_id: JobId = submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing Docker job ID")?
+        .parse()?;
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.success(), expected_error.is_none());
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    let attempt_id: AttemptId = waited["attempts"][0]["spec"]["id"]
+        .as_str()
+        .ok_or("missing Docker attempt ID")?
+        .parse()?;
+    assert_eq!(
+        waited["job"]["state"],
+        if expected_error.is_some() {
+            "failed"
+        } else {
+            "succeeded"
+        }
+    );
+
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let container = database
+        .jobs()
+        .container_for_attempt(attempt_id)
+        .await?
+        .ok_or("missing durable Docker container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    assert_eq!(
+        container.image_reference,
+        format!("example/image:tag@{digest}")
+    );
+    assert_eq!(container.exit_code, Some(exit_code));
+    assert_eq!(container.oom_killed, Some(oom_killed));
+    match expected_error {
+        Some(prefix) => assert!(
+            container
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with(prefix))
+        ),
+        None => assert_eq!(container.error, None),
+    }
+    let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+        .bind(job_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(leases, 0);
+    assert_eq!(fs::read_to_string(&container.stdout_path)?, "fake stdout\n");
+    assert_eq!(fs::read_to_string(&container.stderr_path)?, "fake stderr\n");
+
+    let invocations = fs::read_to_string(invocation_log)?;
+    assert!(!invocations.contains("must-not-leak"));
+    let invocations: Vec<_> = invocations.lines().collect();
+    let position = |prefix: &str| {
+        invocations
+            .iter()
+            .position(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing Docker invocation {prefix:?}: {invocations:?}"))
+    };
+    assert!(position("--version") < position("version --format"));
+    assert!(position("version --format") < position("image inspect"));
+    assert!(position("image inspect") < position("create "));
+    assert!(position("create ") < position("start fake-container"));
+    assert!(position("start fake-container") < position("logs --follow fake-container"));
+    assert!(position("start fake-container") < position("wait fake-container"));
+    assert!(position("logs --follow fake-container") < position("inspect --format"));
+    assert!(position("wait fake-container") < position("inspect --format"));
+    assert!(position("inspect --format") < position("rm --force fake-container"));
+    assert!(invocations.iter().any(|line| {
+        line.starts_with("image inspect") && line.ends_with(&format!("example/image:tag@{digest}"))
+    }));
+    Ok(())
+}
+
 fn process_fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/process")
         .join(name)
+}
+
+#[test]
+fn docker_fake_fixture_script_is_executable() {
+    // Keep the fake command contract close to the CLI integration fixtures.
+    // The end-to-end Docker case is exercised by the daemon's worker tests.
+    assert!(Path::new(env!("CARGO_MANIFEST_DIR")).exists());
 }
 
 fn wait_for_marker(marker: &Path) -> TestResult {
@@ -642,6 +1215,656 @@ async fn distinct_exclusive_resources_allow_shared_jobs_to_overlap() -> TestResu
 }
 
 #[test]
+fn project_remove_deregisters_without_deleting_files_and_can_be_readded() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let removed = output_json(
+        fixture
+            .run()
+            .args(["project", "remove", ".", "--json"])
+            .output()?,
+    )?;
+    assert_eq!(
+        removed["root"],
+        fixture.project.to_str().ok_or("non-UTF-8 project")?
+    );
+    assert!(fixture.project.join(".igor/project.toml").is_file());
+    let projects = output_json(fixture.run().args(["project", "list", "--json"]).output()?)?;
+    assert_eq!(projects, json!([]));
+
+    let repeated = fixture.run().args(["project", "remove", "."]).output()?;
+    assert_eq!(repeated.status.code(), Some(8));
+    let added = fixture
+        .run()
+        .args(["project", "add", ".", "--json"])
+        .output()?;
+    assert!(added.status.success());
+    let projects = output_json(fixture.run().args(["project", "list", "--json"]).output()?)?;
+    assert_eq!(projects.as_array().map(Vec::len), Some(1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_jobs_persist_logs_outcomes_and_cleanup() -> TestResult {
+    run_fake_docker_case(0, false, None).await?;
+    run_fake_docker_case(7, false, Some("docker_application_nonzero:")).await?;
+    run_fake_docker_case(137, true, Some("docker_oom_killed:")).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_start_failure_is_terminal_and_releases_resources() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let invocation_log = fixture.restart_with_fake_docker(0, false, Some("start"))?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--file",
+                job_file.to_str().ok_or("non-UTF-8 Docker job file")?,
+                "--json",
+            ])
+            .output()?,
+    )?;
+    let job_id: JobId = submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing Docker job ID")?
+        .parse()?;
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(!waited.status.success());
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    let attempt_id: AttemptId = waited["attempts"][0]["spec"]["id"]
+        .as_str()
+        .ok_or("missing Docker attempt ID")?
+        .parse()?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let container = database
+        .jobs()
+        .container_for_attempt(attempt_id)
+        .await?
+        .ok_or("missing failed Docker container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    assert!(
+        container
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("docker_start_failed:"))
+    );
+    let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+        .bind(job_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(leases, 0);
+    let invocations = fs::read_to_string(invocation_log)?;
+    assert!(invocations.contains("start fake-container"));
+    assert!(invocations.contains("rm --force fake-container"));
+    assert!(!invocations.contains("logs --follow"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_identity_conflict_removes_unowned_container_and_records_original_error()
+-> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let invocation_log = fixture.restart_with_fake_docker(0, false, None)?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let mut job_ids = Vec::new();
+    for expected_success in [true, false] {
+        let submitted = output_json(
+            fixture
+                .run()
+                .args([
+                    "submit",
+                    "--file",
+                    job_file.to_str().ok_or("non-UTF-8 Docker job file")?,
+                    "--json",
+                ])
+                .output()?,
+        )?;
+        let job_id: JobId = submitted["spec"]["id"]
+            .as_str()
+            .ok_or("missing Docker job ID")?
+            .parse()?;
+        let waited = fixture
+            .run()
+            .args(["wait", &job_id.to_string(), "--json"])
+            .output()?;
+        assert_eq!(waited.status.success(), expected_success);
+        job_ids.push(job_id);
+    }
+
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM events
+         WHERE job_id = ? AND kind = 'attempt_state_changed'
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(job_ids[1].to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let payload: Value = serde_json::from_str(&payload)?;
+    assert!(
+        payload["data"]["details"]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("docker_identity_persistence_failed:"))
+    );
+    let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+        .bind(job_ids[1].to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(leases, 0);
+    let invocations = fs::read_to_string(invocation_log)?;
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| *line == "rm --force fake-container")
+            .count(),
+        2
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.starts_with("start fake-container"))
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_cancellation_stops_and_finalizes_before_cleanup() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let (invocation_log, _) =
+        fixture.restart_with_stateful_fake_docker(143, false, None, None, None)?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let job_id = submit_docker_job(&fixture, &job_file)?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let running = wait_for_container(&database, job_id).await?;
+
+    let cancelled = fixture
+        .run()
+        .args(["cancel", &job_id.to_string(), "--grace-seconds", "2"])
+        .output()?;
+    assert!(cancelled.status.success());
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(!waited.status.success());
+    let detail = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing cancelled Docker job")?;
+    assert_eq!(detail.job.state, JobState::Cancelled);
+    assert_eq!(detail.attempts[0].state, AttemptState::Cancelled);
+    let container = database
+        .jobs()
+        .container_for_attempt(running.attempt_id)
+        .await?
+        .ok_or("missing cancelled Docker container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    assert_eq!(fs::read(&container.stdout_path)?, b"fake stdout\n");
+    assert_eq!(fs::read(&container.stderr_path)?, b"fake stderr\n");
+    let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+        .bind(job_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(leases, 0);
+
+    let invocations = fs::read_to_string(invocation_log)?;
+    let stop = invocations
+        .find("stop --time ")
+        .ok_or("missing Docker stop")?;
+    let inspect = invocations[stop..]
+        .find("inspect --format")
+        .map(|offset| stop + offset)
+        .ok_or("missing post-stop inspect")?;
+    let snapshot = invocations[inspect..]
+        .find("logs fake-container")
+        .map(|offset| inspect + offset)
+        .ok_or("missing cancellation log snapshot")?;
+    let remove = invocations[snapshot..]
+        .find("rm --force fake-container")
+        .map(|offset| snapshot + offset)
+        .ok_or("missing cancellation cleanup")?;
+    assert!(stop < inspect && inspect < snapshot && snapshot < remove);
+    assert!(!invocations.contains("kill fake-container"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_cancellation_escalates_to_kill() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let (invocation_log, _) =
+        fixture.restart_with_stateful_fake_docker(137, false, Some("stop"), None, None)?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let job_id = submit_docker_job(&fixture, &job_file)?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let running = wait_for_container(&database, job_id).await?;
+    assert!(
+        fixture
+            .run()
+            .args(["cancel", &job_id.to_string(), "--grace-seconds", "1"])
+            .output()?
+            .status
+            .success()
+    );
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(!waited.status.success());
+    let detail = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing killed Docker job")?;
+    assert_eq!(detail.job.state, JobState::Cancelled);
+    assert_eq!(detail.attempts[0].state, AttemptState::Cancelled);
+    let container = database
+        .jobs()
+        .container_for_attempt(running.attempt_id)
+        .await?
+        .ok_or("missing killed Docker container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    assert_eq!(container.exit_code, Some(137));
+    let invocations = fs::read_to_string(invocation_log)?;
+    assert!(invocations.contains("stop --time "));
+    assert!(invocations.contains("kill fake-container"));
+    assert!(
+        invocations.find("kill fake-container") < invocations.find("rm --force fake-container")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_timeout_kills_and_persists_failure() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let (invocation_log, _) =
+        fixture.restart_with_stateful_fake_docker(137, false, None, None, None)?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let specification = fs::read_to_string(&job_file)?.replace(
+        "[resources]\nmode = 'shared'",
+        "[resources]\nmode = 'shared'\ntimeout_seconds = 1",
+    );
+    fs::write(&job_file, specification)?;
+    let job_id = submit_docker_job(&fixture, &job_file)?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let running = wait_for_container(&database, job_id).await?;
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(!waited.status.success());
+    let detail = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing timed-out Docker job")?;
+    assert_eq!(detail.job.state, JobState::Failed);
+    assert_eq!(detail.attempts[0].state, AttemptState::Failed);
+    let container = database
+        .jobs()
+        .container_for_attempt(running.attempt_id)
+        .await?
+        .ok_or("missing timed-out Docker container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    assert_eq!(container.exit_code, Some(137));
+    assert_eq!(
+        container.error.as_deref(),
+        Some("docker_timeout: configured execution timeout elapsed")
+    );
+    let invocations = fs::read_to_string(invocation_log)?;
+    assert!(invocations.contains("kill fake-container"));
+    assert!(!invocations.contains("stop --time "));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_recovery_preserves_timeout_deadline() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let (invocation_log, state_dir) =
+        fixture.restart_with_stateful_fake_docker(137, false, None, None, None)?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let specification = fs::read_to_string(&job_file)?.replace(
+        "[resources]\nmode = 'shared'",
+        "[resources]\nmode = 'shared'\ntimeout_seconds = 2",
+    );
+    fs::write(&job_file, specification)?;
+    let job_id = submit_docker_job(&fixture, &job_file)?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let running = wait_for_container(&database, job_id).await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fixture.restart_with_stateful_fake_docker(137, false, None, Some(&state_dir), None)?;
+
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(!waited.status.success());
+    let container = database
+        .jobs()
+        .container_for_attempt(running.attempt_id)
+        .await?
+        .ok_or("missing recovered timed-out Docker container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    assert_eq!(
+        container.error.as_deref(),
+        Some("docker_timeout: configured execution timeout elapsed")
+    );
+    let invocations = fs::read_to_string(invocation_log)?;
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .count(),
+        1
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| *line == "start fake-container")
+            .count(),
+        1
+    );
+    assert!(invocations.contains("kill fake-container"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_restart_reattaches_without_recreating_container() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let (invocation_log, state_dir) =
+        fixture.restart_with_stateful_fake_docker(0, false, None, None, None)?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let job_id = submit_docker_job(&fixture, &job_file)?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let running = wait_for_container(&database, job_id).await?;
+
+    fixture.restart_with_stateful_fake_docker(0, false, None, Some(&state_dir), None)?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let invocations = fs::read_to_string(&invocation_log)?;
+            if invocations
+                .lines()
+                .filter(|line| *line == "wait fake-container")
+                .count()
+                >= 2
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "recovered Docker worker did not reattach")??;
+    fs::write(state_dir.join("stopped"), b"")?;
+
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(waited.status.success());
+    let detail = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing recovered Docker job")?;
+    assert_eq!(detail.job.state, JobState::Succeeded);
+    assert_eq!(detail.attempts[0].state, AttemptState::Succeeded);
+    let container = database
+        .jobs()
+        .container_for_attempt(running.attempt_id)
+        .await?
+        .ok_or("missing recovered Docker container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+        .bind(job_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(leases, 0);
+    let terminal_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE job_id = ? AND kind = 'attempt_state_changed'
+         AND payload_json LIKE '%\"state\":\"succeeded\"%'",
+    )
+    .bind(job_id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(terminal_events, 1);
+
+    let invocations = fs::read_to_string(invocation_log)?;
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .count(),
+        1
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| *line == "start fake-container")
+            .count(),
+        1
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| *line == "rm --force fake-container")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_recovers_every_external_sqlite_crash_boundary() -> TestResult {
+    let _guard = worker_test_guard()?;
+    run_docker_crash_boundary("after_create", false, 1).await?;
+    run_docker_crash_boundary("before_start", false, 2).await?;
+    run_docker_crash_boundary("after_start", false, 1).await?;
+    run_docker_crash_boundary("after_wait", true, 1).await?;
+    run_docker_crash_boundary("before_rm", true, 1).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opt_in_real_docker_jobs_cover_worker_lifecycle() -> TestResult {
+    if std::env::var("IGOR_RUN_DOCKER_TESTS").ok().as_deref() != Some("1") {
+        eprintln!("skipping real Docker integration test: IGOR_RUN_DOCKER_TESTS is not 1");
+        return Ok(());
+    }
+    let image = match std::env::var("IGOR_TEST_DOCKER_IMAGE") {
+        Ok(image) if !image.trim().is_empty() => image,
+        _ => {
+            eprintln!("skipping real Docker integration test: IGOR_TEST_DOCKER_IMAGE is unset");
+            return Ok(());
+        }
+    };
+    let docker = |args: &[&str]| Command::new("docker").args(args).output();
+    for (args, reason) in [
+        (
+            &["version", "--format", "{{.Server.Version}}"] as &[&str],
+            "Docker daemon is unavailable",
+        ),
+        (
+            &["image", "inspect", &image],
+            "configured Docker image is not local",
+        ),
+        (
+            &["run", "--rm", &image, "/bin/sh", "-c", "exit 0"],
+            "configured image lacks /bin/sh",
+        ),
+    ] {
+        match docker(args) {
+            Ok(output) if output.status.success() => {}
+            _ => {
+                eprintln!("skipping real Docker integration test: {reason}");
+                return Ok(());
+            }
+        }
+    }
+    let inspected = docker(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{index .RepoDigests 0}}",
+        &image,
+    ])?;
+    let repo_digest = String::from_utf8(inspected.stdout)?.trim().to_owned();
+    let Some(digest) = repo_digest
+        .split_once('@')
+        .map(|(_, digest)| digest)
+        .filter(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+    else {
+        eprintln!("skipping real Docker integration test: local image has no canonical RepoDigest");
+        return Ok(());
+    };
+    if image.contains('\'') {
+        return Err("IGOR_TEST_DOCKER_IMAGE cannot contain a single quote".into());
+    }
+
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    fixture.restart_with_system_docker()?;
+    let job_root = fixture._temporary.path().to_owned();
+    let job = |name: &str, program: &str, args: &str, configured_digest: &str| {
+        let path = job_root.join(format!("{name}.toml"));
+        fs::write(
+            &path,
+            format!(
+                "schema_version = 1\nname = '{name}'\n[execution]\nprogram = '{program}'\nargs = [{args}]\n[executor]\nkind = 'docker'\n[executor.settings]\nimage = '{image}'\ndigest = '{configured_digest}'\nremove_container = true\n[resources]\nmode = 'shared'\n"
+            ),
+        )?;
+        Ok::<_, Box<dyn Error>>(path)
+    };
+
+    let success = job(
+        "real-docker-success",
+        "/bin/sh",
+        "'-c', 'printf stdout; printf stderr >&2; test -z \"$TELEGRAM_BOT_TOKEN\" -a -z \"$OPENCODE_TEST_SECRET\"'",
+        digest,
+    )?;
+    let success_id = submit_docker_job(&fixture, &success)?;
+    let waited = fixture
+        .run()
+        .args(["wait", &success_id.to_string(), "--json"])
+        .output()?;
+    assert!(waited.status.success());
+    let success: Value = serde_json::from_slice(&waited.stdout)?;
+    let attempt_id: AttemptId = success["attempts"][0]["spec"]["id"]
+        .as_str()
+        .ok_or("missing attempt")?
+        .parse()?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let container = database
+        .jobs()
+        .container_for_attempt(attempt_id)
+        .await?
+        .ok_or("missing container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    assert_eq!(fs::read_to_string(&container.stdout_path)?, "stdout");
+    assert_eq!(fs::read_to_string(&container.stderr_path)?, "stderr");
+    assert!(
+        !docker(&["inspect", &container.container_id])?
+            .status
+            .success()
+    );
+
+    let failed = job("real-docker-failure", "/bin/sh", "'-c', 'exit 7'", digest)?;
+    let failed_id = submit_docker_job(&fixture, &failed)?;
+    assert!(
+        !fixture
+            .run()
+            .args(["wait", &failed_id.to_string(), "--json"])
+            .output()?
+            .status
+            .success()
+    );
+
+    let live = job("real-docker-live", "/bin/sh", "'-c', 'sleep 30'", digest)?;
+    let live_id = submit_docker_job(&fixture, &live)?;
+    let live_container = wait_for_container(&database, live_id).await?;
+    fixture.restart_with_system_docker()?;
+    assert!(
+        fixture
+            .run()
+            .args(["cancel", &live_id.to_string(), "--grace-seconds", "0"])
+            .output()?
+            .status
+            .success()
+    );
+    assert!(
+        !fixture
+            .run()
+            .args(["wait", &live_id.to_string(), "--json"])
+            .output()?
+            .status
+            .success()
+    );
+    assert!(
+        !docker(&["inspect", &live_container.container_id])?
+            .status
+            .success()
+    );
+
+    let bad = job(
+        "real-docker-bad-digest",
+        "/bin/sh",
+        "'-c', 'exit 0'",
+        &format!("sha256:{}", "0".repeat(64)),
+    )?;
+    let bad_id = submit_docker_job(&fixture, &bad)?;
+    assert!(
+        !fixture
+            .run()
+            .args(["wait", &bad_id.to_string(), "--json"])
+            .output()?
+            .status
+            .success()
+    );
+    let bad_detail = database
+        .jobs()
+        .detail(bad_id)
+        .await?
+        .ok_or("missing bad-digest job")?;
+    let bad_attempt = bad_detail
+        .attempts
+        .last()
+        .ok_or("missing bad-digest attempt")?;
+    assert!(
+        database
+            .jobs()
+            .container_for_attempt(bad_attempt.spec.id())
+            .await?
+            .is_none()
+    );
+    let bad_event: String = sqlx::query_scalar(
+        "SELECT payload_json FROM events
+         WHERE job_id = ? AND kind = 'attempt_state_changed'
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(bad_id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert!(bad_event.contains("docker_image_missing_or_invalid"));
+    Ok(())
+}
+
+#[test]
 fn project_submission_and_reads_preserve_argument_contracts() -> TestResult {
     let _guard = worker_test_guard()?;
     let fixture = Fixture::new()?;
@@ -749,6 +1972,26 @@ fn project_submission_and_reads_preserve_argument_contracts() -> TestResult {
         json!(["test", "--release"])
     );
     assert_eq!(rust["job"]["spec"]["command"]["shell"], "direct");
+    Ok(())
+}
+
+#[test]
+fn process_only_worker_needs_no_docker_cli_or_path() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args(["submit", "--json", "--", "/bin/true"])
+            .output()?,
+    )?;
+    let job_id = submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing process-only job ID")?;
+    let waited = fixture.run().args(["wait", job_id, "--json"]).output()?;
+    assert!(waited.status.success());
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["job"]["state"], "succeeded");
     Ok(())
 }
 

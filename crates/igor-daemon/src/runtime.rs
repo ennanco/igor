@@ -427,6 +427,13 @@ async fn handle_request(
             Ok(projects) => ResponseEnvelope::success(Response::Projects { projects }),
             Err(error) => persistence_response(error),
         },
+        Request::ProjectRemove { root } => match normalize_existing_path(&root) {
+            Ok(root) => match database.projects().remove(&root).await {
+                Ok(project) => ResponseEnvelope::success(Response::Project(project)),
+                Err(error) => persistence_response(error),
+            },
+            Err(error) => ResponseEnvelope::failure(ProtocolError::invalid_request(error)),
+        },
         Request::ProjectByRoot { root } => match database.projects().by_root(&root).await {
             Ok(project) => ResponseEnvelope::success(Response::OptionalProject { project }),
             Err(error) => persistence_response(error),
@@ -535,6 +542,11 @@ fn normalize_project(mut project: igor_core::Project) -> Result<igor_core::Proje
     Ok(project)
 }
 
+fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
+    path.canonicalize()
+        .map_err(|error| format!("cannot canonicalize project root: {error}"))
+}
+
 fn persistence_response(error: PersistenceError) -> ResponseEnvelope {
     let protocol = match error {
         PersistenceError::NotFound { entity } => ProtocolError::not_found(entity),
@@ -636,6 +648,7 @@ fn validate_response(
         (Request::DatabaseStatus, Response::DatabaseStatus(value)) => value.role == role,
         (Request::Resources, Response::Resources { .. }) => role == DaemonRole::Worker,
         (Request::ProjectRegister { .. }, Response::Project(_))
+        | (Request::ProjectRemove { .. }, Response::Project(_))
         | (Request::ProjectList, Response::Projects { .. })
         | (Request::ProjectByRoot { .. }, Response::OptionalProject { .. })
         | (Request::Submit { .. }, Response::Submitted(_))

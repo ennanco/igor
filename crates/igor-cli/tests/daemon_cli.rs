@@ -75,7 +75,7 @@ fn worker_and_supervisor_support_health_and_status() -> Result<(), Box<dyn Error
         .output()?;
     assert!(status.status.success());
     let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-    assert_eq!(status[0]["database"]["schema_version"], 6);
+    assert_eq!(status[0]["database"]["schema_version"], 8);
     assert_eq!(status[1]["database"]["integrity"], "ok");
 
     let resources = command(&home, temporary.path())
@@ -136,7 +136,7 @@ fn daemon_exit_codes_distinguish_transport_and_protocol_errors() -> Result<(), B
 
     serve_once(
         &socket,
-        b"{\"protocol_version\":4,\"error\":{\"code\":\"IGOR-PROTO-002\",\"kind\":\"invalid_request\",\"message\":\"bad request\"}}\n",
+        b"{\"protocol_version\":5,\"error\":{\"code\":\"IGOR-PROTO-002\",\"kind\":\"invalid_request\",\"message\":\"bad request\"}}\n",
     )?;
     let invalid = command(&home, temporary.path())
         .args(["daemon", "health"])
@@ -145,7 +145,7 @@ fn daemon_exit_codes_distinguish_transport_and_protocol_errors() -> Result<(), B
 
     serve_once(
         &socket,
-        b"{\"protocol_version\":4,\"error\":{\"code\":\"IGOR-DAEMON-002\",\"kind\":\"internal\",\"message\":\"request failed\"}}\n",
+        b"{\"protocol_version\":5,\"error\":{\"code\":\"IGOR-DAEMON-002\",\"kind\":\"internal\",\"message\":\"request failed\"}}\n",
     )?;
     let internal = command(&home, temporary.path())
         .args(["daemon", "health"])
@@ -167,7 +167,7 @@ fn wait_for_socket(path: &Path) -> Result<(), Box<dyn Error>> {
 fn wait_for_protocol(path: &Path) -> Result<(), Box<dyn Error>> {
     for _ in 0..100 {
         if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) {
-            stream.write_all(b"{\"protocol_version\":4,\"request\":{\"type\":\"health\"}}\n")?;
+            stream.write_all(b"{\"protocol_version\":5,\"request\":{\"type\":\"health\"}}\n")?;
             let mut response = String::new();
             BufReader::new(stream).read_line(&mut response)?;
             if response.contains("\"healthy\":true") {

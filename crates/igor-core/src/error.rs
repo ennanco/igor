@@ -23,6 +23,7 @@ pub enum ErrorCode {
     InvalidRetryPolicy,
     InvalidJob,
     InvalidAttempt,
+    InvalidExecutor,
     InvalidStateTransition,
     InvalidJson,
 }
@@ -39,6 +40,7 @@ impl ErrorCode {
             Self::InvalidRetryPolicy => "IGOR-VALID-004",
             Self::InvalidJob => "IGOR-VALID-005",
             Self::InvalidAttempt => "IGOR-VALID-006",
+            Self::InvalidExecutor => "IGOR-VALID-007",
             Self::InvalidStateTransition => "IGOR-STATE-001",
             Self::InvalidJson => "IGOR-SERDE-001",
         }

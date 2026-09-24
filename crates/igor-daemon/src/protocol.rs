@@ -6,7 +6,7 @@ use igor_core::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +67,9 @@ pub enum Request {
         project: Project,
     },
     ProjectList,
+    ProjectRemove {
+        root: std::path::PathBuf,
+    },
     ProjectByRoot {
         root: std::path::PathBuf,
     },

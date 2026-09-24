@@ -23,8 +23,9 @@ for the ordered implementation backlog.
 - Rust `1.97.1`
 - Git
 
-Docker and `systemd --user` integration are planned but are not required by the
-current direct-process queue.
+Docker is optional. Direct-process installations do not need the Docker CLI,
+daemon, socket, or Rust Docker client dependency. Docker jobs require a locally
+reachable Docker daemon and permission for the worker user to use it.
 
 ## Install From Source
 
@@ -94,6 +95,23 @@ igor cancel JOB_ID
 igor retry JOB_ID
 ```
 
+A project with no queued or running jobs can be deregistered without deleting
+its files or history, then registered again later:
+
+```bash
+igor project remove .
+igor project add .
+```
+
+Igor's managed user services can be stopped and removed independently of user
+data. Both forms preserve the binary, configuration, database, logs, and job
+history, and require confirmation unless `--yes` is supplied:
+
+```bash
+igor service uninstall --user
+igor uninstall
+```
+
 Most inspection commands support machine-readable output through `--json`, for
 example:
 
@@ -104,6 +122,49 @@ igor wait JOB_ID --json
 ```
 
 Use `igor --help` or `igor COMMAND --help` for the complete command reference.
+
+## Docker Jobs
+
+Igor invokes the `docker` CLI directly and never pulls an image implicitly. The
+configured image must already be local. When `digest` is set, Igor resolves the
+exact `IMAGE@sha256:...` reference before creating a container and rejects a
+mismatch. A digest for a pulled image can be obtained with:
+
+```bash
+docker image inspect --format '{{index .RepoDigests 0}}' alpine:3.20
+```
+
+Copy and edit [`config/example-docker-job.toml`](config/example-docker-job.toml),
+then submit it like any other versioned job:
+
+```bash
+igor submit --file config/example-docker-job.toml
+```
+
+Docker execution follows these boundaries:
+
+- Bind-mount sources and container targets must be absolute. Mounts are allowed
+  only when explicitly declared, and writable mounts grant the container access
+  to modify that host path.
+- Image environment defaults are preserved. Only values in
+  `environment.set` are added; ambient host variables, including Telegram,
+  coding-agent, cloud, SSH, and Git credentials, are not copied.
+- GPU jobs receive only the concrete GPU identities assigned by Igor's
+  scheduler. Igor never uses Docker's all-GPU shortcut.
+- Containers are labelled with Igor project, job, attempt, and optional
+  generation identities. The worker persists the container ID before start.
+- Cancellation uses bounded `docker stop`, escalates to `docker kill`, records
+  the inspected result, and only then removes disposable containers.
+- After worker restart, Igor reconciles the persisted ID first and can reattach
+  logs and completion supervision. Exact labels are used only when a crash
+  happened before the ID was persisted.
+
+Common failure prefixes in `igor events JOB_ID` distinguish
+`docker_cli_unavailable`, `docker_daemon_unavailable`,
+`docker_image_missing_or_invalid`, `docker_create_failed`,
+`docker_start_failed`, `docker_oom_killed`, `docker_timeout`, and
+`docker_container_lost`. Use `igor show`, `igor events`, and `igor logs` together
+with `docker version` when diagnosing a job.
 
 ## Host Scheduling Limits
 
@@ -147,6 +208,22 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo doc --workspace --no-deps
 ```
+
+Ordinary tests use a fake Docker CLI and require no Docker installation. The
+real-Docker lifecycle test is opt-in, uses an already-local disposable CPU
+image, and never pulls:
+
+```bash
+docker pull alpine:3.20
+IGOR_RUN_DOCKER_TESTS=1 \
+IGOR_TEST_DOCKER_IMAGE=alpine:3.20 \
+cargo test -p igor-cli --test job_cli \
+  opt_in_real_docker_jobs_cover_worker_lifecycle -- --nocapture
+```
+
+The test prints an explicit skip reason when opt-in is disabled, the CLI or
+daemon is unavailable, the image is absent, or the image has no `/bin/sh` or
+canonical repository digest.
 
 Inspect the CLI:
 

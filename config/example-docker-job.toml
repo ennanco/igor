@@ -1,0 +1,36 @@
+# Versioned Docker job example. Replace the image, digest, and host mount source.
+schema_version = 1
+name = "docker-cpu-example"
+
+[execution]
+program = "/bin/sh"
+args = ["-c", "printf 'hello from Docker\n'"]
+
+[environment]
+inherit = "none"
+
+[environment.set]
+OMP_NUM_THREADS = "4"
+
+[executor]
+kind = "docker"
+
+[executor.settings]
+image = "alpine:3.20"
+digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+workdir = "/workspace"
+remove_container = true
+
+[[executor.settings.mounts]]
+source = "/srv/igor/read-only-input"
+target = "/input"
+access = "read_only"
+
+[resources]
+mode = "shared"
+cpu_threads = 4
+memory = 4294967296
+timeout = 3600
+gpu = { selection = "none" }
+gpu_count = 1
+gpu_exclusive = true

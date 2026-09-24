@@ -9,8 +9,8 @@ use std::{
 
 use igor_core::RuntimePaths;
 use igor_daemon::{
-    Client, ClientError, DaemonError, DaemonRole, ProtocolErrorKind, Request, Response,
-    ResponseEnvelope, run_until,
+    Client, ClientError, DaemonError, DaemonRole, PROTOCOL_VERSION, ProtocolErrorKind, Request,
+    Response, ResponseEnvelope, run_until,
 };
 use tempfile::TempDir;
 use tokio::{
@@ -97,12 +97,13 @@ async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box
         ));
         assert!(matches!(
             client.request(role, Request::Version).await?,
-            Response::Version(version) if version.role == role && version.protocol == 4
+            Response::Version(version)
+                if version.role == role && version.protocol == PROTOCOL_VERSION
         ));
         assert!(matches!(
             client.request(role, Request::DatabaseStatus).await?,
             Response::DatabaseStatus(status)
-                if status.role == role && status.schema_version == 6 && status.integrity == "ok"
+                if status.role == role && status.schema_version == 8 && status.integrity == "ok"
         ));
     }
     assert!(matches!(
@@ -245,7 +246,7 @@ async fn client_rejects_response_from_the_wrong_role() -> Result<(), Box<dyn Err
             let mut request = String::new();
             let _ = BufReader::new(&stream).read_line(&mut request);
             let _ = stream.write_all(
-                b"{\"protocol_version\":4,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
+                b"{\"protocol_version\":5,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
             );
         }
     });

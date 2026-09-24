@@ -1,8 +1,8 @@
 use std::{
-    fs::File,
-    io::{Seek, SeekFrom, Write},
+    fs::{self, File},
+    io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{ExitCode, Stdio},
     time::Duration,
 };
 
@@ -26,6 +26,8 @@ const EXIT_DATABASE_UNAVAILABLE: u8 = 6;
 const EXIT_DAEMON_INTERNAL: u8 = 7;
 const EXIT_NOT_FOUND: u8 = 8;
 const EXIT_CONFLICT: u8 = 9;
+const USER_SERVICE_NAMES: [&str; 2] = ["igor-worker.service", "igor-supervisor.service"];
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,6 +79,12 @@ impl From<PathArgs> for ConfigOverrides {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Remove Igor's user services while preserving the binary and all data.
+    Uninstall {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Create portable project configuration.
     Init {
         #[arg(default_value = ".")]
@@ -97,6 +105,11 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Manage Igor user services.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     /// Show host resources and active leases.
     Resources {
@@ -216,6 +229,13 @@ enum ProjectCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Remove a project registration without deleting its files or history.
+    Remove {
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -254,6 +274,19 @@ enum DaemonCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Stop and remove Igor's user service units.
+    Uninstall {
+        /// Explicitly select user services; system services are never modified.
+        #[arg(long)]
+        user: bool,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Debug, Serialize)]
 struct DaemonStatus {
     role: DaemonRole,
@@ -279,6 +312,10 @@ async fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let overrides = ConfigOverrides::from(cli.paths);
     match cli.command {
+        Command::Uninstall { yes } => {
+            uninstall_user_services(yes).await?;
+            println!("preserved Igor binary, configuration, database, logs, and job history");
+        }
         Command::Init { path, force } => {
             let root = if path.is_absolute() {
                 path
@@ -344,6 +381,11 @@ async fn run() -> anyhow::Result<()> {
                 DaemonCommand::Status { json } => show_status(&client, json).await?,
             }
         }
+        Command::Service { command } => match command {
+            ServiceCommand::Uninstall { user: _, yes } => {
+                uninstall_user_services(yes).await?;
+            }
+        },
         Command::Resources { json } => {
             let effective = effective_config(&overrides, &cwd)?;
             let resources = match Client::new(&effective.paths)
@@ -400,6 +442,15 @@ async fn run() -> anyhow::Result<()> {
                             );
                         }
                     }
+                }
+                ProjectCommand::Remove { path, json } => {
+                    let root = absolute(&cwd, &path).canonicalize()?;
+                    let removed = expect_project(
+                        client
+                            .request(DaemonRole::Worker, Request::ProjectRemove { root })
+                            .await?,
+                    )?;
+                    print_project(&removed, json)?;
                 }
             }
         }
@@ -905,6 +956,68 @@ fn expect_project(response: Response) -> anyhow::Result<Project> {
         Response::Project(project) => Ok(project),
         response => anyhow::bail!("unexpected {response:?} project response"),
     }
+}
+
+async fn uninstall_user_services(yes: bool) -> anyhow::Result<()> {
+    let unit_directory = user_service_directory()?;
+    let installed: Vec<_> = USER_SERVICE_NAMES
+        .iter()
+        .map(|name| (name, unit_directory.join(name)))
+        .filter(|(_, path)| path.symlink_metadata().is_ok())
+        .collect();
+    if installed.is_empty() {
+        println!("no Igor user services are installed");
+        return Ok(());
+    }
+    if !yes {
+        print!("stop and remove Igor's user services? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "YES") {
+            anyhow::bail!("service uninstall cancelled");
+        }
+    }
+
+    let mut disable = tokio::process::Command::new("systemctl");
+    disable
+        .args(["--user", "disable", "--now", "--"])
+        .args(installed.iter().map(|(name, _)| **name))
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(SYSTEMCTL_TIMEOUT, disable.status())
+        .await
+        .map_err(|_| anyhow::anyhow!("systemctl --user disable --now timed out"))??;
+    if !status.success() {
+        anyhow::bail!("systemctl --user disable --now failed with {status}");
+    }
+    for (_, path) in &installed {
+        fs::remove_file(path)?;
+        println!("removed {}", path.display());
+    }
+    let mut reload = tokio::process::Command::new("systemctl");
+    reload
+        .args(["--user", "daemon-reload"])
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(SYSTEMCTL_TIMEOUT, reload.status())
+        .await
+        .map_err(|_| anyhow::anyhow!("systemctl --user daemon-reload timed out"))??;
+    if !status.success() {
+        anyhow::bail!("systemctl --user daemon-reload failed with {status}");
+    }
+    Ok(())
+}
+
+fn user_service_directory() -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"));
+    Ok(config.join("systemd/user"))
 }
 
 fn absolute(cwd: &std::path::Path, path: &std::path::Path) -> PathBuf {

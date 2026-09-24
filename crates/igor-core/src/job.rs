@@ -72,6 +72,7 @@ impl JobSpec {
             ));
         }
         self.command.validate()?;
+        self.executor.validate()?;
         self.resources.validate()?;
         self.retry.0.validate()?;
         if let Some(family) = &self.family {
@@ -229,6 +230,7 @@ impl AttemptSpec {
             ));
         }
         self.command.validate()?;
+        self.executor.validate()?;
         self.resources.validate()?;
         self.source.validate()?;
         self.configuration.validate()?;

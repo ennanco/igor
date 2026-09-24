@@ -93,7 +93,8 @@ fn family() -> FamilyMembership {
 fn executor() -> ExecutorSpec {
     ExecutorSpec::Docker(DockerExecutorSpec {
         image: "example/image:tag".into(),
-        digest: Some("sha256:container".into()),
+        digest: Some(format!("sha256:{}", "a".repeat(64))),
+        workdir: Some(PathBuf::from("/workspace")),
         mounts: vec![DockerMount {
             source: PathBuf::from("/tmp/input data"),
             target: PathBuf::from("/data/input"),

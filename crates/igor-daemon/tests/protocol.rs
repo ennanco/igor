@@ -60,7 +60,13 @@ fn protocol_errors_have_stable_codes() {
 
 #[test]
 fn milestone_five_requests_round_trip() -> Result<(), Box<dyn Error>> {
-    for request in [Request::ProjectList, Request::JobList { project_id: None }] {
+    for request in [
+        Request::ProjectList,
+        Request::ProjectRemove {
+            root: "/tmp/project".into(),
+        },
+        Request::JobList { project_id: None },
+    ] {
         let envelope = RequestEnvelope::new(request);
         let encoded = serde_json::to_vec(&envelope)?;
         assert_eq!(

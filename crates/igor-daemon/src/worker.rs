@@ -12,9 +12,11 @@ use std::{
 };
 
 use igor_core::{
-    AttemptState, Database, EnvironmentInheritance, ExecutionClaim, ExecutionOutcome, ExecutorSpec,
+    AttemptState, ContainerCreate, ContainerFinish, ContainerRecord, Database, DockerCommand,
+    DockerCommandPlanner, DockerContainerInspection, DockerContainerState, DockerIdentity,
+    DockerRecoveryIdentity, EnvironmentInheritance, ExecutionClaim, ExecutionOutcome, ExecutorSpec,
     ProcessIsolation, ProcessRecord, ProcessStart, RecoveredExecution, RuntimePaths,
-    environment_variable_is_sensitive,
+    environment_variable_is_sensitive, validate_docker_mount_sources,
 };
 use nix::{
     sys::signal::{Signal, killpg},
@@ -33,14 +35,36 @@ struct RecoveredProcessState {
     timeout_remaining: Option<Duration>,
 }
 
+enum DockerSupervision {
+    Completed {
+        logs: std::process::Output,
+        wait: std::process::Output,
+    },
+    Cancellation(Duration),
+    Timeout,
+    Shutdown,
+    OwnershipLost(String),
+}
+
+enum DockerInspectFailure {
+    Missing,
+    Indeterminate(String),
+}
+
+struct DockerLogFiles {
+    stdout: fs::File,
+    stderr: fs::File,
+}
+
 pub async fn run(database: Database, paths: RuntimePaths, mut shutdown: watch::Receiver<bool>) {
     let owner = format!("worker:{}", std::process::id());
     loop {
         if *shutdown.borrow() {
             return;
         }
+        cleanup_pending(&database).await;
         match database.jobs().claim_recovery(&owner, CLAIM_DURATION).await {
-            Ok(Some(recovered)) => reconcile(&database, recovered, &mut shutdown).await,
+            Ok(Some(recovered)) => reconcile(&database, &paths, recovered, &mut shutdown).await,
             Ok(None) => match database
                 .jobs()
                 .claim_execution(&owner, CLAIM_DURATION)
@@ -70,9 +94,17 @@ async fn idle(shutdown: &mut watch::Receiver<bool>) {
 
 async fn reconcile(
     database: &Database,
+    paths: &RuntimePaths,
     recovered: RecoveredExecution,
     shutdown: &mut watch::Receiver<bool>,
 ) {
+    if matches!(
+        recovered.claim.attempt.spec.executor(),
+        ExecutorSpec::Docker(_)
+    ) {
+        supervise_recovered_docker(database, paths, recovered, shutdown).await;
+        return;
+    }
     let validation_started = time::Instant::now();
     let Some(process) = recovered.process else {
         finish_lost(
@@ -140,6 +172,456 @@ async fn reconcile(
     .await;
 }
 
+// Recovery deliberately never creates a container: the persisted identity is the
+// only safe authority once Docker create has been committed.
+async fn supervise_recovered_docker(
+    database: &Database,
+    paths: &RuntimePaths,
+    recovered: RecoveredExecution,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let timeout_remaining = recovered.timeout_remaining;
+    let claim = recovered.claim;
+    let planner = DockerCommandPlanner::default();
+    let container = match recovered.container {
+        Some(container) => container,
+        None => match recover_container_identity(database, paths, &planner, &claim, shutdown).await
+        {
+            Some(container) => container,
+            None => return,
+        },
+    };
+    let id = container.container_id.clone();
+    let inspect = docker_command(
+        &planner.recovery_inspect(&id),
+        database,
+        &claim,
+        shutdown,
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .await;
+    let output = match inspect {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            let missing = detail.contains("No such container") || detail.contains("No such object");
+            if missing {
+                finish_docker_lost(
+                    database,
+                    &claim,
+                    &container,
+                    "persisted Docker container is missing",
+                )
+                .await;
+            }
+            return;
+        }
+        Err(_) => return,
+    };
+    let recovered_identity = match igor_core::parse_docker_recovery_inspect(&output.stdout) {
+        Ok(identity)
+            if identity.id == id
+                && recovery_identity_matches(&identity, &claim, &container.image_id) =>
+        {
+            identity
+        }
+        Ok(_) => {
+            tracing::error!(container_id = %id, "persisted Docker identity no longer matches its container");
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, container_id = %id, "cannot parse persisted Docker identity");
+            return;
+        }
+    };
+    let state = recovered_identity.state;
+    if state.status == "created" && !state.running {
+        match database.jobs().cancellation_grace(&claim).await {
+            Ok(Some(_)) => {
+                finish_created_container_cancelled(database, &planner, &claim, &container).await;
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, container_id = %id, "cannot read recovered Docker cancellation");
+                return;
+            }
+        }
+        if container.state != DockerContainerState::Created {
+            tracing::error!(container_id = %id, "persisted running container is only created in Docker");
+            return;
+        }
+        let start = docker_command(
+            &planner.start(&id),
+            database,
+            &claim,
+            shutdown,
+            Stdio::piped(),
+            Stdio::piped(),
+        )
+        .await;
+        if !matches!(start, Ok(ref output) if output.status.success()) {
+            tracing::warn!(container_id = %id, "recovered Docker start was not confirmed; preserving ownership for reconciliation");
+            return;
+        }
+        if let Err(error) = database.jobs().record_container_started(&claim).await {
+            tracing::error!(%error, container_id = %id, "cannot persist recovered Docker start");
+            return;
+        }
+    } else if state.running && container.state == DockerContainerState::Created {
+        if let Err(error) = database.jobs().record_container_started(&claim).await {
+            tracing::error!(%error, container_id = %id, "cannot persist recovered running container");
+            return;
+        }
+    } else if !state.running {
+        if capture_docker_snapshot(database, &planner, &claim, &container, shutdown)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        finish_docker_inspection(database, &planner, &claim, &container, state, None, None).await;
+        return;
+    }
+    let (stdout, stderr) = match reset_recovery_logs(&container) {
+        Ok(logs) => logs,
+        Err(error) => {
+            tracing::error!(%error, container_id = %id, "cannot open recovered Docker logs");
+            return;
+        }
+    };
+    let supervision = docker_logs_and_wait(
+        &planner.logs(&id),
+        &planner.wait(&id),
+        database,
+        &claim,
+        shutdown,
+        DockerLogFiles { stdout, stderr },
+        timeout_remaining,
+    )
+    .await;
+    match supervision {
+        DockerSupervision::Completed { logs, wait } => {
+            finalize_supervised_docker(
+                database, &planner, &claim, &container, &logs, &wait, shutdown,
+            )
+            .await;
+        }
+        DockerSupervision::Cancellation(grace) => {
+            cancel_docker(database, &planner, &claim, &container, grace, shutdown).await;
+        }
+        DockerSupervision::Timeout => {
+            timeout_docker(database, &planner, &claim, &container, shutdown).await;
+        }
+        DockerSupervision::Shutdown | DockerSupervision::OwnershipLost(_) => {}
+    }
+}
+
+async fn recover_container_identity(
+    database: &Database,
+    paths: &RuntimePaths,
+    planner: &DockerCommandPlanner,
+    claim: &ExecutionClaim,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<ContainerRecord> {
+    let identity = docker_identity(claim);
+    let candidates = match docker_command(
+        &planner.recovery_candidates(identity),
+        database,
+        claim,
+        shutdown,
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            match igor_core::parse_docker_recovery_candidates(&output.stdout) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    tracing::error!(%error, "cannot parse Docker recovery candidates");
+                    return None;
+                }
+            }
+        }
+        Ok(output) => {
+            tracing::error!(error = %String::from_utf8_lossy(&output.stderr), "cannot list Docker recovery candidates");
+            return None;
+        }
+        Err(_) => return None,
+    };
+    if candidates.is_empty() {
+        finish_lost(
+            database,
+            claim,
+            "no Docker container matches the recovered attempt",
+        )
+        .await;
+        return None;
+    }
+
+    let spec = match claim.attempt.spec.executor() {
+        ExecutorSpec::Docker(spec) => spec,
+        _ => return None,
+    };
+    let expected_image = match docker_command(
+        &planner.image_inspect(&spec.image_reference()),
+        database,
+        claim,
+        shutdown,
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            match igor_core::parse_docker_create_stdout(&output.stdout) {
+                Ok(image) => image,
+                Err(error) => {
+                    tracing::error!(%error, "cannot parse recovered Docker image identity");
+                    return None;
+                }
+            }
+        }
+        _ => return None,
+    };
+    let mut matches = Vec::new();
+    for candidate in candidates {
+        let output = match docker_command(
+            &planner.recovery_inspect(&candidate),
+            database,
+            claim,
+            shutdown,
+            Stdio::piped(),
+            Stdio::piped(),
+        )
+        .await
+        {
+            Ok(output) if output.status.success() => output,
+            Ok(output) if docker_missing(&output.stderr) => continue,
+            _ => return None,
+        };
+        let recovered = match igor_core::parse_docker_recovery_inspect(&output.stdout) {
+            Ok(recovered) => recovered,
+            Err(error) => {
+                tracing::error!(%error, candidate, "cannot parse Docker recovery identity");
+                return None;
+            }
+        };
+        if recovery_identity_matches(&recovered, claim, &expected_image) {
+            matches.push(recovered);
+        }
+    }
+    if matches.len() != 1 {
+        tracing::error!(
+            count = matches.len(),
+            "Docker recovery identity is ambiguous"
+        );
+        return None;
+    }
+    let recovered = matches.pop()?;
+    let (stdout_path, stderr_path) =
+        match prepare_logs(&paths.log_dir, &claim.attempt.spec.id().to_string()) {
+            Ok(paths) => paths,
+            Err(error) => {
+                tracing::error!(%error, "cannot prepare recovered Docker logs");
+                return None;
+            }
+        };
+    let create = ContainerCreate {
+        container_id: recovered.id,
+        container_name: format!("igor-{}", claim.attempt.spec.id()),
+        image: igor_core::DockerImageIdentity {
+            reference: spec.image_reference(),
+            image_id: recovered.image_id,
+        },
+        stdout_path,
+        stderr_path,
+    };
+    if let Err(error) = database
+        .jobs()
+        .record_container_created(claim, &create)
+        .await
+    {
+        tracing::error!(%error, "cannot persist recovered Docker identity");
+        return None;
+    }
+    match database
+        .jobs()
+        .container_for_attempt(claim.attempt.spec.id())
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            tracing::error!(%error, "cannot reload recovered Docker identity");
+            None
+        }
+    }
+}
+
+fn docker_identity(claim: &ExecutionClaim) -> DockerIdentity {
+    DockerIdentity {
+        project_id: claim.job.spec.project_id,
+        job_id: claim.job.spec.id,
+        attempt_id: claim.attempt.spec.id(),
+        generation_id: claim
+            .attempt
+            .spec
+            .family()
+            .map(|family| family.generation.id),
+    }
+}
+
+fn recovery_identity_matches(
+    recovered: &DockerRecoveryIdentity,
+    claim: &ExecutionClaim,
+    expected_image: &str,
+) -> bool {
+    let identity = docker_identity(claim);
+    let expected_name = format!("igor-{}", identity.attempt_id);
+    let expected_labels = [
+        ("igor.project_id", identity.project_id.to_string()),
+        ("igor.job_id", identity.job_id.to_string()),
+        ("igor.attempt_id", identity.attempt_id.to_string()),
+    ];
+    recovered.name.trim_start_matches('/') == expected_name
+        && recovered.image_id == expected_image
+        && expected_labels
+            .iter()
+            .all(|(key, value)| recovered.labels.get(*key) == Some(value))
+        && match identity.generation_id {
+            Some(generation) => {
+                recovered.labels.get("igor.generation_id") == Some(&generation.to_string())
+            }
+            None => !recovered.labels.contains_key("igor.generation_id"),
+        }
+        && recovered.labels.keys().all(|key| {
+            !key.starts_with("igor.")
+                || matches!(
+                    key.as_str(),
+                    "igor.project_id" | "igor.job_id" | "igor.attempt_id" | "igor.generation_id"
+                )
+        })
+}
+
+async fn inspect_docker(
+    database: &Database,
+    planner: &DockerCommandPlanner,
+    claim: &ExecutionClaim,
+    container_id: &str,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<DockerContainerInspection, DockerInspectFailure> {
+    match docker_command(
+        &planner.inspect(container_id),
+        database,
+        claim,
+        shutdown,
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {
+            igor_core::parse_docker_inspect_stdout(&output.stdout)
+                .map_err(|error| DockerInspectFailure::Indeterminate(error.to_string()))
+        }
+        Ok(output) if docker_missing(&output.stderr) => Err(DockerInspectFailure::Missing),
+        Ok(output) => Err(DockerInspectFailure::Indeterminate(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        )),
+        Err(error) => Err(DockerInspectFailure::Indeterminate(error)),
+    }
+}
+
+fn docker_missing(stderr: &[u8]) -> bool {
+    let detail = String::from_utf8_lossy(stderr);
+    detail.contains("No such container") || detail.contains("No such object")
+}
+
+async fn finish_docker_lost(
+    database: &Database,
+    claim: &ExecutionClaim,
+    container: &ContainerRecord,
+    reason: &str,
+) {
+    let error = format!("docker_container_lost: {reason}");
+    let finish = ContainerFinish {
+        state: DockerContainerState::Lost,
+        docker_status: Some("missing".into()),
+        exit_code: None,
+        oom_killed: false,
+        error: Some(error.clone()),
+    };
+    let outcome = ExecutionOutcome {
+        state: AttemptState::Lost,
+        exit_code: None,
+        term_signal: None,
+        error: Some(error),
+    };
+    if let Err(error) = database
+        .jobs()
+        .finish_container_execution(claim, &finish, &outcome)
+        .await
+    {
+        tracing::error!(%error, container_id = %container.container_id, "cannot persist lost Docker container");
+    }
+}
+
+async fn capture_docker_snapshot(
+    database: &Database,
+    planner: &DockerCommandPlanner,
+    claim: &ExecutionClaim,
+    container: &ContainerRecord,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let (stdout, stderr) = reset_recovery_logs(container).map_err(|error| error.to_string())?;
+    let output = docker_command(
+        &planner.logs_snapshot(&container.container_id),
+        database,
+        claim,
+        shutdown,
+        Stdio::from(stdout),
+        Stdio::from(stderr),
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(format!("docker_logs_failed: {}", output.status));
+    }
+    sync_docker_logs(container).map_err(|error| error.to_string())
+}
+
+async fn finish_created_container_cancelled(
+    database: &Database,
+    planner: &DockerCommandPlanner,
+    claim: &ExecutionClaim,
+    container: &ContainerRecord,
+) {
+    let error = "docker_cancelled: cancellation requested".to_owned();
+    let finish = ContainerFinish {
+        state: DockerContainerState::Exited,
+        docker_status: Some("created".into()),
+        exit_code: None,
+        oom_killed: false,
+        error: Some(error.clone()),
+    };
+    let outcome = ExecutionOutcome {
+        state: AttemptState::Cancelled,
+        exit_code: None,
+        term_signal: None,
+        error: Some(error),
+    };
+    if database
+        .jobs()
+        .finish_container_execution(claim, &finish, &outcome)
+        .await
+        .is_ok()
+        && matches!(claim.attempt.spec.executor(), ExecutorSpec::Docker(spec) if spec.remove_container)
+    {
+        docker_cleanup(planner, database, claim, &container.container_id).await;
+    }
+}
+
 async fn supervise_recovered(
     database: &Database,
     claim: &ExecutionClaim,
@@ -193,7 +675,9 @@ async fn supervise_recovered(
                     finish_recovered(database, claim, state, reason).await;
                     return;
                 }
-                if completion.is_none() || cancel_deadline.is_some() {
+                if completion.is_none()
+                    || matches!(completion, Some((AttemptState::Cancelled, _)))
+                {
                     match database.jobs().cancellation_grace(claim).await {
                         Ok(Some(remaining)) => {
                             if cancel_deadline.is_none() {
@@ -272,6 +756,18 @@ async fn finish_recovered(
 }
 
 async fn execute(
+    database: &Database,
+    paths: &RuntimePaths,
+    claim: &ExecutionClaim,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    match claim.attempt.spec.executor() {
+        ExecutorSpec::Process(_) => execute_process(database, paths, claim, shutdown).await,
+        ExecutorSpec::Docker(_) => execute_docker(database, paths, claim, shutdown).await,
+    }
+}
+
+async fn execute_process(
     database: &Database,
     paths: &RuntimePaths,
     claim: &ExecutionClaim,
@@ -518,6 +1014,917 @@ async fn execute(
     }
 }
 
+async fn docker_command(
+    command: &DockerCommand,
+    database: &Database,
+    claim: &ExecutionClaim,
+    shutdown: &mut watch::Receiver<bool>,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new(command.program());
+    child
+        .args(command.args())
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+    child.kill_on_drop(true);
+    let child = child.spawn().map_err(|e| e.to_string())?;
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    tokio::select! {
+        result = &mut output => result.map_err(|e| e.to_string()),
+        _ = shutdown.changed() => {
+            release_for_restart(database, claim).await;
+            Err("worker shutdown".into())
+        }
+        result = async {
+            let mut interval = time::interval(HEARTBEAT_INTERVAL);
+            loop {
+                interval.tick().await;
+                if let Err(error) = database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await {
+                    break error.to_string();
+                }
+            }
+        } => Err(format!("docker_heartbeat_failed: {result}")),
+    }
+}
+
+async fn docker_stop_with_deadline(
+    command: &DockerCommand,
+    database: &Database,
+    claim: &ExecutionClaim,
+    shutdown: &mut watch::Receiver<bool>,
+    grace: Duration,
+) -> Result<std::process::Output, String> {
+    let mut child = Command::new(command.program());
+    child
+        .args(command.args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    child.kill_on_drop(true);
+    let child = child.spawn().map_err(|error| error.to_string())?;
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    let deadline = time::sleep(grace);
+    tokio::pin!(deadline);
+    let mut cancellation = time::interval(CANCELLATION_INTERVAL);
+    cancellation.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            result = &mut output => return result.map_err(|error| error.to_string()),
+            _ = cancellation.tick() => {
+                match database.jobs().cancellation_grace(claim).await {
+                    Ok(Some(remaining)) => {
+                        let shortened = time::Instant::now() + remaining;
+                        if shortened < deadline.deadline() {
+                            deadline.as_mut().reset(shortened);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            _ = heartbeat.tick() => {
+                database
+                    .jobs()
+                    .heartbeat_execution(claim, CLAIM_DURATION)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            () = &mut deadline => return Err("Docker stop grace period elapsed".into()),
+            _ = shutdown.changed() => {
+                release_for_restart(database, claim).await;
+                return Err("worker shutdown".into());
+            }
+        }
+    }
+}
+
+async fn docker_logs_and_wait(
+    logs_command: &DockerCommand,
+    wait_command: &DockerCommand,
+    database: &Database,
+    claim: &ExecutionClaim,
+    shutdown: &mut watch::Receiver<bool>,
+    log_files: DockerLogFiles,
+    timeout_remaining: Option<Duration>,
+) -> DockerSupervision {
+    let mut logs = Command::new(logs_command.program());
+    logs.args(logs_command.args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_files.stdout))
+        .stderr(Stdio::from(log_files.stderr));
+    logs.kill_on_drop(true);
+    let logs = match logs.spawn() {
+        Ok(logs) => logs,
+        Err(error) => return DockerSupervision::OwnershipLost(error.to_string()),
+    };
+
+    let mut wait = Command::new(wait_command.program());
+    wait.args(wait_command.args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    wait.kill_on_drop(true);
+    let wait = match wait.spawn() {
+        Ok(wait) => wait,
+        Err(error) => return DockerSupervision::OwnershipLost(error.to_string()),
+    };
+
+    let logs = logs.wait_with_output();
+    let wait = wait.wait_with_output();
+    tokio::pin!(logs);
+    tokio::pin!(wait);
+    let mut logs_output = None;
+    let mut wait_output = None;
+    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut cancellation = time::interval(CANCELLATION_INTERVAL);
+    cancellation.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let timeout = async {
+        match timeout_remaining {
+            Some(remaining) => time::sleep(remaining).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            result = &mut logs, if logs_output.is_none() => {
+                match result {
+                    Ok(output) => logs_output = Some(output),
+                    Err(error) => return DockerSupervision::OwnershipLost(error.to_string()),
+                }
+            }
+            result = &mut wait, if wait_output.is_none() => {
+                match result {
+                    Ok(output) => wait_output = Some(output),
+                    Err(error) => return DockerSupervision::OwnershipLost(error.to_string()),
+                }
+            }
+            _ = cancellation.tick() => {
+                match database.jobs().cancellation_grace(claim).await {
+                    Ok(Some(grace)) => return DockerSupervision::Cancellation(grace),
+                    Ok(None) => {}
+                    Err(error) => return DockerSupervision::OwnershipLost(error.to_string()),
+                }
+            }
+            _ = heartbeat.tick() => {
+                if let Err(error) = database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await {
+                    return DockerSupervision::OwnershipLost(format!("docker_heartbeat_failed: {error}"));
+                }
+            }
+            () = &mut timeout => return DockerSupervision::Timeout,
+            _ = shutdown.changed() => {
+                release_for_restart(database, claim).await;
+                return DockerSupervision::Shutdown;
+            }
+        }
+        if logs_output.is_some() && wait_output.is_some() {
+            let (Some(logs), Some(wait)) = (logs_output.take(), wait_output.take()) else {
+                unreachable!("Docker log and wait outputs were checked")
+            };
+            return DockerSupervision::Completed { logs, wait };
+        }
+    }
+}
+
+async fn docker_cleanup(
+    planner: &DockerCommandPlanner,
+    database: &Database,
+    claim: &ExecutionClaim,
+    container_id: &str,
+) {
+    let command = planner.remove(container_id);
+    let mut process = Command::new(command.program());
+    process
+        .args(command.args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    process.kill_on_drop(true);
+    let output = match time::timeout(CLAIM_DURATION, process.output()).await {
+        Ok(output) => output,
+        Err(_) => {
+            tracing::error!(%container_id, "Docker container removal timed out");
+            return;
+        }
+    };
+    let removed = match output {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => String::from_utf8_lossy(&output.stderr).contains("No such container"),
+        Err(error) => {
+            tracing::error!(%error, %container_id, "cannot remove terminal Docker container");
+            false
+        }
+    };
+    if removed
+        && let Err(error) = database
+            .jobs()
+            .record_container_removed(claim.attempt.spec.id(), container_id)
+            .await
+    {
+        tracing::error!(%error, %container_id, "cannot persist Docker container removal");
+    }
+}
+
+async fn cleanup_pending(database: &Database) {
+    let pending = match database.jobs().containers_pending_cleanup().await {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::error!(%error, "cannot list Docker containers pending cleanup");
+            return;
+        }
+    };
+    let planner = DockerCommandPlanner::default();
+    for container in pending {
+        let command = planner.remove(&container.container_id);
+        let mut process = Command::new(command.program());
+        process
+            .args(command.args())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        process.kill_on_drop(true);
+        let result = time::timeout(CLAIM_DURATION, process.output()).await;
+        let removed = match result {
+            Ok(Ok(output)) if output.status.success() => true,
+            Ok(Ok(output)) => {
+                let error = String::from_utf8_lossy(&output.stderr);
+                error.contains("No such container") || error.contains("No such object")
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, container_id = %container.container_id, "cleanup failed");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(container_id = %container.container_id, "cleanup timed out");
+                false
+            }
+        };
+        if removed
+            && let Err(error) = database
+                .jobs()
+                .record_container_removed(container.attempt_id, &container.container_id)
+                .await
+        {
+            tracing::error!(%error, container_id = %container.container_id, "cannot persist Docker cleanup");
+        }
+    }
+}
+
+async fn finish_created_container_failure(
+    database: &Database,
+    claim: &ExecutionClaim,
+    prefix: &str,
+    detail: &str,
+) -> bool {
+    let error = format!("{prefix}: {detail}");
+    let finish = ContainerFinish {
+        state: DockerContainerState::Exited,
+        docker_status: Some("created".into()),
+        exit_code: None,
+        oom_killed: false,
+        error: Some(error.clone()),
+    };
+    let outcome = ExecutionOutcome {
+        state: AttemptState::Failed,
+        exit_code: None,
+        term_signal: None,
+        error: Some(error),
+    };
+    match database
+        .jobs()
+        .finish_container_execution(claim, &finish, &outcome)
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, job_id = %claim.job.spec.id, "cannot persist Docker launch failure");
+            false
+        }
+    }
+}
+
+async fn execute_docker(
+    database: &Database,
+    paths: &RuntimePaths,
+    claim: &ExecutionClaim,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let spec = match claim.attempt.spec.executor() {
+        ExecutorSpec::Docker(s) => s,
+        _ => unreachable!(),
+    };
+    let planner = DockerCommandPlanner::default();
+    async fn fail(
+        database: &Database,
+        claim: &ExecutionClaim,
+        prefix: &str,
+        detail: impl std::fmt::Display,
+    ) {
+        finish_launch_failure(database, claim, &format!("{prefix}: {detail}")).await;
+    }
+    if let Err(e) = validate_docker_mount_sources(spec) {
+        fail(database, claim, "docker_create_failed", e).await;
+        return;
+    }
+    for (command, prefix) in [
+        (planner.client_version(), "docker_cli_unavailable"),
+        (planner.server_version(), "docker_daemon_unavailable"),
+    ] {
+        match docker_command(
+            &command,
+            database,
+            claim,
+            shutdown,
+            Stdio::piped(),
+            Stdio::piped(),
+        )
+        .await
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                fail(
+                    database,
+                    claim,
+                    prefix,
+                    String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                )
+                .await;
+                return;
+            }
+            Err(e) if e == "worker shutdown" => return,
+            Err(e) => {
+                let prefix = if e.starts_with("docker_heartbeat_failed:") {
+                    "docker_heartbeat_failed"
+                } else {
+                    prefix
+                };
+                fail(database, claim, prefix, e).await;
+                return;
+            }
+        }
+    }
+    let image_command = planner.image_inspect(&spec.image_reference());
+    let image_output = match docker_command(
+        &image_command,
+        database,
+        claim,
+        shutdown,
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            fail(
+                database,
+                claim,
+                "docker_image_missing_or_invalid",
+                String::from_utf8_lossy(&output.stderr).trim(),
+            )
+            .await;
+            return;
+        }
+        Err(e) if e == "worker shutdown" => return,
+        Err(e) => {
+            fail(database, claim, "docker_image_missing_or_invalid", e).await;
+            return;
+        }
+    };
+    let image_id = match igor_core::parse_docker_create_stdout(&image_output.stdout) {
+        Ok(id) => id,
+        Err(error) => {
+            fail(database, claim, "docker_image_missing_or_invalid", error).await;
+            return;
+        }
+    };
+    let image = igor_core::DockerImageIdentity {
+        reference: spec.image_reference(),
+        image_id,
+    };
+    if let Err(error) = image.validate() {
+        fail(database, claim, "docker_image_missing_or_invalid", error).await;
+        return;
+    }
+    let (stdout_path, stderr_path) =
+        match prepare_logs(&paths.log_dir, &claim.attempt.spec.id().to_string()) {
+            Ok(p) => p,
+            Err(e) => {
+                fail(database, claim, "docker_create_failed", e).await;
+                return;
+            }
+        };
+    let stdout = match open_log(&stdout_path) {
+        Ok(file) => file,
+        Err(error) => {
+            fail(database, claim, "docker_logs_failed", error).await;
+            return;
+        }
+    };
+    let stderr = match open_log(&stderr_path) {
+        Ok(file) => file,
+        Err(error) => {
+            fail(database, claim, "docker_logs_failed", error).await;
+            return;
+        }
+    };
+    let identity = DockerIdentity {
+        project_id: claim.job.spec.project_id,
+        job_id: claim.job.spec.id,
+        attempt_id: claim.attempt.spec.id(),
+        generation_id: claim
+            .attempt
+            .spec
+            .family()
+            .map(|family| family.generation.id),
+    };
+    let plan = match planner.create(
+        spec,
+        claim.attempt.spec.command(),
+        identity,
+        &claim.assigned_gpus,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            fail(database, claim, "docker_create_failed", e).await;
+            return;
+        }
+    };
+    let output = match docker_command(
+        &plan.command,
+        database,
+        claim,
+        shutdown,
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e == "worker shutdown" => return,
+        Err(e) => {
+            fail(database, claim, "docker_create_failed", e).await;
+            return;
+        }
+    };
+    if !output.status.success() {
+        fail(
+            database,
+            claim,
+            "docker_create_failed",
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        )
+        .await;
+        return;
+    }
+    let id = match igor_core::parse_docker_create_stdout(&output.stdout) {
+        Ok(id) => id,
+        Err(e) => {
+            fail(database, claim, "docker_create_failed", e).await;
+            return;
+        }
+    };
+    let container = ContainerCreate {
+        container_id: id.clone(),
+        container_name: plan.container_name.clone(),
+        image,
+        stdout_path: stdout_path.clone(),
+        stderr_path: stderr_path.clone(),
+    };
+    if let Err(e) = database
+        .jobs()
+        .record_container_created(claim, &container)
+        .await
+    {
+        let _ = docker_command(
+            &planner.remove(&id),
+            database,
+            claim,
+            shutdown,
+            Stdio::null(),
+            Stdio::null(),
+        )
+        .await;
+        fail(database, claim, "docker_identity_persistence_failed", e).await;
+        return;
+    }
+    let start = match docker_command(
+        &planner.start(&id),
+        database,
+        claim,
+        shutdown,
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) if e == "worker shutdown" => return,
+        Err(e) if e.starts_with("docker_heartbeat_failed:") => {
+            tracing::error!(error = %e, container_id = %id, "Docker start supervision lost ownership");
+            return;
+        }
+        Err(e) => {
+            if finish_created_container_failure(database, claim, "docker_start_failed", &e).await
+                && spec.remove_container
+            {
+                docker_cleanup(&planner, database, claim, &id).await;
+            }
+            return;
+        }
+    };
+    if !start.status.success() {
+        let detail = String::from_utf8_lossy(&start.stderr);
+        if finish_created_container_failure(database, claim, "docker_start_failed", detail.trim())
+            .await
+            && spec.remove_container
+        {
+            docker_cleanup(&planner, database, claim, &id).await;
+        }
+        return;
+    }
+    if let Err(e) = database.jobs().record_container_started(claim).await {
+        tracing::error!(%e, "cannot mark Docker container running");
+        return;
+    }
+    let container = match database
+        .jobs()
+        .container_for_attempt(claim.attempt.spec.id())
+        .await
+    {
+        Ok(Some(container)) => container,
+        Ok(None) => {
+            tracing::error!(container_id = %id, "started Docker identity disappeared");
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, container_id = %id, "cannot reload started Docker identity");
+            return;
+        }
+    };
+    match docker_logs_and_wait(
+        &planner.logs(&id),
+        &planner.wait(&id),
+        database,
+        claim,
+        shutdown,
+        DockerLogFiles { stdout, stderr },
+        claim
+            .attempt
+            .spec
+            .resources()
+            .timeout_seconds
+            .map(Duration::from_secs),
+    )
+    .await
+    {
+        DockerSupervision::Completed { logs, wait } => {
+            if !logs.status.success() {
+                tracing::warn!(status = %logs.status, container_id = %id, "Docker logs command failed before final inspection");
+            }
+            finalize_supervised_docker(
+                database, &planner, claim, &container, &logs, &wait, shutdown,
+            )
+            .await;
+        }
+        DockerSupervision::Cancellation(grace) => {
+            cancel_docker(database, &planner, claim, &container, grace, shutdown).await;
+        }
+        DockerSupervision::Timeout => {
+            timeout_docker(database, &planner, claim, &container, shutdown).await;
+        }
+        DockerSupervision::Shutdown => {}
+        DockerSupervision::OwnershipLost(error) => {
+            tracing::error!(%error, container_id = %id, "Docker log/wait supervision lost ownership");
+        }
+    }
+}
+
+async fn finalize_supervised_docker(
+    database: &Database,
+    planner: &DockerCommandPlanner,
+    claim: &ExecutionClaim,
+    container: &ContainerRecord,
+    logs: &std::process::Output,
+    wait: &std::process::Output,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let mut infrastructure_error = sync_docker_logs(container)
+        .err()
+        .map(|error| format!("docker_logs_failed: {error}"));
+    if !logs.status.success() && infrastructure_error.is_none() {
+        infrastructure_error = Some(format!("docker_logs_failed: {}", logs.status));
+    }
+    let wait_code = if wait.status.success() {
+        match igor_core::parse_docker_wait_stdout(&wait.stdout) {
+            Ok(code) => Some(code),
+            Err(error) => {
+                infrastructure_error = Some(format!("docker_wait_failed: {error}"));
+                None
+            }
+        }
+    } else {
+        infrastructure_error = Some(format!(
+            "docker_wait_failed: {}",
+            String::from_utf8_lossy(&wait.stderr).trim()
+        ));
+        None
+    };
+    let inspection = match inspect_docker(
+        database,
+        planner,
+        claim,
+        &container.container_id,
+        shutdown,
+    )
+    .await
+    {
+        Ok(inspection) if !inspection.running => inspection,
+        Ok(_) => {
+            tracing::error!(container_id = %container.container_id, "docker wait returned while container is still running");
+            return;
+        }
+        Err(DockerInspectFailure::Missing) => {
+            finish_docker_lost(
+                database,
+                claim,
+                container,
+                "container disappeared after wait",
+            )
+            .await;
+            return;
+        }
+        Err(DockerInspectFailure::Indeterminate(error)) => {
+            tracing::error!(%error, container_id = %container.container_id, "cannot inspect Docker container after wait");
+            return;
+        }
+    };
+    if let Some(wait_code) = wait_code
+        && wait_code != inspection.exit_code
+    {
+        infrastructure_error = Some(format!(
+            "docker_inspect_failed: wait exit code {wait_code} differs from inspect exit code {}",
+            inspection.exit_code
+        ));
+    }
+    finish_docker_inspection(
+        database,
+        planner,
+        claim,
+        container,
+        inspection,
+        None,
+        infrastructure_error,
+    )
+    .await;
+}
+
+async fn finish_docker_inspection(
+    database: &Database,
+    planner: &DockerCommandPlanner,
+    claim: &ExecutionClaim,
+    container: &ContainerRecord,
+    inspection: DockerContainerInspection,
+    forced_state: Option<AttemptState>,
+    infrastructure_error: Option<String>,
+) {
+    let exit_code = inspection.exit_code;
+    let error = if forced_state == Some(AttemptState::Cancelled) {
+        Some("docker_cancelled: cancellation requested".into())
+    } else if forced_state.is_some()
+        && let Some(error) = infrastructure_error
+    {
+        Some(error)
+    } else if inspection.oom_killed {
+        Some("docker_oom_killed: container was killed by the OOM killer".into())
+    } else if let Some(error) = infrastructure_error {
+        Some(error)
+    } else if let Some(error) = inspection.error.clone() {
+        Some(format!("docker_application_nonzero: {error}"))
+    } else if exit_code != 0 {
+        Some(format!(
+            "docker_application_nonzero: container exited with code {exit_code}"
+        ))
+    } else {
+        None
+    };
+    let state = forced_state.unwrap_or_else(|| {
+        if error.is_some() {
+            AttemptState::Failed
+        } else {
+            AttemptState::Succeeded
+        }
+    });
+    let finish = ContainerFinish {
+        state: DockerContainerState::Exited,
+        docker_status: Some(inspection.status),
+        exit_code: Some(exit_code),
+        oom_killed: inspection.oom_killed,
+        error: error.clone(),
+    };
+    let outcome = ExecutionOutcome {
+        state,
+        exit_code: Some(exit_code),
+        term_signal: None,
+        error,
+    };
+    if database
+        .jobs()
+        .finish_container_execution(claim, &finish, &outcome)
+        .await
+        .is_ok()
+        && matches!(claim.attempt.spec.executor(), ExecutorSpec::Docker(spec) if spec.remove_container)
+    {
+        docker_cleanup(planner, database, claim, &container.container_id).await;
+    }
+}
+
+async fn cancel_docker(
+    database: &Database,
+    planner: &DockerCommandPlanner,
+    claim: &ExecutionClaim,
+    container: &ContainerRecord,
+    grace: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    if !grace.is_zero() {
+        let seconds = grace.as_secs().max(1);
+        let stop_command = planner.stop(&container.container_id, seconds);
+        if let Err(error) =
+            docker_stop_with_deadline(&stop_command, database, claim, shutdown, grace).await
+            && error != "Docker stop grace period elapsed"
+        {
+            tracing::error!(%error, container_id = %container.container_id, "Docker stop was not confirmed");
+            return;
+        }
+    }
+    let mut inspection = match inspect_docker(
+        database,
+        planner,
+        claim,
+        &container.container_id,
+        shutdown,
+    )
+    .await
+    {
+        Ok(inspection) => inspection,
+        Err(DockerInspectFailure::Missing) => {
+            finish_docker_lost(
+                database,
+                claim,
+                container,
+                "container disappeared during cancellation",
+            )
+            .await;
+            return;
+        }
+        Err(DockerInspectFailure::Indeterminate(error)) => {
+            tracing::error!(%error, container_id = %container.container_id, "cannot inspect Docker cancellation");
+            return;
+        }
+    };
+    if inspection.running {
+        match docker_command(
+            &planner.kill(&container.container_id),
+            database,
+            claim,
+            shutdown,
+            Stdio::piped(),
+            Stdio::piped(),
+        )
+        .await
+        {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                tracing::error!(error = %String::from_utf8_lossy(&output.stderr), container_id = %container.container_id, "Docker kill failed");
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, container_id = %container.container_id, "Docker kill was not confirmed");
+                return;
+            }
+        }
+        inspection = match inspect_docker(
+            database,
+            planner,
+            claim,
+            &container.container_id,
+            shutdown,
+        )
+        .await
+        {
+            Ok(inspection) if !inspection.running => inspection,
+            Ok(_) => return,
+            Err(DockerInspectFailure::Missing) => {
+                finish_docker_lost(
+                    database,
+                    claim,
+                    container,
+                    "container disappeared after kill",
+                )
+                .await;
+                return;
+            }
+            Err(DockerInspectFailure::Indeterminate(error)) => {
+                tracing::error!(%error, container_id = %container.container_id, "cannot confirm Docker kill");
+                return;
+            }
+        };
+    }
+    if let Err(error) = capture_docker_snapshot(database, planner, claim, container, shutdown).await
+    {
+        tracing::error!(%error, container_id = %container.container_id, "cannot persist cancelled Docker logs");
+        return;
+    }
+    finish_docker_inspection(
+        database,
+        planner,
+        claim,
+        container,
+        inspection,
+        Some(AttemptState::Cancelled),
+        None,
+    )
+    .await;
+}
+
+async fn timeout_docker(
+    database: &Database,
+    planner: &DockerCommandPlanner,
+    claim: &ExecutionClaim,
+    container: &ContainerRecord,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    match docker_command(
+        &planner.kill(&container.container_id),
+        database,
+        claim,
+        shutdown,
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .await
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            tracing::error!(error = %String::from_utf8_lossy(&output.stderr), container_id = %container.container_id, "cannot kill timed-out Docker container");
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, container_id = %container.container_id, "Docker timeout kill was not confirmed");
+            return;
+        }
+    }
+    let inspection = match inspect_docker(
+        database,
+        planner,
+        claim,
+        &container.container_id,
+        shutdown,
+    )
+    .await
+    {
+        Ok(inspection) if !inspection.running => inspection,
+        Ok(_) => return,
+        Err(DockerInspectFailure::Missing) => {
+            finish_docker_lost(
+                database,
+                claim,
+                container,
+                "container disappeared after timeout",
+            )
+            .await;
+            return;
+        }
+        Err(DockerInspectFailure::Indeterminate(error)) => {
+            tracing::error!(%error, container_id = %container.container_id, "cannot confirm Docker timeout kill");
+            return;
+        }
+    };
+    if let Err(error) = capture_docker_snapshot(database, planner, claim, container, shutdown).await
+    {
+        tracing::error!(%error, container_id = %container.container_id, "cannot persist timed-out Docker logs");
+        return;
+    }
+    finish_docker_inspection(
+        database,
+        planner,
+        claim,
+        container,
+        inspection,
+        Some(AttemptState::Failed),
+        Some("docker_timeout: configured execution timeout elapsed".into()),
+    )
+    .await;
+}
+
 async fn finish_launch_failure(database: &Database, claim: &ExecutionClaim, reason: &str) {
     let outcome = ExecutionOutcome {
         state: AttemptState::Failed,
@@ -536,7 +1943,11 @@ fn prepare_logs(log_dir: &Path, attempt_id: &str) -> io::Result<(PathBuf, PathBu
     ensure_real_directory(log_dir)?;
     fs::set_permissions(log_dir, fs::Permissions::from_mode(0o700))?;
     let attempt_dir = log_dir.join(attempt_id);
-    DirBuilder::new().mode(0o700).create(&attempt_dir)?;
+    match DirBuilder::new().mode(0o700).create(&attempt_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
     ensure_real_directory(&attempt_dir)?;
     fs::set_permissions(&attempt_dir, fs::Permissions::from_mode(0o700))?;
     Ok((
@@ -565,6 +1976,30 @@ fn open_log(path: &Path) -> io::Result<fs::File> {
         .create_new(true)
         .mode(0o600)
         .open(path)
+}
+
+fn reset_recovery_logs(container: &ContainerRecord) -> io::Result<(fs::File, fs::File)> {
+    Ok((
+        reset_recovery_log(&container.stdout_path)?,
+        reset_recovery_log(&container.stderr_path)?,
+    ))
+}
+
+fn reset_recovery_log(path: &Path) -> io::Result<fs::File> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn sync_docker_logs(container: &ContainerRecord) -> io::Result<()> {
+    for path in [&container.stdout_path, &container.stderr_path] {
+        OpenOptions::new().write(true).open(path)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn configure_environment(

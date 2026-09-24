@@ -9,12 +9,14 @@ use std::{
 
 use igor_core::{
     ActionId, ActionRecord, ActionState, ArtifactRecord, ArtifactRole, AttemptId, AttemptSpec,
-    AttemptState, CommandSpec, ConfigurationIdentity, Database, DatabaseOptions, DeliveryId,
-    DeliveryRecord, DeliveryState, EnvironmentPolicy, Event, EventId, EventKind, EventPayload,
-    ExecutionOutcome, Family, FamilyId, Generation, GenerationId, GenerationIdentity, GpuRequest,
-    HostGpu, HostInventory, IntegrityCheck, JobId, JobSpec, JobState, NamedResourceMode,
-    NamedResourceRequest, PersistenceError, ProcessStart, Project, ProjectId, Resource, ResourceId,
-    ResourceMode, ResultContract, ShellPolicy, SourceIdentity,
+    AttemptState, CommandSpec, ConfigurationIdentity, ContainerCreate, ContainerFinish, Database,
+    DatabaseOptions, DeliveryId, DeliveryRecord, DeliveryState, DockerContainerState,
+    DockerExecutorSpec, DockerImageIdentity, EnvironmentPolicy, Event, EventId, EventKind,
+    EventPayload, ExecutionClaim, ExecutionOutcome, ExecutorSpec, Family, FamilyId, Generation,
+    GenerationId, GenerationIdentity, GpuRequest, HostGpu, HostInventory, IntegrityCheck, JobId,
+    JobSpec, JobState, NamedResourceMode, NamedResourceRequest, PersistenceError, ProcessStart,
+    Project, ProjectId, Resource, ResourceId, ResourceMode, ResultContract, ShellPolicy,
+    SourceIdentity,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
@@ -123,6 +125,62 @@ async fn synchronize_test_inventory(
     Ok(())
 }
 
+async fn claimed_docker_execution(
+    database: &Database,
+    project_id: ProjectId,
+    owner: &str,
+) -> Result<(ExecutionClaim, ContainerCreate), Box<dyn Error>> {
+    let (claim, container) = claim_docker_execution(database, project_id, owner).await?;
+    database
+        .jobs()
+        .record_container_created(&claim, &container)
+        .await?;
+    Ok((claim, container))
+}
+
+async fn claim_docker_execution(
+    database: &Database,
+    project_id: ProjectId,
+    owner: &str,
+) -> Result<(ExecutionClaim, ContainerCreate), Box<dyn Error>> {
+    let mut docker_job = job(project_id);
+    docker_job.resources.mode = ResourceMode::Shared;
+    docker_job.executor = ExecutorSpec::Docker(DockerExecutorSpec {
+        image: "example/image:tag".into(),
+        digest: None,
+        workdir: Some(PathBuf::from("/workspace")),
+        mounts: Vec::new(),
+        remove_container: true,
+    });
+    let docker_attempt = attempt(&docker_job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &docker_job,
+            &docker_attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution(owner, Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("Docker execution was not claimed"))?;
+    let container = ContainerCreate {
+        container_id: format!("container-{}", claim.attempt.spec.id()),
+        container_name: format!("igor-{}", claim.attempt.spec.id()),
+        image: DockerImageIdentity {
+            reference: "example/image:tag".into(),
+            image_id: format!("sha256:{}", "a".repeat(64)),
+        },
+        stdout_path: PathBuf::from("/tmp/igor/docker.stdout"),
+        stderr_path: PathBuf::from("/tmp/igor/docker.stderr"),
+    };
+    Ok((claim, container))
+}
+
 #[tokio::test]
 async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     let (_directory, database) = database().await?;
@@ -132,6 +190,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "agent_sessions",
         "artifacts",
         "attempts",
+        "attempt_containers",
         "attempt_processes",
         "deliveries",
         "events",
@@ -162,6 +221,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "actions_pending_idx",
         "agent_sessions_cleanup_idx",
         "artifacts_attempt_idx",
+        "attempt_containers_state_idx",
         "attempts_job_lookup_idx",
         "deliveries_lease_idx",
         "deliveries_pending_idx",
@@ -194,7 +254,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(ledger.len(), 6);
+    assert_eq!(ledger.len(), 8);
     for (index, row) in ledger.iter().enumerate() {
         assert_eq!(row.get::<i64, _>("version"), (index + 1) as i64);
         assert!(row.get::<bool, _>("success"));
@@ -242,7 +302,7 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
             .fetch_all(database.pool())
             .await?;
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     let checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
             .fetch_one(database.pool())
@@ -1194,6 +1254,72 @@ async fn project_registration_is_idempotent_and_listed() -> TestResult {
 }
 
 #[tokio::test]
+async fn project_removal_preserves_history_and_registration_can_be_restored() -> TestResult {
+    let (_directory, database) = database().await?;
+    let registered_project = project();
+    database.projects().register(&registered_project).await?;
+    let removed = database.projects().remove(&registered_project.root).await?;
+    assert_eq!(removed, registered_project);
+    assert!(database.projects().list().await?.is_empty());
+    assert_eq!(
+        database
+            .projects()
+            .by_root(&registered_project.root)
+            .await?,
+        None
+    );
+    assert_eq!(database.projects().get(registered_project.id).await?, None);
+    assert!(matches!(
+        database.projects().remove(&registered_project.root).await,
+        Err(PersistenceError::NotFound { entity: "project" })
+    ));
+    assert_eq!(
+        database.projects().register(&registered_project).await?,
+        registered_project
+    );
+
+    let mut active_project = project();
+    active_project.id = ProjectId::new();
+    active_project.root = PathBuf::from("/tmp/active-project");
+    active_project.config_path = active_project.root.join(".igor/project.toml");
+    database.projects().insert(&active_project).await?;
+    let active_job = job(active_project.id);
+    database
+        .jobs()
+        .insert_job_with_event(
+            &active_job,
+            10,
+            &event(EventKind::JobSubmitted, json!({"source": "test"}))?,
+        )
+        .await?;
+    assert!(matches!(
+        database.projects().remove(&active_project.root).await,
+        Err(PersistenceError::Conflict { entity: "project" })
+    ));
+    sqlx::query("UPDATE jobs SET state = 'failed' WHERE id = ?")
+        .bind(active_job.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database.projects().remove(&active_project.root).await?;
+    let history = database.jobs().list(Some(active_project.id)).await?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].spec, active_job);
+    let blocked_job = job(active_project.id);
+    assert!(
+        database
+            .jobs()
+            .insert_job_with_event(
+                &blocked_job,
+                10,
+                &event(EventKind::JobSubmitted, json!({"source": "test"}))?,
+            )
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn persisted_legacy_git_attempt_remains_readable() -> TestResult {
     let (_directory, database) = database().await?;
     let (project, job) = insert_project_job(&database).await?;
@@ -1673,6 +1799,457 @@ async fn execution_claims_age_priority_and_break_effective_ties_by_submission_or
 }
 
 #[tokio::test]
+async fn container_identity_is_durable_unique_and_starts_atomically() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 2, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+
+    let mut submitted = Vec::new();
+    for name in ["first-container", "second-container"] {
+        let mut docker_job = job(project.id);
+        docker_job.name = name.into();
+        docker_job.resources.mode = ResourceMode::Shared;
+        docker_job.executor = ExecutorSpec::Docker(DockerExecutorSpec {
+            image: "example/image:tag".into(),
+            digest: None,
+            workdir: Some(PathBuf::from("/workspace")),
+            mounts: Vec::new(),
+            remove_container: true,
+        });
+        let docker_attempt = attempt(&docker_job, 1)?;
+        database
+            .jobs()
+            .submit(
+                &docker_job,
+                &docker_attempt,
+                0,
+                &event(EventKind::JobSubmitted, json!({}))?,
+                &event(EventKind::AttemptCreated, json!({}))?,
+            )
+            .await?;
+        submitted.push(docker_job);
+    }
+    let first = database
+        .jobs()
+        .claim_execution("worker-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("first Docker claim missing"))?;
+    let second = database
+        .jobs()
+        .claim_execution("worker-b", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("second Docker claim missing"))?;
+    assert_eq!(first.job.spec.id, submitted[0].id);
+    assert_eq!(second.job.spec.id, submitted[1].id);
+
+    let image = DockerImageIdentity {
+        reference: "example/image:tag".into(),
+        image_id: format!("sha256:{}", "a".repeat(64)),
+    };
+    let first_container = ContainerCreate {
+        container_id: "container-one".into(),
+        container_name: format!("igor-{}", first.attempt.spec.id()),
+        image: image.clone(),
+        stdout_path: PathBuf::from("/tmp/igor/docker-one.stdout"),
+        stderr_path: PathBuf::from("/tmp/igor/docker-one.stderr"),
+    };
+    let mut wrong_claim = first.clone();
+    wrong_claim.owner = "wrong-worker".into();
+    assert!(
+        database
+            .jobs()
+            .record_container_created(&wrong_claim, &first_container)
+            .await
+            .is_err()
+    );
+    database
+        .jobs()
+        .record_container_created(&first, &first_container)
+        .await?;
+
+    let mut second_container = ContainerCreate {
+        container_id: first_container.container_id.clone(),
+        container_name: format!("igor-{}", second.attempt.spec.id()),
+        image,
+        stdout_path: PathBuf::from("/tmp/igor/docker-two.stdout"),
+        stderr_path: PathBuf::from("/tmp/igor/docker-two.stderr"),
+    };
+    assert!(
+        database
+            .jobs()
+            .record_container_created(&second, &second_container)
+            .await
+            .is_err()
+    );
+    second_container.container_id = "container-two".into();
+    database
+        .jobs()
+        .record_container_created(&second, &second_container)
+        .await?;
+    assert!(
+        sqlx::query("UPDATE attempt_containers SET container_name = ? WHERE attempt_id = ?")
+            .bind(&first_container.container_name)
+            .bind(second.attempt.spec.id().to_string())
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+
+    let created = database
+        .jobs()
+        .container_for_attempt(first.attempt.spec.id())
+        .await?
+        .ok_or_else(|| missing("created container missing"))?;
+    assert_eq!(created.state, DockerContainerState::Created);
+    assert_eq!(created.container_id, first_container.container_id);
+    assert!(created.started_at.is_none());
+    assert!(
+        database
+            .jobs()
+            .record_container_started(&wrong_claim)
+            .await
+            .is_err()
+    );
+
+    sqlx::query(
+        "UPDATE jobs SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?",
+    )
+    .bind(first.job.spec.id.to_string())
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .jobs()
+            .record_container_started(&first)
+            .await
+            .is_err()
+    );
+    sqlx::query(
+        "UPDATE jobs SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 seconds') WHERE id = ?",
+    )
+    .bind(first.job.spec.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "CREATE TRIGGER reject_container_start_event BEFORE INSERT ON events
+         WHEN NEW.kind = 'attempt_state_changed'
+         BEGIN SELECT RAISE(ABORT, 'reject container start event'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .jobs()
+            .record_container_started(&first)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .jobs()
+            .get_attempt(first.attempt.spec.id())
+            .await?
+            .ok_or_else(|| missing("Docker attempt missing after rollback"))?
+            .state,
+        AttemptState::Starting
+    );
+    assert_eq!(
+        database
+            .jobs()
+            .container_for_attempt(first.attempt.spec.id())
+            .await?
+            .ok_or_else(|| missing("container missing after rollback"))?
+            .state,
+        DockerContainerState::Created
+    );
+    sqlx::query("DROP TRIGGER reject_container_start_event")
+        .execute(database.pool())
+        .await?;
+
+    database.jobs().record_container_started(&first).await?;
+    let running = database
+        .jobs()
+        .container_for_attempt(first.attempt.spec.id())
+        .await?
+        .ok_or_else(|| missing("running container missing"))?;
+    assert_eq!(running.state, DockerContainerState::Running);
+    assert_eq!(running.docker_status.as_deref(), Some("running"));
+    assert!(running.started_at.is_some());
+    assert_eq!(
+        database
+            .jobs()
+            .get_attempt(first.attempt.spec.id())
+            .await?
+            .ok_or_else(|| missing("running Docker attempt missing"))?
+            .state,
+        AttemptState::Running
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn docker_heartbeat_renews_created_and_running_container_execution() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let (claim, _) = claimed_docker_execution(&database, project.id, "docker-worker").await?;
+
+    for state in [DockerContainerState::Created, DockerContainerState::Running] {
+        sqlx::query(
+            "UPDATE attempt_containers SET updated_at = '2000-01-01T00:00:00.000Z'
+             WHERE attempt_id = ?",
+        )
+        .bind(claim.attempt.spec.id().to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE resource_leases SET heartbeat_at = '2000-01-01T00:00:00.000Z'
+             WHERE job_id = ?",
+        )
+        .bind(claim.job.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+        database
+            .jobs()
+            .heartbeat_execution(&claim, Duration::from_secs(30))
+            .await?;
+        let (container_updated, resource_heartbeat): (String, String) = sqlx::query_as(
+            "SELECT attempt_containers.updated_at, resource_leases.heartbeat_at
+             FROM attempt_containers
+             JOIN resource_leases ON resource_leases.job_id = attempt_containers.job_id
+             WHERE attempt_containers.attempt_id = ?",
+        )
+        .bind(claim.attempt.spec.id().to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert!(container_updated.as_str() > "2000-01-01T00:00:00.000Z");
+        assert!(resource_heartbeat.as_str() > "2000-01-01T00:00:00.000Z");
+        if state == DockerContainerState::Created {
+            database.jobs().record_container_started(&claim).await?;
+        }
+    }
+    assert_eq!(
+        database
+            .jobs()
+            .container_for_attempt(claim.attempt.spec.id())
+            .await?
+            .ok_or_else(|| missing("heartbeated container missing"))?
+            .state,
+        DockerContainerState::Running
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn docker_heartbeat_renews_claim_before_container_identity_is_recorded() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let (claim, container) = claim_docker_execution(&database, project.id, "docker-worker").await?;
+
+    database
+        .jobs()
+        .heartbeat_execution(&claim, Duration::from_secs(30))
+        .await?;
+    database
+        .jobs()
+        .record_container_created(&claim, &container)
+        .await?;
+    database
+        .jobs()
+        .heartbeat_execution(&claim, Duration::from_secs(30))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn container_finish_is_atomic_and_persists_docker_outcome() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let (claim, _) = claimed_docker_execution(&database, project.id, "docker-worker").await?;
+    database.jobs().record_container_started(&claim).await?;
+    let finish = ContainerFinish {
+        state: DockerContainerState::Exited,
+        docker_status: Some("exited".into()),
+        exit_code: Some(137),
+        oom_killed: true,
+        error: Some("container exceeded memory limit".into()),
+    };
+    let outcome = ExecutionOutcome {
+        state: AttemptState::Failed,
+        exit_code: Some(137),
+        term_signal: None,
+        error: Some("container exceeded memory limit".into()),
+    };
+
+    sqlx::query(
+        "CREATE TRIGGER reject_container_finish_event BEFORE INSERT ON events
+         WHEN NEW.kind = 'attempt_state_changed'
+         BEGIN SELECT RAISE(ABORT, 'reject container finish event'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .jobs()
+            .finish_container_execution(&claim, &finish, &outcome)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .jobs()
+            .container_for_attempt(claim.attempt.spec.id())
+            .await?
+            .ok_or_else(|| missing("container missing after finish rollback"))?
+            .state,
+        DockerContainerState::Running
+    );
+    assert_eq!(
+        database
+            .jobs()
+            .get_attempt(claim.attempt.spec.id())
+            .await?
+            .ok_or_else(|| missing("attempt missing after finish rollback"))?
+            .state,
+        AttemptState::Running
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM resource_leases WHERE job_id = ?")
+            .bind(claim.job.spec.id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        i64::try_from(claim.resource_leases.len())?
+    );
+    sqlx::query("DROP TRIGGER reject_container_finish_event")
+        .execute(database.pool())
+        .await?;
+
+    database
+        .jobs()
+        .finish_container_execution(&claim, &finish, &outcome)
+        .await?;
+    let container = database
+        .jobs()
+        .container_for_attempt(claim.attempt.spec.id())
+        .await?
+        .ok_or_else(|| missing("finished container missing"))?;
+    assert_eq!(container.state, DockerContainerState::Exited);
+    assert_eq!(container.docker_status.as_deref(), Some("exited"));
+    assert_eq!(container.exit_code, Some(137));
+    assert_eq!(container.oom_killed, Some(true));
+    assert_eq!(container.error, finish.error);
+    assert!(container.finished_at.is_some());
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(claim.job.spec.id)
+            .await?
+            .ok_or_else(|| missing("finished Docker job missing"))?
+            .state,
+        JobState::Failed
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM resource_leases WHERE job_id = ?")
+            .bind(claim.job.spec.id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    let terminal_events: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_json FROM events
+         WHERE job_id = ? AND kind IN ('attempt_state_changed', 'job_state_changed')
+         ORDER BY sequence DESC LIMIT 2",
+    )
+    .bind(claim.job.spec.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(terminal_events.len(), 2);
+    for payload in terminal_events {
+        let payload: serde_json::Value = serde_json::from_str(&payload)?;
+        assert_eq!(payload["data"]["details"]["container_state"], "exited");
+        assert_eq!(payload["data"]["details"]["container_exit_code"], 137);
+        assert_eq!(payload["data"]["details"]["oom_killed"], true);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn container_removal_requires_terminal_identity_and_is_idempotent() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let (claim, container) =
+        claimed_docker_execution(&database, project.id, "docker-worker").await?;
+    assert!(
+        database
+            .jobs()
+            .record_container_removed(claim.attempt.spec.id(), &container.container_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .jobs()
+            .record_container_removed(claim.attempt.spec.id(), "wrong-container")
+            .await
+            .is_err()
+    );
+    database
+        .jobs()
+        .finish_container_execution(
+            &claim,
+            &ContainerFinish {
+                state: DockerContainerState::Lost,
+                docker_status: Some("missing".into()),
+                exit_code: None,
+                oom_killed: false,
+                error: Some("container no longer exists".into()),
+            },
+            &ExecutionOutcome {
+                state: AttemptState::Lost,
+                exit_code: None,
+                term_signal: None,
+                error: Some("container no longer exists".into()),
+            },
+        )
+        .await?;
+    database
+        .jobs()
+        .record_container_removed(claim.attempt.spec.id(), &container.container_id)
+        .await?;
+    let first_removed_at = database
+        .jobs()
+        .container_for_attempt(claim.attempt.spec.id())
+        .await?
+        .ok_or_else(|| missing("removed container missing"))?
+        .removed_at
+        .ok_or_else(|| missing("container removal timestamp missing"))?;
+    database
+        .jobs()
+        .record_container_removed(claim.attempt.spec.id(), &container.container_id)
+        .await?;
+    let removed = database
+        .jobs()
+        .container_for_attempt(claim.attempt.spec.id())
+        .await?
+        .ok_or_else(|| missing("idempotently removed container missing"))?;
+    assert_eq!(removed.state, DockerContainerState::Removed);
+    assert_eq!(
+        removed.removed_at.as_deref(),
+        Some(first_removed_at.as_str())
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn scheduler_skips_blocked_jobs_and_preserves_gpu_assignment_during_recovery() -> TestResult {
     let (_directory, database) = database().await?;
     synchronize_test_inventory(
@@ -1821,6 +2398,106 @@ async fn scheduler_skips_blocked_jobs_and_preserves_gpu_assignment_during_recove
             },
         )
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn docker_recovery_returns_identity_preserves_leases_and_lists_cleanup() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let claim = {
+        let (project, _) = insert_project_job(&database).await?;
+        let (claim, container) =
+            claimed_docker_execution(&database, project.id, "worker-a").await?;
+        (claim, container)
+    };
+    let (claim, container) = claim;
+    let lease_ids: BTreeSet<_> = claim.resource_leases.iter().map(|lease| lease.id).collect();
+    database.jobs().release_execution(&claim).await?;
+    let recovered = database
+        .jobs()
+        .claim_recovery("worker-b", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("Docker recovery missing"))?;
+    assert_eq!(
+        recovered
+            .container
+            .as_ref()
+            .map(|value| value.container_id.as_str()),
+        Some(container.container_id.as_str())
+    );
+    assert_eq!(recovered.process, None);
+    assert_eq!(recovered.claim.owner, "worker-b");
+    assert_eq!(
+        recovered
+            .claim
+            .resource_leases
+            .iter()
+            .map(|lease| lease.id)
+            .collect::<BTreeSet<_>>(),
+        lease_ids
+    );
+    database
+        .jobs()
+        .record_container_started(&recovered.claim)
+        .await?;
+    database
+        .jobs()
+        .finish_container_execution(
+            &recovered.claim,
+            &ContainerFinish {
+                state: DockerContainerState::Exited,
+                docker_status: Some("exited".into()),
+                exit_code: Some(0),
+                oom_killed: false,
+                error: None,
+            },
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let pending = database.jobs().containers_pending_cleanup().await?;
+    let finished = database
+        .jobs()
+        .container_for_attempt(recovered.claim.attempt.spec.id())
+        .await?
+        .ok_or_else(|| missing("finished Docker container missing"))?;
+    assert_eq!(pending, vec![finished]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn docker_recovery_never_reassigns_missing_resources() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let (project, _) = insert_project_job(&database).await?;
+    let (claim, _) = claimed_docker_execution(&database, project.id, "worker-a").await?;
+    database.jobs().release_execution(&claim).await?;
+    sqlx::query("DELETE FROM resource_leases WHERE job_id = ?")
+        .bind(claim.job.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    assert!(matches!(
+        database
+            .jobs()
+            .claim_recovery("worker-b", Duration::from_secs(30))
+            .await,
+        Err(PersistenceError::Conflict {
+            entity: "recovered Docker execution resources"
+        })
+    ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+            .bind(claim.job.spec.id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
     Ok(())
 }
 

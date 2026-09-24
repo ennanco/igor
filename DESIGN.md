@@ -247,12 +247,66 @@ shell execution.
 
 ### 8.2 Docker
 
-- Resolve and optionally pin the image digest.
-- Persist container ID and Igor labels.
-- Use structured mounts and arguments.
-- Select a concrete GPU instead of exposing all GPUs.
-- Recover using container ID, with labels as a fallback.
-- Keep Docker optional; process execution must work without it.
+- Invoke the Docker CLI directly with argument vectors. Docker commands never
+  pass through a shell, and v1 does not add a Docker client dependency.
+- Use only images already present in the local daemon. Igor inspects the image
+  before creation, never pulls implicitly, and verifies a configured canonical
+  `sha256` digest by resolving the exact `image@digest` reference.
+- Keep the host working directory separate from the container working directory.
+  A Docker executor may declare an absolute `workdir`; otherwise the image
+  default is retained.
+- Require absolute bind-mount sources and targets, reject duplicate targets and
+  traversal components, and preserve explicit read-only or read-write access.
+  Igor is a trusted-user tool, so an explicitly declared writable source is the
+  v1 authorization boundary; Docker is not treated as a sandbox.
+- Preserve environment defaults declared by the image and add only the frozen
+  command's explicit `environment.set` entries. Ambient host variables are never
+  copied into Docker jobs, regardless of the direct-process inheritance policy.
+- Select only the concrete GPU identities assigned by the scheduler instead of
+  using an all-GPU shortcut.
+- Name containers `igor-ATTEMPT_ID` and label them with `igor.project_id`,
+  `igor.job_id`, `igor.attempt_id`, and optional `igor.generation_id`.
+- Persist container ID, name, resolved image identity, and lifecycle state before
+  declaring an attempt running. Recover by container ID, with exact Igor labels
+  as a fallback that must produce one unambiguous match.
+- Keep Docker optional. Capability checks run only for Docker work or explicit
+  diagnostics; process execution must work when the CLI or daemon is absent.
+
+Container identity is stored one-to-one with an attempt. The durable record
+contains the Docker ID and deterministic name, resolved image reference and ID,
+log paths, lifecycle state, last observed Docker status, outcome fields, and
+created, started, finished, and removed timestamps. Its states are:
+
+- `created`: `docker create` returned an ID and Igor persisted it, but successful
+  start has not yet been recorded.
+- `running`: Docker start succeeded and the attempt entered `running` in the same
+  database transaction as the attempt-state event.
+- `exited`: Docker reported a terminal status and its outcome is durable.
+- `removed`: cleanup completed or the container was already absent.
+- `lost`: the persisted identity can no longer be reconciled safely.
+
+External Docker operations cannot share a transaction with SQLite. Igor handles
+the boundaries deliberately: creation uses deterministic labels, then persists
+the returned ID before start; persistence failure triggers best-effort removal;
+and a crash after start but before the `running` transaction is recovered by
+inspecting the record still marked `created`. Container identity transitions
+require the live job claim and its complete M7 resource-lease set.
+
+Cancellation and recovery preserve that ownership boundary. Cancellation polls
+the durable request, runs `docker stop` against the remaining persisted grace
+deadline, accepts a shorter repeated request, and escalates to `docker kill` only
+after inspection still reports a live container. Logs and the authoritative
+inspect result are persisted before disposable cleanup. Worker shutdown is not
+cancellation: Docker CLI helper processes are dropped, the container is left
+untouched, and the next owner reconciles it by durable ID.
+
+Recovery never launches a replacement. A running container retains its original
+complete resource leases while logs and wait supervision reattach. A terminal
+container is finalized from inspection; a narrowly confirmed missing container
+is classified as lost; daemon, permission, timeout, malformed-output, and
+ambiguous-label failures preserve ownership for another reconciliation attempt.
+Terminal containers whose first removal was interrupted are discovered and
+removed idempotently without repeating attempt finalization.
 
 ### 8.3 systemd Transient Units
 
@@ -733,6 +787,7 @@ stored exception URLs.
 igor init [PATH]
 igor project add PATH
 igor project list
+igor project remove [PATH]
 igor config path
 igor config show
 igor config check
@@ -744,6 +799,11 @@ timeout, and exclusive-host scheduling defaults. It creates only configuration
 files needed by enabled features and never overwrites an existing file unless
 the user passes `--force`. Runtime state, logs, databases, and secrets are not
 created inside the project.
+
+`igor project remove` defaults to the current directory and removes only the
+active registration. It preserves the project directory and all Igor history,
+can be reversed with `igor project add`, and refuses to deregister a project
+while it has queued or running jobs.
 
 ### 20.2 Jobs And Families
 
@@ -827,12 +887,18 @@ igor service restart
 igor service status
 igor service logs
 igor service uninstall --user
+igor uninstall
 ```
 
 Installation generates units using the detected stable binary and XDG paths,
 runs `systemctl --user daemon-reload`, and never invokes `sudo` implicitly.
 Installing units, enabling them, and starting them remain distinguishable
 operations.
+
+Both uninstall commands require confirmation unless `--yes` is supplied.
+`igor uninstall` is intentionally conservative: it removes the same managed
+user units as `igor service uninstall` but preserves the Igor binary,
+configuration, database, logs, and job history.
 
 The initial systemd units should use restart-on-failure, deliberate shutdown
 semantics, and resource priority appropriate to each service. They must not
@@ -928,6 +994,10 @@ Commit `Cargo.lock` because Igor ships executable applications.
 - Disposable container success, failure, cancellation, and recovery.
 - Image digest verification.
 - GPU argument construction without requiring a GPU in ordinary CI.
+- Ordinary Docker tests use a stateful fake CLI and require no Docker runtime.
+  Real-daemon tests are opt-in through `IGOR_RUN_DOCKER_TESTS=1` and
+  `IGOR_TEST_DOCKER_IMAGE`; they use only an already-local CPU image and print an
+  explicit skip reason when prerequisites are absent.
 - Unit generation and validation.
 - User-service install, enable, disable, and uninstall where systemd is
   available.

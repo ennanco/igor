@@ -33,8 +33,12 @@ pub use config::{
 pub use error::{DomainError, ErrorCategory, ErrorCode, Result};
 pub use event::{Event, EventKind, EventPayload};
 pub use executor::{
-    DockerExecutorSpec, DockerMount, ExecutorSpec, MountAccess, ProcessExecutorSpec,
-    ProcessIsolation,
+    DockerCapability, DockerCommand, DockerCommandPlanner, DockerContainerInspection,
+    DockerContainerState, DockerCreatePlan, DockerExecutorSpec, DockerIdentity, DockerImageError,
+    DockerImageIdentity, DockerMount, DockerOutputParseError, DockerRecoveryIdentity, ExecutorSpec,
+    MountAccess, ProcessExecutorSpec, ProcessIsolation, detect_docker, inspect_local_docker_image,
+    parse_docker_create_stdout, parse_docker_inspect_stdout, parse_docker_recovery_candidates,
+    parse_docker_recovery_inspect, parse_docker_wait_stdout, validate_docker_mount_sources,
 };
 pub use id::{
     ActionId, AgentSessionId, AttemptId, DeliveryId, EventId, FamilyId, GenerationId, JobId,
@@ -46,12 +50,13 @@ pub use job::{
     GenerationIdentity, GitIdentity, JobSpec, ResultContract, Seed, SourceIdentity,
 };
 pub use persistence::{
-    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, Database,
-    DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim,
-    ExecutionOutcome, Family, FamilyGenerationRepository, Generation, IntegrityCheck,
-    JobAttemptRepository, JobDetail, JobLogs, PersistenceError, ProcessRecord, ProcessStart,
-    ProjectRepository, RecoveredExecution, Resource, ResourceLease, ResourceRepository,
-    ResourceStatus, StoredAttempt, StoredEvent, StoredJob,
+    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, ContainerCreate,
+    ContainerFinish, ContainerRecord, Database, DatabaseOptions, DeliveryRecord,
+    DeliveryRepository, EventRepository, ExecutionClaim, ExecutionOutcome, Family,
+    FamilyGenerationRepository, Generation, IntegrityCheck, JobAttemptRepository, JobDetail,
+    JobLogs, PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, RecoveredExecution,
+    Resource, ResourceLease, ResourceRepository, ResourceStatus, StoredAttempt, StoredEvent,
+    StoredJob,
 };
 pub use project::{
     PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,
