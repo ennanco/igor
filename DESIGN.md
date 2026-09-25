@@ -904,6 +904,51 @@ The initial systemd units should use restart-on-failure, deliberate shutdown
 semantics, and resource priority appropriate to each service. They must not
 hardcode a project path.
 
+The worker and supervisor are two user units backed by the same absolute,
+installed `igor` executable. Generate their contents from one deterministic
+renderer and treat binary paths and any configured XDG values as untrusted unit
+input: escape systemd argument syntax and specifiers, rather than interpolating
+raw paths into `ExecStart` or `Environment`. Do not bind units to the caller's
+current project or working directory. Keep install separate from enable and
+start; reinstalling identical units is idempotent. A failed install or reload
+must not silently destroy previously installed working units.
+
+Use `Restart=on-failure` for daemon crashes and a bounded stop interval long
+enough for the worker's cooperative shutdown and lease handoff. Do not apply
+experiment CPU, memory, or GPU limits to the worker unit. Give only the
+supervisor low CPU and I/O scheduling priority. Stopping a user service must
+leave recoverable active attempts available for reconciliation after restart;
+validate that behavior with an opt-in live user-manager test, while ordinary
+tests validate rendering and CLI behavior without a running systemd manager.
+Until direct attempts use independent transient units, the worker service must
+not use systemd's default whole-cgroup kill behavior: Process children must
+survive worker stop/restart for the persisted-identity recovery path to work.
+An opt-in live user-manager test verifies this survival across `systemctl --user`
+restart. Process-group reattachment cannot recover the final exit code after
+the original parent exits, so a subsequently completed attempt may be
+classified as `lost` even though its process finished. Transient per-attempt
+units should be evaluated for durable identity and authoritative completion;
+retain process groups for environments without a user manager.
+An initial `systemd-run --user` probe showed that completed successful units
+are unloaded immediately unless `--remain-after-exit` is set. Retained units
+expose `ExecMainStatus` and `InvocationID`, but require explicit cleanup after
+the terminal outcome has been committed; launching them safely also requires
+persisting their names before external creation and reconciling both sides of
+that boundary on worker restart.
+The optional `systemd_user_unit` process backend must reserve a unique,
+attempt-derived unit name durably before invoking `systemd-run --user` with
+`--remain-after-exit`. On recovery, inspect that exact name and its invocation
+identity; never start a replacement for an attempt that might already be
+running. Capture logs in Igor's attempt paths, clear the manager's ambient
+environment before passing explicitly allowed job values, and use systemd's
+reported result, exit code, or termination signal as the authoritative terminal
+outcome. Disable systemd-run argument environment expansion so literal dollar
+signs in job arguments are preserved. Stop or
+kill only the owned unit for cancellation and timeout. Persist the outcome and
+release leases before stopping/resetting the retained unit. If systemd is
+unavailable or a result is ambiguous, preserve ownership for reconciliation.
+The existing process-group backend stays the default and portable fallback.
+
 ## 22. Diagnostics And Maintenance
 
 `igor doctor` checks:

@@ -56,7 +56,7 @@ pub use persistence::{
     FamilyGenerationRepository, Generation, IntegrityCheck, JobAttemptRepository, JobDetail,
     JobLogs, PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, RecoveredExecution,
     Resource, ResourceLease, ResourceRepository, ResourceStatus, StoredAttempt, StoredEvent,
-    StoredJob,
+    StoredJob, UnitRecord, UnitReservation,
 };
 pub use project::{
     PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,

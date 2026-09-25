@@ -458,6 +458,7 @@ pub struct RecoveredExecution {
     pub claim: ExecutionClaim,
     pub process: Option<ProcessRecord>,
     pub container: Option<ContainerRecord>,
+    pub unit: Option<UnitRecord>,
     pub timeout_remaining: Option<Duration>,
 }
 
@@ -493,6 +494,32 @@ pub struct ContainerCreate {
     pub image: DockerImageIdentity,
     pub stdout_path: PathBuf,
     pub stderr_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnitReservation {
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct UnitRecord {
+    pub attempt_id: AttemptId,
+    pub job_id: JobId,
+    pub project_id: ProjectId,
+    pub unit_name: String,
+    pub state: String,
+    pub stdout_path: PathBuf,
+    pub stderr_path: PathBuf,
+    pub invocation_id: Option<String>,
+    pub result: Option<String>,
+    pub exit_code: Option<i32>,
+    pub term_signal: Option<i32>,
+    pub error: Option<String>,
+    pub finished_at: Option<String>,
+    pub removed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1363,6 +1390,300 @@ pub struct JobAttemptRepository<'a> {
 }
 
 impl JobAttemptRepository<'_> {
+    pub async fn reserve_unit(
+        &self,
+        claim: &ExecutionClaim,
+        reservation: &UnitReservation,
+    ) -> PersistenceResult<UnitRecord> {
+        if !matches!(
+            claim.attempt.spec.executor(),
+            ExecutorSpec::Process(spec)
+                if spec.isolation == crate::ProcessIsolation::SystemdUserUnit
+        ) {
+            return Err(PersistenceError::InvalidValue {
+                entity: "systemd unit execution",
+                value: "attempt does not use systemd user-unit isolation".into(),
+            });
+        }
+        let stdout = reservation.stdout_path.to_str();
+        let stderr = reservation.stderr_path.to_str();
+        if stdout.is_none_or(str::is_empty) || stderr.is_none_or(str::is_empty) {
+            return Err(PersistenceError::InvalidValue {
+                entity: "systemd unit output paths",
+                value: format!(
+                    "stdout {:?}, stderr {:?}",
+                    reservation.stdout_path, reservation.stderr_path
+                ),
+            });
+        }
+        let attempt_id = claim.attempt.spec.id();
+        let unit_name = format!("igor-job-{attempt_id}.service");
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin unit reservation", source))?;
+        if !lock_execution_scheduler(&mut transaction, "lock unit reservation").await? {
+            return Err(execution_resource_conflict());
+        }
+        validate_execution_claim_resources(&mut transaction, claim).await?;
+        let exact_resources: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM resource_leases
+             WHERE job_id = ? AND owner = ? AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               AND id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(claim.job.spec.id.to_string())
+        .bind(&claim.owner)
+        .bind(json(
+            &claim
+                .resource_leases
+                .iter()
+                .map(|lease| lease.id.to_string())
+                .collect::<Vec<_>>(),
+            "unit resource lease ids",
+        )?)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|source| db("validate unit resource leases", source))?;
+        if usize::try_from(exact_resources).ok() != Some(claim.resource_leases.len()) {
+            return Err(execution_resource_conflict());
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO attempt_units
+                 (attempt_id, job_id, project_id, unit_name, stdout_path, stderr_path)
+             SELECT ?, ?, ?, ?, ?, ?
+             WHERE EXISTS (
+                 SELECT 1 FROM jobs JOIN attempts ON attempts.job_id = jobs.id
+                 WHERE jobs.id = ? AND jobs.project_id = ? AND jobs.state = 'running'
+                   AND jobs.claim_id = ? AND jobs.claim_owner = ?
+                   AND jobs.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                   AND attempts.id = ? AND attempts.project_id = ? AND attempts.state = 'starting'
+             )",
+        )
+        .bind(attempt_id.to_string())
+        .bind(claim.job.spec.id.to_string())
+        .bind(claim.job.spec.project_id.to_string())
+        .bind(&unit_name)
+        .bind(stdout)
+        .bind(stderr)
+        .bind(claim.job.spec.id.to_string())
+        .bind(claim.job.spec.project_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .bind(attempt_id.to_string())
+        .bind(claim.job.spec.project_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| {
+            if matches!(&source, sqlx::Error::Database(error) if error.is_unique_violation()) {
+                PersistenceError::Conflict {
+                    entity: "attempt unit",
+                }
+            } else {
+                db("reserve attempt unit", source)
+            }
+        })?;
+        if inserted.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "execution claim",
+            });
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit unit reservation", source))?;
+        let row = sqlx::query(
+            "SELECT attempt_id, job_id, project_id, unit_name, state, stdout_path, stderr_path,
+                    invocation_id, result, exit_code, term_signal, error, finished_at, removed_at,
+                    created_at, updated_at
+             FROM attempt_units WHERE attempt_id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_one(&self.database.pool)
+        .await
+        .map_err(|source| db("load reserved attempt unit", source))?;
+        decode_unit(row)
+    }
+
+    pub async fn record_unit_started(
+        &self,
+        claim: &ExecutionClaim,
+        invocation_id: &str,
+    ) -> PersistenceResult<()> {
+        if invocation_id.len() != 32
+            || !invocation_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(PersistenceError::InvalidValue {
+                entity: "systemd invocation id",
+                value: invocation_id.into(),
+            });
+        }
+        if !matches!(
+            claim.attempt.spec.executor(),
+            ExecutorSpec::Process(spec)
+                if spec.isolation == crate::ProcessIsolation::SystemdUserUnit
+        ) {
+            return Err(PersistenceError::InvalidValue {
+                entity: "systemd unit execution",
+                value: "attempt does not use systemd user-unit isolation".into(),
+            });
+        }
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin unit start record", source))?;
+        if !lock_execution_scheduler(&mut transaction, "lock unit start record").await? {
+            return Err(execution_resource_conflict());
+        }
+        validate_execution_claim_resources(&mut transaction, claim).await?;
+        let attempt_id = claim.attempt.spec.id();
+        let updated = sqlx::query(
+            "UPDATE attempt_units SET state = 'started', invocation_id = ?,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE attempt_id = ? AND job_id = ? AND project_id = ? AND state = 'reserved'
+               AND EXISTS (SELECT 1 FROM jobs JOIN attempts ON attempts.job_id = jobs.id
+                 WHERE jobs.id = ? AND jobs.project_id = ? AND jobs.state = 'running'
+                   AND jobs.claim_id = ? AND jobs.claim_owner = ?
+                   AND jobs.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                   AND attempts.id = ? AND attempts.state = 'starting')",
+        )
+        .bind(invocation_id)
+        .bind(attempt_id.to_string())
+        .bind(claim.job.spec.id.to_string())
+        .bind(claim.job.spec.project_id.to_string())
+        .bind(claim.job.spec.id.to_string())
+        .bind(claim.job.spec.project_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .bind(attempt_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("record started unit", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "attempt unit",
+            });
+        }
+        let started = sqlx::query(
+            "UPDATE attempts SET state = 'running', started_at = COALESCE(started_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND job_id = ? AND project_id = ? AND state = 'starting'",
+        )
+        .bind(attempt_id.to_string()).bind(claim.job.spec.id.to_string())
+        .bind(claim.job.spec.project_id.to_string()).execute(&mut *transaction).await
+        .map_err(|source| db("transition started attempt", source))?;
+        if started.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "execution attempt",
+            });
+        }
+        let event = state_event(
+            EventKind::AttemptStateChanged,
+            "attempt",
+            &attempt_id.to_string(),
+            "running",
+            Some(claim.lease_id),
+            None,
+        )?;
+        insert_event(
+            &mut transaction,
+            claim.job.spec.project_id,
+            Some(claim.job.spec.id),
+            Some(attempt_id),
+            &event,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit started unit", source))?;
+        Ok(())
+    }
+
+    pub async fn unit_for_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<Option<UnitRecord>> {
+        let row = sqlx::query(
+            "SELECT attempt_id, job_id, project_id, unit_name, state, stdout_path, stderr_path,
+                    invocation_id, result, exit_code, term_signal, error, finished_at, removed_at,
+                    created_at, updated_at
+             FROM attempt_units WHERE attempt_id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(&self.database.pool)
+        .await
+        .map_err(|source| db("load attempt unit", source))?;
+        row.map(decode_unit).transpose()
+    }
+
+    pub async fn finish_unit_execution(
+        &self,
+        claim: &ExecutionClaim,
+        outcome: &ExecutionOutcome,
+        observed_invocation_id: Option<&str>,
+    ) -> PersistenceResult<()> {
+        if !matches!(claim.attempt.spec.executor(), ExecutorSpec::Process(spec) if spec.isolation == crate::ProcessIsolation::SystemdUserUnit)
+        {
+            return Err(PersistenceError::InvalidValue {
+                entity: "systemd unit execution",
+                value: "attempt does not use systemd user-unit isolation".into(),
+            });
+        }
+        validate_execution_outcome(outcome)?;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin unit execution finish", source))?;
+        let attempt_id = claim.attempt.spec.id();
+        let result = sqlx::query("UPDATE attempt_units SET state = 'finished', result = ?, exit_code = ?, term_signal = ?, error = ?, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE attempt_id = ? AND job_id = ? AND project_id = ? AND state IN ('reserved', 'started') AND (state != 'started' OR (invocation_id IS NOT NULL AND invocation_id = ?)) AND (state != 'reserved' OR ? != 'succeeded') AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id = ? AND jobs.project_id = ? AND jobs.state = 'running' AND jobs.claim_id = ? AND jobs.claim_owner = ? AND jobs.claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))")
+            .bind(outcome.state.as_str()).bind(outcome.exit_code).bind(outcome.term_signal).bind(&outcome.error)
+            .bind(attempt_id.to_string()).bind(claim.job.spec.id.to_string()).bind(claim.job.spec.project_id.to_string())
+            .bind(observed_invocation_id).bind(outcome.state.as_str()).bind(claim.job.spec.id.to_string())
+            .bind(claim.job.spec.project_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+            .execute(&mut *transaction).await.map_err(|source| db("record unit outcome", source))?;
+        if result.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "attempt unit",
+            });
+        }
+        let details = serde_json::json!({"exit_code": outcome.exit_code, "term_signal": outcome.term_signal, "error": outcome.error});
+        finish_execution_transaction(&mut transaction, claim, outcome, details).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit unit execution finish", source))?;
+        Ok(())
+    }
+
+    pub async fn record_unit_removed(
+        &self,
+        attempt_id: AttemptId,
+        unit_name: &str,
+    ) -> PersistenceResult<()> {
+        let result = sqlx::query("UPDATE attempt_units SET state = 'removed', removed_at = COALESCE(removed_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE attempt_id = ? AND unit_name = ? AND state IN ('finished', 'removed')")
+            .bind(attempt_id.to_string()).bind(unit_name).execute(&self.database.pool).await.map_err(|source| db("record unit removal", source))?;
+        if result.rows_affected() == 0 {
+            return Err(PersistenceError::Conflict {
+                entity: "unit removal",
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn units_pending_cleanup(&self) -> PersistenceResult<Vec<UnitRecord>> {
+        let rows = sqlx::query("SELECT attempt_id, job_id, project_id, unit_name, state, stdout_path, stderr_path, invocation_id, result, exit_code, term_signal, error, finished_at, removed_at, created_at, updated_at FROM attempt_units WHERE state = 'finished' ORDER BY finished_at, attempt_id")
+            .fetch_all(&self.database.pool).await.map_err(|source| db("list units pending cleanup", source))?;
+        rows.into_iter().map(decode_unit).collect()
+    }
+
     pub async fn submit(
         &self,
         job: &JobSpec,
@@ -1837,11 +2158,19 @@ impl JobAttemptRepository<'_> {
         })?;
         let attempt = decode_attempt(attempt_row)?;
         let existing_leases = execution_resource_leases(&mut transaction, job_id).await?;
+        let is_systemd_unit = matches!(
+            attempt.spec.executor(),
+            ExecutorSpec::Process(spec) if spec.isolation == crate::ProcessIsolation::SystemdUserUnit
+        );
         let (resource_leases, assigned_gpus) = if existing_leases.is_empty()
             && matches!(attempt.spec.executor(), ExecutorSpec::Docker(_))
         {
             return Err(PersistenceError::Conflict {
                 entity: "recovered Docker execution resources",
+            });
+        } else if existing_leases.is_empty() && is_systemd_unit {
+            return Err(PersistenceError::Conflict {
+                entity: "recovered execution resources",
             });
         } else if existing_leases.is_empty() {
             let inventory = scheduling_resources(&mut transaction).await?;
@@ -1910,12 +2239,28 @@ impl JobAttemptRepository<'_> {
         .await
         .map_err(|source| db("read recovered container", source))?;
         let container = container_row.map(decode_container).transpose()?;
+        let unit_row = sqlx::query(
+            "SELECT attempt_id, job_id, project_id, unit_name, state, stdout_path, stderr_path,
+                    invocation_id, result, exit_code, term_signal, error, finished_at, removed_at,
+                    created_at, updated_at
+             FROM attempt_units WHERE attempt_id = ?",
+        )
+        .bind(attempt.spec.id().to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("read recovered unit", source))?;
+        let unit = unit_row.map(decode_unit).transpose()?;
         if matches!(attempt.spec.executor(), ExecutorSpec::Docker(_)) && process.is_some() {
             return Err(PersistenceError::Conflict {
                 entity: "recovered executor identity",
             });
         }
         if !matches!(attempt.spec.executor(), ExecutorSpec::Docker(_)) && container.is_some() {
+            return Err(PersistenceError::Conflict {
+                entity: "recovered executor identity",
+            });
+        }
+        if unit.is_some() && (!is_systemd_unit || process.is_some()) {
             return Err(PersistenceError::Conflict {
                 entity: "recovered executor identity",
             });
@@ -1986,6 +2331,7 @@ impl JobAttemptRepository<'_> {
             },
             process,
             container,
+            unit,
             timeout_remaining,
         }))
     }
@@ -2392,6 +2738,35 @@ impl JobAttemptRepository<'_> {
             return Err(execution_resource_conflict());
         }
         let (identity_rows, identity_entity) = match claim.attempt.spec.executor() {
+            ExecutorSpec::Process(spec)
+                if spec.isolation == crate::ProcessIsolation::SystemdUserUnit =>
+            {
+                let result = sqlx::query(
+                    "UPDATE attempt_units SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                     WHERE attempt_id = ? AND job_id = ? AND project_id = ? AND state IN ('reserved', 'started')",
+                )
+                .bind(claim.attempt.spec.id().to_string())
+                .bind(claim.job.spec.id.to_string())
+                .bind(claim.job.spec.project_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| db("heartbeat attempt unit", source))?;
+                let rows = if result.rows_affected() == 1 {
+                    1
+                } else {
+                    let pre_identity: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM attempts WHERE id = ? AND job_id = ? AND project_id = ? AND state = 'starting' AND NOT EXISTS (SELECT 1 FROM attempt_units WHERE attempt_id = attempts.id))",
+                    )
+                    .bind(claim.attempt.spec.id().to_string())
+                    .bind(claim.job.spec.id.to_string())
+                    .bind(claim.job.spec.project_id.to_string())
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(|source| db("check pre-identity unit heartbeat", source))?;
+                    if pre_identity { 1 } else { 0 }
+                };
+                (rows, "attempt unit")
+            }
             ExecutorSpec::Process(_) => {
                 let result = sqlx::query(
                     "UPDATE attempt_processes SET
@@ -2907,13 +3282,15 @@ impl JobAttemptRepository<'_> {
     pub async fn logs_for_job(&self, job_id: JobId) -> PersistenceResult<JobLogs> {
         let row = sqlx::query(
             "SELECT jobs.state, attempts.id AS attempt_id,
-                    attempt_processes.stdout_path, attempt_processes.stderr_path
+                    COALESCE(attempt_units.stdout_path, attempt_processes.stdout_path) AS stdout_path,
+                    COALESCE(attempt_units.stderr_path, attempt_processes.stderr_path) AS stderr_path
              FROM jobs
              JOIN attempts ON attempts.id = (
                  SELECT id FROM attempts AS latest
                  WHERE latest.job_id = jobs.id ORDER BY sequence DESC LIMIT 1
              )
              LEFT JOIN attempt_processes ON attempt_processes.attempt_id = attempts.id
+             LEFT JOIN attempt_units ON attempt_units.attempt_id = attempts.id
              WHERE jobs.id = ?",
         )
         .bind(job_id.to_string())
@@ -3328,6 +3705,27 @@ fn decode_container(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<Container
         oom_killed: row.get("oom_killed"),
         error: row.get("error"),
         started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
+        removed_at: row.get("removed_at"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn decode_unit(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<UnitRecord> {
+    Ok(UnitRecord {
+        attempt_id: parse_id(row.get("attempt_id"), "unit attempt")?,
+        job_id: parse_id(row.get("job_id"), "unit job")?,
+        project_id: parse_id(row.get("project_id"), "unit project")?,
+        unit_name: row.get("unit_name"),
+        state: row.get("state"),
+        stdout_path: PathBuf::from(row.get::<String, _>("stdout_path")),
+        stderr_path: PathBuf::from(row.get::<String, _>("stderr_path")),
+        invocation_id: row.get("invocation_id"),
+        result: row.get("result"),
+        exit_code: row.get("exit_code"),
+        term_signal: row.get("term_signal"),
+        error: row.get("error"),
         finished_at: row.get("finished_at"),
         removed_at: row.get("removed_at"),
         created_at: row.get("created_at"),

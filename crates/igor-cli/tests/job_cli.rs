@@ -10,7 +10,7 @@ use std::{
 
 use igor_core::{
     AttemptId, AttemptState, ContainerRecord, Database, DockerContainerState, JobId, JobState,
-    ProcessRecord, TransitionState,
+    ProcessRecord, TransitionState, UnitRecord,
 };
 use nix::{
     sys::signal::{Signal, kill, killpg},
@@ -90,6 +90,58 @@ fn spawn_worker(home: &Path, project: &Path) -> Result<Worker, Box<dyn Error>> {
             .stderr(Stdio::null())
             .spawn()?,
     ))
+}
+
+fn spawn_systemd_worker(home: &Path, project: &Path, bus: &str) -> Result<Worker, Box<dyn Error>> {
+    Ok(Worker(
+        command(home, project)
+            .env("DBUS_SESSION_BUS_ADDRESS", bus)
+            .arg("worker")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    ))
+}
+
+fn spawn_fake_systemd_worker(
+    home: &Path,
+    project: &Path,
+    bin: &Path,
+    state: &Path,
+) -> Result<Worker, Box<dyn Error>> {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::iter::once(bin.to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )?;
+    Ok(Worker(
+        command(home, project)
+            .env("PATH", path)
+            .env("IGOR_FAKE_UNIT_STATE", state)
+            .arg("worker")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    ))
+}
+
+struct LiveUnitCleanup {
+    bus: String,
+    units: Vec<String>,
+}
+
+impl Drop for LiveUnitCleanup {
+    fn drop(&mut self) {
+        for unit in &self.units {
+            for operation in ["stop", "reset-failed"] {
+                let _ = Command::new("systemctl")
+                    .env("DBUS_SESSION_BUS_ADDRESS", &self.bus)
+                    .args(["--user", operation, "--", unit])
+                    .output();
+            }
+        }
+    }
 }
 
 fn spawn_docker_worker(home: &Path, project: &Path) -> Result<Worker, Box<dyn Error>> {
@@ -2791,5 +2843,359 @@ fn logs_follow_and_preserve_large_and_binary_output() -> TestResult {
     let expected: Vec<u8> = [0, 1, 128, 255].into_iter().cycle().take(1_024).collect();
     assert_eq!(logs.stdout, expected);
     assert_eq!(logs.stderr, expected);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_transient_unit_completion_and_restart_are_opt_in() -> TestResult {
+    if std::env::var("IGOR_RUN_SYSTEMD_TESTS").as_deref() != Ok("1") {
+        return Ok(());
+    }
+    let bus = std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .or_else(|_| std::env::var("XDG_RUNTIME_DIR").map(|dir| format!("unix:path={dir}/bus")))?;
+    if !Command::new("systemctl")
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+        .args(["--user", "is-system-running"])
+        .output()?
+        .status
+        .success()
+    {
+        return Ok(());
+    }
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    fixture.worker.stop()?;
+    fixture.worker = spawn_systemd_worker(&fixture.home, &fixture.project, &bus)?;
+    fixture.wait_until_worker_ready("systemd")?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let mut cleanup = LiveUnitCleanup {
+        bus,
+        units: Vec::new(),
+    };
+    for (name, exit, restart, cancel, timed) in [
+        ("success", 0, false, false, false),
+        ("failure", 7, false, false, false),
+        ("signal", 0, false, false, false),
+        ("restart", 0, true, false, false),
+        ("cancel", 0, false, true, false),
+        ("timeout", 0, false, false, true),
+    ] {
+        let job_file = fixture._temporary.path().join(format!("unit-{name}.toml"));
+        let script = if cancel || timed {
+            "sleep 30".to_owned()
+        } else if name == "signal" {
+            "kill -TERM $$".to_owned()
+        } else if restart {
+            "sleep 2; printf 'recovered\\n'".to_owned()
+        } else {
+            format!("printf 'unit-{name}\\n'; exit {exit}")
+        };
+        fs::write(
+            &job_file,
+            format!(
+                "schema_version = 1\nname = 'unit-{name}'\n[execution]\nprogram = '/bin/sh'\nargs = ['-c', {}]\n[executor]\nkind = 'process'\n[executor.settings]\nisolation = 'systemd_user_unit'\n[resources]\nmode = 'shared'\n{}",
+                serde_json::to_string(&script)?,
+                if timed { "timeout_seconds = 1\n" } else { "" }
+            ),
+        )?;
+        let submitted = output_json(
+            fixture
+                .run()
+                .args([
+                    "submit",
+                    "--json",
+                    "--file",
+                    job_file.to_str().ok_or("non-UTF-8 unit job")?,
+                ])
+                .output()?,
+        )?;
+        let job_id: JobId = submitted["spec"]["id"]
+            .as_str()
+            .ok_or("missing unit job id")?
+            .parse()?;
+        let attempt_id = database
+            .jobs()
+            .detail(job_id)
+            .await?
+            .ok_or("missing unit job")?
+            .attempts
+            .first()
+            .ok_or("missing unit attempt")?
+            .spec
+            .id();
+        cleanup.units.push(format!("igor-job-{attempt_id}.service"));
+        if restart || cancel {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if database
+                        .jobs()
+                        .unit_for_attempt(attempt_id)
+                        .await?
+                        .is_some_and(|unit| unit.state == "started")
+                    {
+                        return Ok::<_, Box<dyn Error>>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await??;
+            if restart {
+                fixture.worker.stop()?;
+                fixture.worker =
+                    spawn_systemd_worker(&fixture.home, &fixture.project, &cleanup.bus)?;
+                fixture.wait_until_worker_ready("recovered systemd")?;
+            } else {
+                let output = fixture
+                    .run()
+                    .args(["cancel", &job_id.to_string(), "--grace-seconds", "0"])
+                    .output()?;
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        let waited = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let detail = database
+                    .jobs()
+                    .detail(job_id)
+                    .await?
+                    .ok_or("missing systemd job")?;
+                if detail.job.state.is_terminal() {
+                    return Ok::<_, Box<dyn Error>>(detail);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let detail = match waited {
+            Ok(detail) => detail?,
+            Err(_) => {
+                let unit = database.jobs().unit_for_attempt(attempt_id).await?;
+                let status = Command::new("systemctl")
+                    .env("DBUS_SESSION_BUS_ADDRESS", &cleanup.bus)
+                    .args([
+                        "--user",
+                        "show",
+                        "--",
+                        cleanup.units.last().ok_or("unit missing")?,
+                    ])
+                    .output()?;
+                return Err(format!(
+                    "unit {name} did not finish: persisted {unit:?}; systemd {}",
+                    String::from_utf8_lossy(&status.stdout)
+                )
+                .into());
+            }
+        };
+        assert_eq!(
+            detail.job.state,
+            if cancel {
+                JobState::Cancelled
+            } else if timed || exit != 0 || name == "signal" {
+                JobState::Failed
+            } else {
+                JobState::Succeeded
+            }
+        );
+        let unit: UnitRecord = database
+            .jobs()
+            .unit_for_attempt(attempt_id)
+            .await?
+            .ok_or("missing unit record")?;
+        assert!(unit.invocation_id.is_some());
+        if name == "signal" {
+            assert_eq!(
+                unit.term_signal,
+                Some(15),
+                "{unit:?}; stderr {:?}",
+                fs::read_to_string(&unit.stderr_path)?
+            );
+            assert_eq!(unit.exit_code, None);
+        } else if !cancel && !timed {
+            assert_eq!(unit.exit_code, Some(exit));
+            assert_eq!(
+                fs::read_to_string(&unit.stdout_path)?,
+                if restart {
+                    "recovered\n".to_owned()
+                } else {
+                    format!("unit-{name}\n")
+                }
+            );
+        }
+        let leases: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+                .bind(job_id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(leases, 0);
+        let removed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if database
+                    .jobs()
+                    .unit_for_attempt(attempt_id)
+                    .await?
+                    .is_some_and(|unit| unit.state == "removed")
+                {
+                    return Ok::<_, Box<dyn Error>>(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        if removed.is_err() {
+            let unit = database.jobs().unit_for_attempt(attempt_id).await?;
+            let status = Command::new("systemctl")
+                .env("DBUS_SESSION_BUS_ADDRESS", &cleanup.bus)
+                .args([
+                    "--user",
+                    "show",
+                    "--",
+                    cleanup.units.last().ok_or("unit missing")?,
+                ])
+                .output()?;
+            return Err(format!(
+                "unit {name} was not cleaned: persisted {unit:?}; systemd {}",
+                String::from_utf8_lossy(&status.stdout)
+            )
+            .into());
+        }
+        removed??;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ambiguous_unit_status_survives_restart_without_relaunch() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let bin = fixture._temporary.path().join("fake-systemd-bin");
+    let state = fixture._temporary.path().join("fake-systemd-state");
+    fs::create_dir(&bin)?;
+    fs::create_dir(&state)?;
+    let run = bin.join("systemd-run");
+    fs::write(
+        &run,
+        r#"#!/bin/sh
+set -eu
+for arg in "$@"; do case "$arg" in --unit=*) unit="${arg#--unit=}";; esac; done
+printf '%s\n' "$unit" >> "$IGOR_FAKE_UNIT_STATE/launches"
+printf 'Running as unit: %s; invocation ID: 0123456789abcdef0123456789abcdef\n' "$unit"
+"#,
+    )?;
+    let ctl = bin.join("systemctl");
+    fs::write(
+        &ctl,
+        r#"#!/bin/sh
+set -eu
+case "$2" in
+  show)
+    if [ -f "$IGOR_FAKE_UNIT_STATE/stopped" ]; then
+      printf 'Result=success\nExecMainCode=0\nExecMainStatus=0\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nInvocationID=\n'
+    elif [ -f "$IGOR_FAKE_UNIT_STATE/finished" ]; then
+      printf 'Result=success\nExecMainCode=1\nExecMainStatus=0\nLoadState=loaded\nActiveState=active\nSubState=exited\nInvocationID=0123456789abcdef0123456789abcdef\n'
+    else
+      printf 'LoadState=loaded\nActiveState=activating\nSubState=start\nResult=\nExecMainCode=0\nExecMainStatus=0\nInvocationID=0123456789abcdef0123456789abcdef\n'
+    fi ;;
+  stop) touch "$IGOR_FAKE_UNIT_STATE/stopped" ;;
+  reset-failed) : ;;
+  *) exit 64 ;;
+esac
+"#,
+    )?;
+    for file in [&run, &ctl] {
+        fs::set_permissions(file, fs::Permissions::from_mode(0o700))?;
+    }
+    fixture.worker.stop()?;
+    fixture.worker = spawn_fake_systemd_worker(&fixture.home, &fixture.project, &bin, &state)?;
+    fixture.wait_until_worker_ready("fake systemd")?;
+    let job_file = fixture._temporary.path().join("ambiguous-unit.toml");
+    fs::write(
+        &job_file,
+        "schema_version = 1\nname = 'ambiguous unit'\n[execution]\nprogram = '/bin/true'\n[executor]\nkind = 'process'\n[executor.settings]\nisolation = 'systemd_user_unit'\n[resources]\nmode = 'shared'\n",
+    )?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--json",
+                "--file",
+                job_file.to_str().ok_or("non-UTF-8 unit fixture")?,
+            ])
+            .output()?,
+    )?;
+    let job_id: JobId = submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing unit job id")?
+        .parse()?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let attempt_id = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing unit job")?
+        .attempts[0]
+        .spec
+        .id();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if database
+                .jobs()
+                .unit_for_attempt(attempt_id)
+                .await?
+                .is_some_and(|unit| unit.state == "started")
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        database
+            .jobs()
+            .detail(job_id)
+            .await?
+            .ok_or("missing unit job")?
+            .job
+            .state,
+        JobState::Running
+    );
+    fixture.worker.stop()?;
+    fs::write(state.join("finished"), b"")?;
+    fixture.worker = spawn_fake_systemd_worker(&fixture.home, &fixture.project, &bin, &state)?;
+    fixture.wait_until_worker_ready("recovered fake systemd")?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if database
+                .jobs()
+                .unit_for_attempt(attempt_id)
+                .await?
+                .is_some_and(|unit| unit.state == "removed")
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        database
+            .jobs()
+            .detail(job_id)
+            .await?
+            .ok_or("missing recovered unit job")?
+            .job
+            .state,
+        JobState::Succeeded
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("launches"))?.lines().count(),
+        1
+    );
     Ok(())
 }

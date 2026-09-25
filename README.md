@@ -200,6 +200,34 @@ process; strict process limits will arrive with the planned `systemd`
 integration. CPU and memory remain unrestricted unless a smaller scheduling
 capacity is configured.
 
+## User Services
+
+Install the worker and supervisor units from an installed Igor binary:
+
+```bash
+igor service install --user
+igor service install --user --enable --start
+igor service status --json
+igor service logs --follow
+```
+
+Installation alone neither enables nor starts the services. `igor service
+enable [--now]`, `disable [--now]`, `start`, `stop`, and `restart` manage both
+units. Repeating an unchanged installation does not reload systemd. The worker
+unit leaves active Process jobs alive on stop so a restarted worker can
+reconcile them; the supervisor runs at low CPU and I/O priority. Commands use
+`systemd --user` and require a running user manager; no `sudo` is used.
+`igor service uninstall --user` removes the managed units after confirmation
+while preserving Igor's binary, configuration, database, logs, and history.
+On restart, Process jobs remain alive and the worker reattaches to them. If
+such a job finishes after its original worker exits, the process-group backend
+cannot read its exit status and may record it as `lost`. For attempts requiring
+authoritative exit status after a restart, set `executor.kind = "process"` and
+`executor.settings.isolation = "systemd_user_unit"` in the job file. This
+optional backend requires a running user manager, reserves each unit before
+launch, retains its status through recovery, and cleans it after finalization.
+The default `process_group` backend remains available without systemd.
+
 ## Development
 
 ```bash
@@ -224,6 +252,16 @@ cargo test -p igor-cli --test job_cli \
 The test prints an explicit skip reason when opt-in is disabled, the CLI or
 daemon is unavailable, the image is absent, or the image has no `/bin/sh` or
 canonical repository digest.
+
+The live user-systemd test is also opt-in. It requires a running user manager,
+skips if Igor units or active sockets already exist, and removes the disposable
+units after testing install, enable, restart with an active Process job, disable,
+and uninstall:
+
+```bash
+IGOR_RUN_SYSTEMD_TESTS=1 cargo test -p igor-cli --test service_cli \
+  live_user_systemd_lifecycle_is_opt_in -- --nocapture
+```
 
 Inspect the CLI:
 

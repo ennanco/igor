@@ -15,14 +15,16 @@ use igor_core::{
     AttemptState, ContainerCreate, ContainerFinish, ContainerRecord, Database, DockerCommand,
     DockerCommandPlanner, DockerContainerInspection, DockerContainerState, DockerIdentity,
     DockerRecoveryIdentity, EnvironmentInheritance, ExecutionClaim, ExecutionOutcome, ExecutorSpec,
-    ProcessIsolation, ProcessRecord, ProcessStart, RecoveredExecution, RuntimePaths,
-    environment_variable_is_sensitive, validate_docker_mount_sources,
+    ProcessIsolation, ProcessRecord, ProcessStart, RecoveredExecution, RuntimePaths, UnitRecord,
+    UnitReservation, environment_variable_is_sensitive, validate_docker_mount_sources,
 };
 use nix::{
     sys::signal::{Signal, killpg},
     unistd::Pid,
 };
 use tokio::{process::Command, sync::watch, time};
+
+use crate::systemd::{self, PlannedCommand, UnitOutcome};
 
 const CLAIM_DURATION: Duration = Duration::from_secs(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -103,6 +105,11 @@ async fn reconcile(
         ExecutorSpec::Docker(_)
     ) {
         supervise_recovered_docker(database, paths, recovered, shutdown).await;
+        return;
+    }
+    if matches!(recovered.claim.attempt.spec.executor(), ExecutorSpec::Process(spec) if spec.isolation == ProcessIsolation::SystemdUserUnit)
+    {
+        supervise_recovered_unit(database, recovered, shutdown).await;
         return;
     }
     let validation_started = time::Instant::now();
@@ -762,8 +769,413 @@ async fn execute(
     shutdown: &mut watch::Receiver<bool>,
 ) {
     match claim.attempt.spec.executor() {
+        ExecutorSpec::Process(spec) if spec.isolation == ProcessIsolation::SystemdUserUnit => {
+            execute_unit(database, paths, claim, shutdown).await;
+        }
         ExecutorSpec::Process(_) => execute_process(database, paths, claim, shutdown).await,
         ExecutorSpec::Docker(_) => execute_docker(database, paths, claim, shutdown).await,
+    }
+}
+
+// The reservation is the launch boundary: once it exists, neither a failed CLI
+// response nor a worker restart is permission to launch this attempt again.
+async fn execute_unit(
+    database: &Database,
+    paths: &RuntimePaths,
+    claim: &ExecutionClaim,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let command = claim.attempt.spec.command();
+    let (stdout_path, stderr_path) =
+        match prepare_logs(&paths.log_dir, &claim.attempt.spec.id().to_string()) {
+            Ok(paths) => paths,
+            Err(error) => {
+                finish_launch_failure(
+                    database,
+                    claim,
+                    &format!("cannot prepare unit logs: {error}"),
+                )
+                .await;
+                return;
+            }
+        };
+    for path in [&stdout_path, &stderr_path] {
+        if let Err(error) = open_log(path) {
+            finish_launch_failure(database, claim, &format!("cannot create unit log: {error}"))
+                .await;
+            return;
+        }
+    }
+    let mut environment_command = Command::new(&command.program);
+    if let Err(error) = configure_execution_environment(
+        &mut environment_command,
+        &command.environment,
+        &claim.assigned_gpus,
+    ) {
+        finish_launch_failure(database, claim, &error.to_string()).await;
+        return;
+    }
+    let mut environment = BTreeMap::new();
+    for (key, value) in environment_command.as_std().get_envs() {
+        if let Some(value) = value {
+            let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+                finish_launch_failure(
+                    database,
+                    claim,
+                    "unit environment contains non-UTF-8 values",
+                )
+                .await;
+                return;
+            };
+            environment.insert(key.to_owned(), value.to_owned());
+        }
+    }
+    let unit_name = match systemd::unit_name(&claim.attempt.spec.id().to_string()) {
+        Ok(name) => name,
+        Err(error) => {
+            finish_launch_failure(database, claim, &error.to_string()).await;
+            return;
+        }
+    };
+    let planned = match systemd::run(
+        &unit_name,
+        &command.cwd,
+        &stdout_path,
+        &stderr_path,
+        &environment,
+        &command.program,
+        &command.args,
+    ) {
+        Ok(planned) => planned,
+        Err(error) => {
+            finish_launch_failure(database, claim, &error.to_string()).await;
+            return;
+        }
+    };
+    let unit = match database
+        .jobs()
+        .reserve_unit(
+            claim,
+            &UnitReservation {
+                stdout_path,
+                stderr_path,
+            },
+        )
+        .await
+    {
+        Ok(unit) => unit,
+        Err(error) => {
+            tracing::error!(%error, "cannot reserve unit before launch");
+            return;
+        }
+    };
+    // A cancellation arriving before the external call must not launch a job.
+    match database.jobs().cancellation_grace(claim).await {
+        Ok(Some(_)) => {
+            finish_unit(
+                database,
+                claim,
+                &unit,
+                &unit_outcome(
+                    AttemptState::Cancelled,
+                    None,
+                    None,
+                    Some("execution cancelled before launch".into()),
+                ),
+                None,
+            )
+            .await;
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, "cannot inspect pre-launch cancellation");
+            return;
+        }
+    }
+    let launch = unit_command(&planned, database, Some(claim), shutdown).await;
+    if let Ok(ref output) = launch
+        && output.status.success()
+        && let Some(invocation) = systemd::parse_launch(&output.stdout, &unit.unit_name)
+    {
+        if let Err(error) = database
+            .jobs()
+            .record_unit_started(claim, &invocation)
+            .await
+        {
+            tracing::error!(%error, "cannot persist launched unit invocation");
+            return;
+        }
+        supervise_unit(
+            database,
+            claim,
+            &unit,
+            Some(invocation),
+            claim
+                .attempt
+                .spec
+                .resources()
+                .timeout_seconds
+                .map(Duration::from_secs),
+            shutdown,
+        )
+        .await;
+        return;
+    }
+    // A systemd-run error can occur after creation: inspect the reserved name
+    // instead of reporting a launch failure or starting another unit.
+    tracing::warn!(unit = %unit.unit_name, "unit launch not confirmed; reconciling reserved identity");
+    supervise_unit(
+        database,
+        claim,
+        &unit,
+        None,
+        claim
+            .attempt
+            .spec
+            .resources()
+            .timeout_seconds
+            .map(Duration::from_secs),
+        shutdown,
+    )
+    .await;
+}
+
+async fn supervise_recovered_unit(
+    database: &Database,
+    recovered: RecoveredExecution,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let claim = recovered.claim;
+    let Some(unit) = recovered.unit else {
+        finish_lost(
+            database,
+            &claim,
+            "worker restarted before unit identity was reserved",
+        )
+        .await;
+        return;
+    };
+    if systemd::unit_name(&claim.attempt.spec.id().to_string()).as_deref() != Ok(&unit.unit_name) {
+        tracing::error!(unit = %unit.unit_name, "recovered unit name does not match attempt");
+        return;
+    }
+    supervise_unit(
+        database,
+        &claim,
+        &unit,
+        unit.invocation_id.clone(),
+        recovered.timeout_remaining.or_else(|| {
+            claim
+                .attempt
+                .spec
+                .resources()
+                .timeout_seconds
+                .map(Duration::from_secs)
+        }),
+        shutdown,
+    )
+    .await;
+}
+
+async fn unit_command(
+    planned: &PlannedCommand,
+    database: &Database,
+    claim: Option<&ExecutionClaim>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<std::process::Output, String> {
+    let mut command = Command::new(planned.program);
+    command
+        .args(&planned.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    let output = child.wait_with_output();
+    tokio::pin!(output);
+    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let deadline = time::sleep(CLAIM_DURATION);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            result = &mut output => return result.map_err(|error| error.to_string()),
+            () = &mut deadline => return Err("systemd command timed out".into()),
+            _ = shutdown.changed() => {
+                if let Some(claim) = claim { release_for_restart(database, claim).await; }
+                return Err("worker shutdown".into());
+            }
+            _ = heartbeat.tick(), if claim.is_some() => {
+                if let Some(claim) = claim {
+                    database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await
+                        .map_err(|error| format!("unit heartbeat failed: {error}"))?;
+                }
+            }
+        }
+    }
+}
+
+async fn inspect_unit(
+    database: &Database,
+    claim: &ExecutionClaim,
+    unit: &UnitRecord,
+    invocation: Option<&str>,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<systemd::UnitStatus> {
+    let planned = systemd::show(&unit.unit_name).ok()?;
+    let output = match unit_command(&planned, database, Some(claim), shutdown).await {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            tracing::warn!(unit = %unit.unit_name, error = %String::from_utf8_lossy(&output.stderr), "cannot inspect unit");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(%error, unit = %unit.unit_name, "cannot inspect unit");
+            return None;
+        }
+    };
+    Some(match invocation {
+        Some(invocation) => systemd::parse_status(&output.stdout, invocation),
+        None => systemd::parse_unclaimed_status(&output.stdout),
+    })
+}
+
+async fn finish_unit(
+    database: &Database,
+    claim: &ExecutionClaim,
+    unit: &UnitRecord,
+    outcome: &ExecutionOutcome,
+    invocation: Option<&str>,
+) {
+    if let Err(error) = database
+        .jobs()
+        .finish_unit_execution(claim, outcome, invocation)
+        .await
+    {
+        tracing::error!(%error, unit = %unit.unit_name, "cannot persist unit result");
+    }
+}
+
+fn unit_outcome(
+    state: AttemptState,
+    exit_code: Option<i32>,
+    term_signal: Option<i32>,
+    error: Option<String>,
+) -> ExecutionOutcome {
+    ExecutionOutcome {
+        state,
+        exit_code,
+        term_signal,
+        error,
+    }
+}
+
+async fn supervise_unit(
+    database: &Database,
+    claim: &ExecutionClaim,
+    unit: &UnitRecord,
+    mut invocation: Option<String>,
+    timeout_remaining: Option<Duration>,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let mut poll = time::interval(CANCELLATION_INTERVAL);
+    poll.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    let timeout = timeout_remaining.map(|remaining| time::Instant::now() + remaining);
+    let mut interruption: Option<(AttemptState, String)> = None;
+    let mut stop_deadline = None;
+    let mut missing_since = None;
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                let Some(status) = inspect_unit(database, claim, unit, invocation.as_deref(), shutdown).await else { continue };
+                if invocation.is_none() && let Some(id) = status.invocation_id.clone() {
+                    if let Err(error) = database.jobs().record_unit_started(claim, &id).await {
+                        tracing::error!(%error, "cannot persist recovered unit invocation");
+                        return;
+                    }
+                    invocation = Some(id);
+                }
+                match status.outcome {
+                    UnitOutcome::Exited { status, .. } => {
+                        if let Some((state, reason)) = interruption {
+                            finish_unit(database, claim, unit, &unit_outcome(state, Some(status), None, Some(reason)), invocation.as_deref()).await;
+                        } else {
+                            let state = if status == 0 { AttemptState::Succeeded } else { AttemptState::Failed };
+                            finish_unit(database, claim, unit, &unit_outcome(state, Some(status), None, None), invocation.as_deref()).await;
+                        }
+                        return;
+                    }
+                    UnitOutcome::Signaled { signal, .. } => {
+                        let (state, error) = interruption.map_or((AttemptState::Failed, None), |(state, reason)| (state, Some(reason)));
+                        finish_unit(database, claim, unit, &unit_outcome(state, None, Some(signal), error), invocation.as_deref()).await;
+                        return;
+                    }
+                    UnitOutcome::Missing => {
+                        if !missing_since.is_some_and(|since: time::Instant| since.elapsed() >= Duration::from_secs(1)) {
+                            missing_since.get_or_insert_with(time::Instant::now);
+                            continue;
+                        }
+                        let (state, reason) = interruption.unwrap_or((AttemptState::Lost, "reserved systemd unit is missing".into()));
+                        finish_unit(database, claim, unit, &unit_outcome(state, None, None, Some(reason)), invocation.as_deref()).await;
+                        return;
+                    }
+                    UnitOutcome::Running { .. } => {}
+                    UnitOutcome::Indeterminate if interruption.is_none() || status.invocation_id.as_deref() != invocation.as_deref() || invocation.is_none() => continue,
+                    UnitOutcome::Indeterminate => {}
+                }
+                missing_since = None;
+                if interruption.is_some() && stop_deadline.is_some_and(|deadline| time::Instant::now() >= deadline) {
+                    if let Ok(kill) = systemd::signal(&unit.unit_name, "SIGKILL") {
+                        let _ = unit_command(&kill, database, Some(claim), shutdown).await;
+                    }
+                    stop_deadline = None;
+                }
+                if matches!(interruption, Some((AttemptState::Cancelled, _))) && stop_deadline.is_some()
+                    && let Ok(Some(remaining)) = database.jobs().cancellation_grace(claim).await {
+                    let deadline = time::Instant::now() + remaining;
+                    stop_deadline = stop_deadline.map(|current| current.min(deadline));
+                }
+                if interruption.is_some() && stop_deadline.is_none() {
+                    if let Ok(stop) = systemd::stop(&unit.unit_name) {
+                        let _ = unit_command(&stop, database, Some(claim), shutdown).await;
+                    }
+                    continue;
+                }
+                if interruption.is_none() {
+                    let cancel = database.jobs().cancellation_grace(claim).await;
+                    let action = match cancel {
+                        Ok(Some(grace)) => Some((AttemptState::Cancelled, "execution cancelled".to_owned(), grace)),
+                        Ok(None) if timeout.is_some_and(|deadline| time::Instant::now() >= deadline) =>
+                            Some((AttemptState::Failed, "configured execution timeout elapsed".to_owned(), Duration::ZERO)),
+                        Ok(None) => None,
+                        Err(error) => { tracing::error!(%error, "cannot read unit cancellation"); None }
+                    };
+                    if let Some((state, reason, grace)) = action
+                        && let Ok(planned) = systemd::signal(&unit.unit_name, "SIGTERM") {
+                            match unit_command(&planned, database, Some(claim), shutdown).await {
+                                Ok(output) if output.status.success() => {
+                                    interruption = Some((state, reason));
+                                    stop_deadline = Some(time::Instant::now() + grace);
+                                }
+                                other => tracing::warn!(unit = %unit.unit_name, ?other, "unit signal was not confirmed"),
+                            }
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                if let Err(error) = database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await {
+                    tracing::error!(%error, unit = %unit.unit_name, "unit heartbeat failed");
+                    return;
+                }
+            }
+            _ = shutdown.changed() => {
+                release_for_restart(database, claim).await;
+                return;
+            }
+        }
     }
 }
 
@@ -1233,6 +1645,7 @@ async fn docker_cleanup(
 }
 
 async fn cleanup_pending(database: &Database) {
+    cleanup_pending_units(database).await;
     let pending = match database.jobs().containers_pending_cleanup().await {
         Ok(pending) => pending,
         Err(error) => {
@@ -1273,6 +1686,94 @@ async fn cleanup_pending(database: &Database) {
                 .await
         {
             tracing::error!(%error, container_id = %container.container_id, "cannot persist Docker cleanup");
+        }
+    }
+}
+
+async fn cleanup_pending_units(database: &Database) {
+    let pending = match database.jobs().units_pending_cleanup().await {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::error!(%error, "cannot list units pending cleanup");
+            return;
+        }
+    };
+    let (_sender, mut shutdown) = watch::channel(false);
+    for unit in pending {
+        if systemd::unit_name(&unit.attempt_id.to_string()).as_deref() != Ok(&unit.unit_name) {
+            tracing::error!(unit = %unit.unit_name, "unit cleanup identity mismatch");
+            continue;
+        }
+        let Ok(show) = systemd::show(&unit.unit_name) else {
+            continue;
+        };
+        let Ok(output) = unit_command(&show, database, None, &mut shutdown).await else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let status = match unit.invocation_id.as_deref() {
+            Some(id) => systemd::parse_status(&output.stdout, id),
+            None => systemd::parse_unclaimed_status(&output.stdout),
+        };
+        if matches!(
+            status.outcome,
+            UnitOutcome::Indeterminate | UnitOutcome::Running { .. }
+        ) {
+            continue;
+        }
+        let mut missing = matches!(status.outcome, UnitOutcome::Missing);
+        if !missing {
+            // A reserved unit without a recorded invocation can only be cleaned
+            // after it is observed missing. Otherwise its origin is ambiguous.
+            if unit.invocation_id.is_none() {
+                continue;
+            }
+            let Ok(stop) = systemd::stop(&unit.unit_name) else {
+                continue;
+            };
+            if !matches!(unit_command(&stop, database, None, &mut shutdown).await, Ok(output) if output.status.success())
+            {
+                continue;
+            }
+            let Ok(output) = unit_command(&show, database, None, &mut shutdown).await else {
+                continue;
+            };
+            if !output.status.success() {
+                continue;
+            }
+            missing = matches!(
+                systemd::parse_unclaimed_status(&output.stdout).outcome,
+                UnitOutcome::Missing
+            );
+        }
+        if !missing {
+            let Ok(reset) = systemd::cleanup(&unit.unit_name) else {
+                continue;
+            };
+            if !matches!(unit_command(&reset, database, None, &mut shutdown).await, Ok(output) if output.status.success())
+            {
+                continue;
+            }
+        }
+        let Ok(output) = unit_command(&show, database, None, &mut shutdown).await else {
+            continue;
+        };
+        if !output.status.success()
+            || !matches!(
+                systemd::parse_unclaimed_status(&output.stdout).outcome,
+                UnitOutcome::Missing
+            )
+        {
+            continue;
+        }
+        if let Err(error) = database
+            .jobs()
+            .record_unit_removed(unit.attempt_id, &unit.unit_name)
+            .await
+        {
+            tracing::error!(%error, unit = %unit.unit_name, "cannot persist unit cleanup");
         }
     }
 }

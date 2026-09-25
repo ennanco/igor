@@ -1,3 +1,5 @@
+mod service;
+
 use std::{
     fs::{self, File},
     io::{self, Seek, SeekFrom, Write},
@@ -28,6 +30,7 @@ const EXIT_NOT_FOUND: u8 = 8;
 const EXIT_CONFLICT: u8 = 9;
 const USER_SERVICE_NAMES: [&str; 2] = ["igor-worker.service", "igor-supervisor.service"];
 const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(30);
+const JOURNALCTL_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -276,6 +279,44 @@ enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
+    /// Install Igor's user service units without enabling or starting them.
+    Install {
+        /// Explicitly install user services; system services are never modified.
+        #[arg(long, required = true)]
+        user: bool,
+        /// Enable the installed user services at login.
+        #[arg(long)]
+        enable: bool,
+        /// Start the installed user services immediately.
+        #[arg(long)]
+        start: bool,
+    },
+    /// Enable Igor's installed user services.
+    Enable {
+        #[arg(long)]
+        now: bool,
+    },
+    /// Disable Igor's installed user services.
+    Disable {
+        #[arg(long)]
+        now: bool,
+    },
+    /// Start Igor's installed user services.
+    Start,
+    /// Stop Igor's installed user services.
+    Stop,
+    /// Restart Igor's installed user services.
+    Restart,
+    /// Show load, active, and enablement state for Igor's user services.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show logs from Igor's user services.
+    Logs {
+        #[arg(long)]
+        follow: bool,
+    },
     /// Stop and remove Igor's user service units.
     Uninstall {
         /// Explicitly select user services; system services are never modified.
@@ -382,6 +423,26 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Command::Service { command } => match command {
+            ServiceCommand::Install {
+                user: _,
+                enable,
+                start,
+            } => {
+                install_user_services().await?;
+                if enable {
+                    manage_user_services("enable", false).await?;
+                }
+                if start {
+                    manage_user_services("start", false).await?;
+                }
+            }
+            ServiceCommand::Enable { now } => manage_user_services("enable", now).await?,
+            ServiceCommand::Disable { now } => manage_user_services("disable", now).await?,
+            ServiceCommand::Start => manage_user_services("start", false).await?,
+            ServiceCommand::Stop => manage_user_services("stop", false).await?,
+            ServiceCommand::Restart => manage_user_services("restart", false).await?,
+            ServiceCommand::Status { json } => show_service_status(json).await?,
+            ServiceCommand::Logs { follow } => show_service_logs(follow).await?,
             ServiceCommand::Uninstall { user: _, yes } => {
                 uninstall_user_services(yes).await?;
             }
@@ -561,6 +622,248 @@ async fn run() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn install_user_services() -> anyhow::Result<()> {
+    let directory = user_service_directory()?;
+    let binary = std::env::current_exe()?.canonicalize()?;
+    let xdg = service::XdgDirectories {
+        config: absolute_xdg("XDG_CONFIG_HOME"),
+        state: absolute_xdg("XDG_STATE_HOME"),
+        runtime: absolute_xdg("XDG_RUNTIME_DIR"),
+    };
+    let units = service::render_units(&binary, &xdg).map_err(anyhow::Error::msg)?;
+    fs::create_dir_all(&directory)?;
+    let mut changed = false;
+    let mut pending = Vec::new();
+    for unit in &units {
+        let path = directory.join(unit.name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!("refusing symlinked managed service unit {}", path.display());
+            }
+            Ok(_) if fs::read(&path)? == unit.contents.as_bytes() => {}
+            Ok(_) => {
+                changed = true;
+                pending.push((
+                    path.clone(),
+                    Some(fs::read(&path)?),
+                    unit.contents.as_bytes().to_vec(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                changed = true;
+                pending.push((path, None, unit.contents.as_bytes().to_vec()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut staged = Vec::new();
+    let staging = (|| -> anyhow::Result<()> {
+        for (index, (path, original, contents)) in pending.into_iter().enumerate() {
+            let temporary =
+                path.with_file_name(format!(".igor-unit-{}-{index}.tmp", std::process::id()));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            staged.push((temporary.clone(), path, original));
+            file.write_all(&contents)?;
+            file.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = staging {
+        for (temporary, _, _) in &staged {
+            let _ = fs::remove_file(temporary);
+        }
+        return Err(error);
+    }
+    let mut installed = 0;
+    for (temporary, path, _) in &staged {
+        if let Err(error) = fs::rename(temporary, path) {
+            rollback_units(&staged, installed);
+            return Err(anyhow::anyhow!(
+                "failed installing {}: {error}",
+                path.display()
+            ));
+        }
+        installed += 1;
+    }
+    if changed {
+        let reload = reload_user_units().await;
+        if let Err(error) = reload {
+            rollback_units(&staged, installed);
+            let _ = reload_user_units().await;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn rollback_units(staged: &[(PathBuf, PathBuf, Option<Vec<u8>>)], installed: usize) {
+    for (_, path, original) in staged.iter().take(installed) {
+        match original {
+            Some(contents) => {
+                let _ = fs::write(path, contents);
+            }
+            None => {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    for (temporary, _, _) in staged {
+        let _ = fs::remove_file(temporary);
+    }
+}
+
+async fn reload_user_units() -> anyhow::Result<()> {
+    systemctl_user(&["daemon-reload"]).await
+}
+
+async fn systemctl_user(arguments: &[&str]) -> anyhow::Result<()> {
+    let status = tokio::time::timeout(
+        SYSTEMCTL_TIMEOUT,
+        tokio::process::Command::new("systemctl")
+            .args(["--user"])
+            .args(arguments)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("systemctl --user {} timed out", arguments.join(" ")))??;
+    if !status.success() {
+        anyhow::bail!(
+            "systemctl --user {} failed with {status}",
+            arguments.join(" ")
+        );
+    }
+    Ok(())
+}
+
+async fn manage_user_services(action: &str, now: bool) -> anyhow::Result<()> {
+    let directory = user_service_directory()?;
+    for name in USER_SERVICE_NAMES {
+        let path = directory.join(name);
+        if !path.is_file() || path.symlink_metadata()?.file_type().is_symlink() {
+            anyhow::bail!("managed service unit is not installed: {}", path.display());
+        }
+    }
+    let mut arguments = vec![action];
+    if now {
+        arguments.push("--now");
+    }
+    arguments.push("--");
+    arguments.extend(USER_SERVICE_NAMES);
+    systemctl_user(&arguments).await
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceUnitStatus {
+    unit: &'static str,
+    load_state: String,
+    active_state: String,
+    unit_file_state: String,
+}
+
+async fn show_service_status(json: bool) -> anyhow::Result<()> {
+    let mut statuses = Vec::with_capacity(USER_SERVICE_NAMES.len());
+    for unit in USER_SERVICE_NAMES {
+        let output = tokio::time::timeout(
+            SYSTEMCTL_TIMEOUT,
+            tokio::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "show",
+                    "--property=LoadState,ActiveState,UnitFileState",
+                    "--",
+                    unit,
+                ])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("systemctl --user show {unit} timed out"))??;
+        if !output.status.success() {
+            anyhow::bail!(
+                "systemctl --user show {unit} failed with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let values = parse_unit_properties(&String::from_utf8(output.stdout)?)?;
+        statuses.push(ServiceUnitStatus {
+            unit,
+            load_state: values.0,
+            active_state: values.1,
+            unit_file_state: values.2,
+        });
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&statuses)?);
+    } else {
+        println!("UNIT\tLOAD\tACTIVE\tENABLEMENT");
+        for status in statuses {
+            println!(
+                "{}\t{}\t{}\t{}",
+                status.unit, status.load_state, status.active_state, status.unit_file_state
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_unit_properties(output: &str) -> anyhow::Result<(String, String, String)> {
+    let mut load = None;
+    let mut active = None;
+    let mut enabled = None;
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let target = match key {
+            "LoadState" => &mut load,
+            "ActiveState" => &mut active,
+            "UnitFileState" => &mut enabled,
+            _ => continue,
+        };
+        *target = Some(value.to_owned());
+    }
+    Ok((
+        load.ok_or_else(|| anyhow::anyhow!("systemctl output missing LoadState"))?,
+        active.ok_or_else(|| anyhow::anyhow!("systemctl output missing ActiveState"))?,
+        enabled.ok_or_else(|| anyhow::anyhow!("systemctl output missing UnitFileState"))?,
+    ))
+}
+
+async fn show_service_logs(follow: bool) -> anyhow::Result<()> {
+    let mut command = tokio::process::Command::new("journalctl");
+    command.args(["--user", "--no-pager"]);
+    if follow {
+        command.arg("--follow");
+    }
+    for unit in USER_SERVICE_NAMES {
+        command.args(["-u", unit]);
+    }
+    command.stdin(Stdio::null()).kill_on_drop(true);
+    let result = if follow {
+        command.status().await?
+    } else {
+        tokio::time::timeout(JOURNALCTL_TIMEOUT, command.status())
+            .await
+            .map_err(|_| anyhow::anyhow!("journalctl --user timed out"))??
+    };
+    if !result.success() {
+        anyhow::bail!("journalctl --user failed with {result}");
+    }
+    Ok(())
+}
+
+fn absolute_xdg(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 fn set_host_config(overrides: &ConfigOverrides, arguments: ConfigSetArgs) -> anyhow::Result<()> {

@@ -419,35 +419,47 @@ Dependencies: milestones 6-8.
 
 ### Tasks
 
-- [ ] `M9.01` Design worker and supervisor user units without project paths.
-- [ ] `M9.02` Generate units using the installed binary and XDG locations.
-- [ ] `M9.03` Configure deliberate restart and shutdown behavior.
-- [ ] `M9.04` Give supervisor background work low CPU and I/O priority without
+- [x] `M9.01` Design worker and supervisor user units without project paths.
+- [x] `M9.02` Generate units using the installed binary and XDG locations.
+- [x] `M9.03` Configure deliberate restart and shutdown behavior.
+- [x] `M9.04` Give supervisor background work low CPU and I/O priority without
   limiting experiment resources.
-- [ ] `M9.05` Implement `igor service install --user`.
-- [ ] `M9.06` Implement install flags `--enable` and `--start`.
-- [ ] `M9.07` Implement `igor service enable [--now]`.
-- [ ] `M9.08` Implement `igor service disable [--now]`.
-- [ ] `M9.09` Implement service start, stop, and restart.
-- [ ] `M9.10` Implement `igor service status`.
-- [ ] `M9.11` Implement `igor service logs`.
+- [x] `M9.05` Implement `igor service install --user`.
+- [x] `M9.06` Implement install flags `--enable` and `--start`.
+- [x] `M9.07` Implement `igor service enable [--now]`.
+- [x] `M9.08` Implement `igor service disable [--now]`.
+- [x] `M9.09` Implement service start, stop, and restart.
+- [x] `M9.10` Implement `igor service status`.
+- [x] `M9.11` Implement `igor service logs`.
 - [x] `M9.12` Implement `igor service uninstall --user` with explicit
   confirmation.
-- [ ] `M9.13` Ensure service commands never invoke `sudo` implicitly.
-- [ ] `M9.14` Validate generated units with `systemd-analyze --user verify`.
-- [ ] `M9.15` Add unit snapshot tests and opt-in live user-systemd tests.
-- [ ] `M9.16` Evaluate transient user units for direct attempts and implement
+- [x] `M9.13` Ensure service commands never invoke `sudo` implicitly.
+- [x] `M9.14` Validate generated units with `systemd-analyze --user verify`.
+- [x] `M9.15` Add unit snapshot tests and opt-in live user-systemd tests.
+- [x] `M9.16` Evaluate transient user units for direct attempts and implement
   them if recovery is more reliable than process groups.
-- [ ] `M9.17` Preserve the process-group backend as a portable fallback.
+  Live user-systemd testing confirms process groups survive worker restart, but
+  their exit status becomes unobservable after reattachment. A `systemd-run
+  --user` probe showed that a normal successful transient unit is immediately
+  unloaded (`LoadState=not-found`), whereas `--remain-after-exit` retains
+  `ExecMainStatus` and `InvocationID` until the unit is stopped. Persist unit
+  identity before launch, reconcile completion and cancellation by that
+  identity, and verify cleanup/restart boundaries before closing this task.
+  The opt-in live worker test covers success, nonzero exit, signal termination,
+  worker restart, cancellation, timeout, logs, resource release, and
+  retained-unit cleanup.
+  A fake-manager test also verifies that an ambiguous status remains owned
+  across restart without launching a replacement unit.
+- [x] `M9.17` Preserve the process-group backend as a portable fallback.
 - [x] `M9.18` Implement conservative `igor uninstall` as user-service removal
   while preserving the binary, configuration, database, logs, and history.
 
 ### Acceptance
 
-- [ ] `A9.01` A fresh user can install, enable, start, inspect, disable, and
+- [x] `A9.01` A fresh user can install, enable, start, inspect, disable, and
   uninstall both services using only `igor` commands.
-- [ ] `A9.02` Unit installation is idempotent.
-- [ ] `A9.03` Restarting Igor services does not cancel a recoverable active
+- [x] `A9.02` Unit installation is idempotent.
+- [x] `A9.03` Restarting Igor services does not cancel a recoverable active
   attempt.
 
 ## Milestone 10: Supervisor Actions And Telegram

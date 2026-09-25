@@ -2,6 +2,7 @@
 
 mod protocol;
 mod runtime;
+mod systemd;
 mod worker;
 
 pub use protocol::{

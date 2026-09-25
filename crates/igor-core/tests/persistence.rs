@@ -14,9 +14,9 @@ use igor_core::{
     DockerExecutorSpec, DockerImageIdentity, EnvironmentPolicy, Event, EventId, EventKind,
     EventPayload, ExecutionClaim, ExecutionOutcome, ExecutorSpec, Family, FamilyId, Generation,
     GenerationId, GenerationIdentity, GpuRequest, HostGpu, HostInventory, IntegrityCheck, JobId,
-    JobSpec, JobState, NamedResourceMode, NamedResourceRequest, PersistenceError, ProcessStart,
-    Project, ProjectId, Resource, ResourceId, ResourceMode, ResultContract, ShellPolicy,
-    SourceIdentity,
+    JobSpec, JobState, NamedResourceMode, NamedResourceRequest, PersistenceError,
+    ProcessExecutorSpec, ProcessIsolation, ProcessStart, Project, ProjectId, Resource, ResourceId,
+    ResourceMode, ResultContract, ShellPolicy, SourceIdentity, UnitReservation,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
@@ -191,6 +191,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "artifacts",
         "attempts",
         "attempt_containers",
+        "attempt_units",
         "attempt_processes",
         "deliveries",
         "events",
@@ -254,7 +255,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(ledger.len(), 8);
+    assert_eq!(ledger.len(), 9);
     for (index, row) in ledger.iter().enumerate() {
         assert_eq!(row.get::<i64, _>("version"), (index + 1) as i64);
         assert!(row.get::<bool, _>("success"));
@@ -302,7 +303,7 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
             .fetch_all(database.pool())
             .await?;
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     let checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
             .fetch_one(database.pool())
@@ -1986,6 +1987,338 @@ async fn container_identity_is_durable_unique_and_starts_atomically() -> TestRes
             .state,
         AttemptState::Running
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn systemd_unit_reservation_validates_invocation_id_and_claim_lifecycle() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 2, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let mut systemd_job = job(project.id);
+    systemd_job.executor = ExecutorSpec::Process(ProcessExecutorSpec {
+        isolation: ProcessIsolation::SystemdUserUnit,
+    });
+    let systemd_attempt = attempt(&systemd_job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &systemd_job,
+            &systemd_attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker-unit", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("systemd execution was not claimed"))?;
+    let reservation = UnitReservation {
+        stdout_path: PathBuf::from("/tmp/igor/unit.stdout"),
+        stderr_path: PathBuf::from("/tmp/igor/unit.stderr"),
+    };
+    let unit = database.jobs().reserve_unit(&claim, &reservation).await?;
+    assert_eq!(unit.state, "reserved");
+    assert!(!unit.created_at.is_empty());
+    assert!(!unit.updated_at.is_empty());
+    assert_eq!(unit.stdout_path, reservation.stdout_path);
+    assert_eq!(unit.stderr_path, reservation.stderr_path);
+    assert!(matches!(
+        database.jobs().reserve_unit(&claim, &reservation).await,
+        Err(PersistenceError::Conflict { .. })
+    ));
+
+    for invalid in [
+        "",
+        "not-an-invocation",
+        "01234567-89ab-cdef-0123-456789abcdef",
+        "0123456789ABCDEF0123456789abcdef",
+    ] {
+        assert!(matches!(
+            database.jobs().record_unit_started(&claim, invalid).await,
+            Err(PersistenceError::InvalidValue { .. })
+        ));
+    }
+    let persisted: (String, String) = sqlx::query_as(
+        "SELECT attempt_units.state, attempts.state FROM attempt_units JOIN attempts ON attempts.id = attempt_units.attempt_id WHERE attempt_units.attempt_id = ?",
+    ).bind(claim.attempt.spec.id().to_string()).fetch_one(database.pool()).await?;
+    assert_eq!(persisted, ("reserved".into(), "starting".into()));
+    database
+        .jobs()
+        .record_unit_started(&claim, "0123456789abcdef0123456789abcdef")
+        .await?;
+    let persisted: (String, String, String) = sqlx::query_as(
+        "SELECT attempt_units.state, attempts.state, attempt_units.invocation_id FROM attempt_units JOIN attempts ON attempts.id = attempt_units.attempt_id WHERE attempt_units.attempt_id = ?",
+    )
+    .bind(claim.attempt.spec.id().to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        persisted,
+        (
+            "started".into(),
+            "running".into(),
+            "0123456789abcdef0123456789abcdef".into()
+        )
+    );
+    database
+        .jobs()
+        .finish_unit_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+            Some("0123456789abcdef0123456789abcdef"),
+        )
+        .await?;
+    assert!(matches!(
+        database
+            .jobs()
+            .finish_unit_execution(
+                &claim,
+                &ExecutionOutcome {
+                    state: AttemptState::Succeeded,
+                    exit_code: Some(0),
+                    term_signal: None,
+                    error: None,
+                },
+                Some("0123456789abcdef0123456789abcdef")
+            )
+            .await,
+        Err(PersistenceError::Conflict { .. })
+    ));
+    let logs = database.jobs().logs_for_job(systemd_job.id).await?;
+    assert_eq!(logs.stdout_path, Some(reservation.stdout_path.clone()));
+    assert_eq!(database.jobs().units_pending_cleanup().await?.len(), 1);
+    database
+        .jobs()
+        .record_unit_removed(claim.attempt.spec.id(), &unit.unit_name)
+        .await?;
+    database
+        .jobs()
+        .record_unit_removed(claim.attempt.spec.id(), &unit.unit_name)
+        .await?;
+    assert!(database.jobs().units_pending_cleanup().await?.is_empty());
+
+    let mut expiring_job = job(project.id);
+    expiring_job.executor = ExecutorSpec::Process(ProcessExecutorSpec {
+        isolation: ProcessIsolation::SystemdUserUnit,
+    });
+    let expiring_attempt = attempt(&expiring_job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &expiring_job,
+            &expiring_attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let expiring_claim = database
+        .jobs()
+        .claim_execution("worker-unit-expiring", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("second systemd execution was not claimed"))?;
+    database
+        .jobs()
+        .reserve_unit(&expiring_claim, &reservation)
+        .await?;
+    sqlx::query("UPDATE jobs SET claim_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+        .bind(expiring_claim.job.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert!(matches!(
+        database
+            .jobs()
+            .record_unit_started(&expiring_claim, "abcdef0123456789abcdef0123456789")
+            .await,
+        Err(PersistenceError::Conflict { .. })
+    ));
+    let expired_states: (String, String) = sqlx::query_as(
+        "SELECT attempt_units.state, attempts.state FROM attempt_units JOIN attempts ON attempts.id = attempt_units.attempt_id WHERE attempt_units.attempt_id = ?",
+    )
+    .bind(expiring_claim.attempt.spec.id().to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(expired_states, ("reserved".into(), "starting".into()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn systemd_recovery_transfers_reserved_unit_and_heartbeats_without_process_identity()
+-> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 2, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let mut systemd_job = job(project.id);
+    systemd_job.executor = ExecutorSpec::Process(ProcessExecutorSpec {
+        isolation: ProcessIsolation::SystemdUserUnit,
+    });
+    let systemd_attempt = attempt(&systemd_job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &systemd_job,
+            &systemd_attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let original = database
+        .jobs()
+        .claim_execution("worker-unit", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("systemd execution was not claimed"))?;
+    let reservation = UnitReservation {
+        stdout_path: PathBuf::from("/tmp/igor/recovered-unit.stdout"),
+        stderr_path: PathBuf::from("/tmp/igor/recovered-unit.stderr"),
+    };
+    let unit = database
+        .jobs()
+        .reserve_unit(&original, &reservation)
+        .await?;
+    let original_leases = original
+        .resource_leases
+        .iter()
+        .map(|lease| (lease.id, lease.resource_id, lease.quantity))
+        .collect::<Vec<_>>();
+    database.jobs().release_execution(&original).await?;
+
+    let recovered = database
+        .jobs()
+        .claim_recovery("worker-unit-recovered", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("systemd execution was not recovered"))?;
+    assert_eq!(recovered.unit.as_ref(), Some(&unit));
+    assert!(recovered.process.is_none());
+    assert!(recovered.container.is_none());
+    assert_eq!(
+        recovered
+            .claim
+            .resource_leases
+            .iter()
+            .map(|lease| (lease.id, lease.resource_id, lease.quantity))
+            .collect::<Vec<_>>(),
+        original_leases
+    );
+    let old_heartbeat = "2000-01-01T00:00:00.000Z";
+    sqlx::query("UPDATE resource_leases SET heartbeat_at = ? WHERE job_id = ?")
+        .bind(old_heartbeat)
+        .bind(recovered.claim.job.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE attempt_units SET updated_at = ? WHERE attempt_id = ?")
+        .bind(old_heartbeat)
+        .bind(recovered.claim.attempt.spec.id().to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .jobs()
+        .heartbeat_execution(&recovered.claim, Duration::from_secs(30))
+        .await?;
+    let (resource_heartbeat, unit_updated): (String, String) = sqlx::query_as(
+        "SELECT resource_leases.heartbeat_at, attempt_units.updated_at
+         FROM resource_leases JOIN attempt_units ON attempt_units.job_id = resource_leases.job_id
+         WHERE resource_leases.job_id = ?",
+    )
+    .bind(recovered.claim.job.spec.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert!(resource_heartbeat.as_str() > old_heartbeat);
+    assert!(unit_updated.as_str() > old_heartbeat);
+    Ok(())
+}
+
+#[tokio::test]
+async fn systemd_recovery_before_unit_reservation_returns_no_unit() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 2, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let mut systemd_job = job(project.id);
+    systemd_job.executor = ExecutorSpec::Process(ProcessExecutorSpec {
+        isolation: ProcessIsolation::SystemdUserUnit,
+    });
+    let systemd_attempt = attempt(&systemd_job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &systemd_job,
+            &systemd_attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let original = database
+        .jobs()
+        .claim_execution("worker-unit", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("systemd execution was not claimed"))?;
+    database.jobs().release_execution(&original).await?;
+    let recovered = database
+        .jobs()
+        .claim_recovery("worker-unit-recovered", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("pre-reservation execution was not recovered"))?;
+    assert!(recovered.unit.is_none());
+    assert!(recovered.process.is_none());
+    assert!(recovered.container.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn systemd_recovery_does_not_allocate_resources_when_leases_are_missing() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 2, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let mut systemd_job = job(project.id);
+    systemd_job.executor = ExecutorSpec::Process(ProcessExecutorSpec {
+        isolation: ProcessIsolation::SystemdUserUnit,
+    });
+    let systemd_attempt = attempt(&systemd_job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &systemd_job,
+            &systemd_attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let original = database
+        .jobs()
+        .claim_execution("worker-unit", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("systemd execution was not claimed"))?;
+    database.jobs().release_execution(&original).await?;
+    sqlx::query("DELETE FROM resource_leases WHERE job_id = ?")
+        .bind(original.job.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert!(matches!(
+        database
+            .jobs()
+            .claim_recovery("worker-unit-recovered", Duration::from_secs(30))
+            .await,
+        Err(PersistenceError::Conflict { .. })
+    ));
+    let leases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resource_leases WHERE job_id = ?")
+        .bind(original.job.spec.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(leases, 0);
     Ok(())
 }
 

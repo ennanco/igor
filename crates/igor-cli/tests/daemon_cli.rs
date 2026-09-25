@@ -75,7 +75,7 @@ fn worker_and_supervisor_support_health_and_status() -> Result<(), Box<dyn Error
         .output()?;
     assert!(status.status.success());
     let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-    assert_eq!(status[0]["database"]["schema_version"], 8);
+    assert_eq!(status[0]["database"]["schema_version"], 9);
     assert_eq!(status[1]["database"]["integrity"], "ok");
 
     let resources = command(&home, temporary.path())
