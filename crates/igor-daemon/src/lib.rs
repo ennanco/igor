@@ -2,7 +2,9 @@
 
 mod protocol;
 mod runtime;
+mod supervisor;
 mod systemd;
+mod telegram;
 mod worker;
 
 pub use protocol::{
@@ -10,3 +12,4 @@ pub use protocol::{
     Request, RequestEnvelope, Response, ResponseEnvelope, Version,
 };
 pub use runtime::{Client, ClientError, DaemonError, run, run_until};
+pub use telegram::{SendResult, TelegramClient, format_notification};

@@ -2,7 +2,7 @@ mod service;
 
 use std::{
     fs::{self, File},
-    io::{self, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
     time::Duration,
@@ -113,6 +113,11 @@ enum Command {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    /// Configure and test Telegram notifications.
+    Notify {
+        #[command(subcommand)]
+        command: NotifyCommand,
     },
     /// Show host resources and active leases.
     Resources {
@@ -328,6 +333,17 @@ enum ServiceCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum NotifyCommand {
+    /// Read a bot token from standard input and store it in private user configuration.
+    Setup {
+        #[arg(long, allow_hyphen_values = true)]
+        chat_id: String,
+    },
+    /// Send a test message using configured credentials.
+    Test,
+}
+
 #[derive(Debug, Serialize)]
 struct DaemonStatus {
     role: DaemonRole,
@@ -445,6 +461,33 @@ async fn run() -> anyhow::Result<()> {
             ServiceCommand::Logs { follow } => show_service_logs(follow).await?,
             ServiceCommand::Uninstall { user: _, yes } => {
                 uninstall_user_services(yes).await?;
+            }
+        },
+        Command::Notify { command } => match command {
+            NotifyCommand::Setup { chat_id } => {
+                let mut token = String::new();
+                io::stdin().take(1025).read_to_string(&mut token)?;
+                let path = select_global_config_path(&Environment::from_process()?, &overrides);
+                igor_core::update_global_telegram_config(
+                    &path,
+                    token.trim_end_matches(['\r', '\n']),
+                    &chat_id,
+                ).map_err(|_| anyhow::anyhow!("cannot save Telegram credentials; check token, chat ID and private user config"))?;
+                println!("Telegram credentials saved; restart the supervisor to apply changes");
+            }
+            NotifyCommand::Test => {
+                let effective = effective_config(&overrides, &cwd)
+                    .map_err(|_| anyhow::anyhow!("cannot load private user configuration"))?;
+                let telegram = igor_daemon::TelegramClient::new(&effective.global.telegram)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Telegram is not configured; run igor notify setup")
+                    })?;
+                match telegram.send("Igor notification test").await {
+                    igor_daemon::SendResult::Delivered => println!("Telegram test delivered"),
+                    igor_daemon::SendResult::Retry { reason, .. } => {
+                        anyhow::bail!("Telegram test failed: {reason}")
+                    }
+                }
             }
         },
         Command::Resources { json } => {

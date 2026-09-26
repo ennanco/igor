@@ -129,6 +129,15 @@ pub struct GlobalPathConfig {
 pub struct TelegramConfig {
     pub bot_token: Option<SecretString>,
     pub chat_id: Option<SecretString>,
+    pub api_base: Option<String>,
+}
+
+impl TelegramConfig {
+    pub fn credentials(&self) -> Option<(&str, &str)> {
+        let token = self.bot_token.as_ref()?.expose();
+        let chat = self.chat_id.as_ref()?.expose();
+        (valid_telegram_token(token) && valid_telegram_chat(chat)).then_some((token, chat))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -352,6 +361,68 @@ fn parse_global_config(path: &Path, input: &str) -> Result<GlobalConfig, ConfigE
         "names",
     )?;
     Ok(config)
+}
+
+fn validate_telegram_credentials(path: &Path, token: &str, chat: &str) -> Result<(), ConfigError> {
+    if !valid_telegram_token(token) {
+        return Err(invalid_field(
+            path,
+            "telegram.bot_token",
+            "must be a valid bot token",
+        ));
+    }
+    if !valid_telegram_chat(chat) {
+        return Err(invalid_field(
+            path,
+            "telegram.chat_id",
+            "must be a numeric chat ID",
+        ));
+    }
+    Ok(())
+}
+
+fn valid_telegram_token(token: &str) -> bool {
+    token.len() <= 256
+        && token.split_once(':').is_some_and(|(prefix, suffix)| {
+            !prefix.is_empty()
+                && prefix.bytes().all(|byte| byte.is_ascii_digit())
+                && suffix.len() >= 20
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+}
+
+fn valid_telegram_chat(chat: &str) -> bool {
+    chat.parse::<i64>().is_ok_and(|id| id != 0)
+}
+
+pub fn update_global_telegram_config(
+    path: &Path,
+    token: &str,
+    chat: &str,
+) -> Result<(), ConfigError> {
+    validate_telegram_credentials(path, token, chat)?;
+    let input = if path.is_file() {
+        read_config(path)?
+    } else {
+        format!("schema_version = {GLOBAL_CONFIG_VERSION}\n")
+    };
+    check_version(path, &input, GLOBAL_CONFIG_VERSION)?;
+    let mut document: toml::Table = parse_toml(path, &input)?;
+    let telegram = document
+        .entry("telegram")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| invalid_field(path, "telegram", "must be a table"))?;
+    telegram.insert("bot_token".into(), toml::Value::String(token.into()));
+    telegram.insert("chat_id".into(), toml::Value::String(chat.into()));
+    let output = toml::to_string_pretty(&document).map_err(|source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(source),
+    })?;
+    parse_global_config(path, &output)?;
+    write_atomic(path, &output)
 }
 
 fn validate_unique_names(

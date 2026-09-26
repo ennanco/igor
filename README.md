@@ -228,6 +228,30 @@ optional backend requires a running user manager, reserves each unit before
 launch, retains its status through recovery, and cleans it after finalization.
 The default `process_group` backend remains available without systemd.
 
+## Supervisor And Notifications
+
+The supervisor records a notification action in the same database transaction
+that finishes each attempt. It then creates a Telegram delivery in the durable
+outbox and sends it independently of the worker. Install and run both services
+with `igor service install --user --enable --start` to enable this flow.
+
+Configure Telegram in the **user** configuration, not `.igor/project.toml`:
+
+```bash
+igor notify setup --chat-id CHAT_ID < /path/to/private-bot-token
+igor service restart
+igor notify test
+```
+
+The token is read from standard input rather than a command argument and stored
+in the user configuration with mode `0600`. `config show` redacts it. A delivery
+failure is retried with bounded backoff; an unavailable endpoint never waits on
+the worker's next job. Pending deliveries survive supervisor restart. Delivery
+is **at least once**: if the supervisor crashes after Telegram accepts a message
+but before Igor records acknowledgement, a duplicate can be sent. Messages
+include status, duration, available metrics and family progress before the
+technical job identifier. Metrics appear when an extractor has published them.
+
 ## Development
 
 ```bash

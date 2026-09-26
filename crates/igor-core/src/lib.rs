@@ -29,6 +29,7 @@ pub use config::{
     REPORT_PROMPT_RELATIVE_PATH, RuntimePaths, SecretString, TelegramConfig,
     discover_project_config, initialize_project, load_effective_config, load_global_config,
     load_project_config, select_global_config_path, update_global_host_config,
+    update_global_telegram_config,
 };
 pub use error::{DomainError, ErrorCategory, ErrorCode, Result};
 pub use event::{Event, EventKind, EventPayload};
@@ -50,9 +51,9 @@ pub use job::{
     GenerationIdentity, GitIdentity, JobSpec, ResultContract, Seed, SourceIdentity,
 };
 pub use persistence::{
-    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, ContainerCreate,
-    ContainerFinish, ContainerRecord, Database, DatabaseOptions, DeliveryRecord,
-    DeliveryRepository, EventRepository, ExecutionClaim, ExecutionOutcome, Family,
+    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, ClaimedAction,
+    ClaimedDelivery, ContainerCreate, ContainerFinish, ContainerRecord, Database, DatabaseOptions,
+    DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim, ExecutionOutcome, Family,
     FamilyGenerationRepository, Generation, IntegrityCheck, JobAttemptRepository, JobDetail,
     JobLogs, PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, RecoveredExecution,
     Resource, ResourceLease, ResourceRepository, ResourceStatus, StoredAttempt, StoredEvent,

@@ -778,6 +778,13 @@ Notifications should contain useful results rather than primarily file paths:
 Credentials live in protected user configuration and are never persisted in
 job specifications, passed to experiments, passed to agents, or included in
 stored exception URLs.
+`igor notify setup` accepts the token on standard input. The terminal attempt
+transaction enqueues an idempotent notification action; the supervisor claims
+that action, atomically creates a delivery and marks the action succeeded, then
+claims and sends deliveries separately. Failed HTTP calls record fixed error
+codes rather than exception strings or token-bearing URLs. A failed send is
+rescheduled with bounded backoff; an expired delivery lease may cause an
+at-least-once duplicate after restart.
 
 ## 20. CLI Surface
 

@@ -3199,3 +3199,124 @@ esac
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_worker() -> TestResult
+{
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    const TOKEN: &str = "123456:abcdefghijklmnopqrstuvwxyzABCDEFG";
+    let _guard = worker_test_guard()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let config = format!(
+        "schema_version = 1\n[telegram]\nbot_token = '{TOKEN}'\nchat_id = '12345'\napi_base = 'http://{}'\n",
+        listener.local_addr()?
+    );
+    let fixture = Fixture::with_global_config(Some(&config))?;
+    let server = tokio::spawn(async move {
+        for response in [
+            "HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n{\"ok\":false,\"parameters\":{\"retry_after\":2}}",
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        ] {
+            let (mut stream, _) = listener.accept().await?;
+            let mut buffer = [0u8; 2048];
+            let read = stream.read(&mut buffer).await?;
+            if !String::from_utf8_lossy(&buffer[..read]).contains("/sendMessage") {
+                return Err(std::io::Error::other("unexpected Telegram endpoint"));
+            }
+            stream.write_all(response.as_bytes()).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    });
+    let spawn_supervisor = || -> Result<Worker, Box<dyn Error>> {
+        Ok(Worker(
+            command(&fixture.home, &fixture.project)
+                .arg("supervisor")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        ))
+    };
+    let mut supervisor = spawn_supervisor()?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let submit = |program: &str| -> Result<JobId, Box<dyn Error>> {
+        let output = output_json(
+            fixture
+                .run()
+                .args(["submit", "--json", "--", program])
+                .output()?,
+        )?;
+        Ok(output["spec"]["id"]
+            .as_str()
+            .ok_or("missing notification job")?
+            .parse()?)
+    };
+    let job_id = submit("/bin/true")?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let delivery_id: String = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+                "SELECT id, state, last_error FROM deliveries WHERE idempotency_key IN
+                 (SELECT 'telegram:action:' || id FROM actions WHERE job_id = ?)",
+            )
+            .bind(job_id.to_string())
+            .fetch_optional(database.pool())
+            .await?;
+            if let Some((id, state, error)) = row
+                && state == "pending"
+                && error.as_deref() == Some("telegram_rate_limited")
+            {
+                return Ok::<_, Box<dyn Error>>(id);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    // A rate-limited notification endpoint cannot hold the worker queue.
+    let next_job = submit("/usr/bin/env")?;
+    let next = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(job) = database.jobs().get_job(next_job).await?
+                && job.state == JobState::Succeeded
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await?;
+    next?;
+    let logs = database.jobs().logs_for_job(next_job).await?;
+    let stdout = logs.stdout_path.ok_or("missing environment job log")?;
+    assert!(!fs::read_to_string(stdout)?.contains(TOKEN));
+    supervisor.stop()?;
+    sqlx::query("UPDATE deliveries SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
+        .bind(&delivery_id).execute(database.pool()).await?;
+    supervisor = spawn_supervisor()?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state: String = sqlx::query_scalar("SELECT state FROM deliveries WHERE id = ?")
+                .bind(&delivery_id)
+                .fetch_one(database.pool())
+                .await?;
+            if state == "delivered" {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT last_error FROM deliveries WHERE id = ?")
+            .bind(&delivery_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(!error.unwrap_or_default().contains(TOKEN));
+    server.await??;
+    supervisor.stop()?;
+    Ok(())
+}

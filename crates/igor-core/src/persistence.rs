@@ -598,6 +598,14 @@ pub struct ActionRecord {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ClaimedAction {
+    pub action: ActionRecord,
+    pub job_id: Option<JobId>,
+    pub attempt_id: Option<AttemptId>,
+    pub attempts: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeliveryRecord {
     pub id: DeliveryId,
     pub project_id: ProjectId,
@@ -605,6 +613,12 @@ pub struct DeliveryRecord {
     pub state: DeliveryState,
     pub payload: Value,
     pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimedDelivery {
+    pub delivery: DeliveryRecord,
+    pub attempts: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -3646,6 +3660,46 @@ async fn finish_execution_transaction(
         Some(details),
     )?;
     insert_event(transaction, project_id, Some(job_id), None, &job_event).await?;
+    let duration_seconds: Option<f64> = sqlx::query_scalar(
+        "SELECT ROUND((julianday(finished_at) - julianday(started_at)) * 86400, 3)
+         FROM attempts WHERE id = ?",
+    )
+    .bind(attempt_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(|source| db("read notification duration", source))?;
+    let family_progress = if let Some(family) = &claim.job.spec.family {
+        let (completed, total): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE state IN ('succeeded', 'failed', 'cancelled', 'lost', 'superseded')), COUNT(*)
+             FROM jobs WHERE generation_id = ?",
+        ).bind(family.generation.id.to_string()).fetch_one(&mut **transaction).await
+        .map_err(|source| db("read notification family progress", source))?;
+        Some(format!("{completed}/{total} finished"))
+    } else {
+        None
+    };
+    let notification = serde_json::json!({
+        "event_id": job_event.id,
+        "job_id": job_id,
+        "attempt_id": attempt_id,
+        "job_name": claim.job.spec.name,
+        "state": job_state.as_str(),
+        "exit_code": outcome.exit_code,
+        "term_signal": outcome.term_signal,
+        "duration_seconds": duration_seconds,
+        "family_progress": family_progress,
+        "family_id": claim.job.spec.family.as_ref().map(|family| family.family_id),
+        "generation_id": claim.job.spec.family.as_ref().map(|family| family.generation.id),
+    });
+    sqlx::query(
+        "INSERT INTO actions (id, project_id, job_id, attempt_id, kind, state, spec_json, idempotency_key, available_at)
+         VALUES (?, ?, ?, ?, 'send_notification', 'pending', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+    )
+    .bind(ActionId::new().to_string())
+    .bind(project_id.to_string()).bind(job_id.to_string()).bind(attempt_id.to_string())
+    .bind(json(&notification, "notification action")?)
+    .bind(format!("notify:attempt:{attempt_id}"))
+    .execute(&mut **transaction).await.map_err(|source| db("enqueue terminal notification action", source))?;
     Ok(())
 }
 
@@ -3863,6 +3917,7 @@ impl ActionRepository<'_> {
             EventKind::ActionStateChanged,
             owner,
             duration,
+            "",
         )
         .await?
         .map(|claim| {
@@ -3874,6 +3929,256 @@ impl ActionRepository<'_> {
             })
         })
         .transpose()
+    }
+
+    pub async fn claim_notification(
+        &self,
+        owner: &str,
+        duration: Duration,
+    ) -> PersistenceResult<Option<Claim<ActionId>>> {
+        claim_outbox(
+            &self.database.pool,
+            "actions",
+            "running",
+            EventKind::ActionStateChanged,
+            owner,
+            duration,
+            " AND kind = 'send_notification'",
+        )
+        .await?
+        .map(|claim| {
+            Ok(Claim {
+                record_id: parse_id(&claim.record_id, "claimed notification action")?,
+                lease_id: claim.lease_id,
+                owner: claim.owner,
+                expires_at: claim.expires_at,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn claimed(
+        &self,
+        claim: &Claim<ActionId>,
+    ) -> PersistenceResult<Option<ClaimedAction>> {
+        let row = sqlx::query(
+            "SELECT id, project_id, job_id, attempt_id, kind, state, spec_json, idempotency_key, attempts
+             FROM actions WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?
+               AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(claim.record_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+        .fetch_optional(&self.database.pool).await.map_err(|source| db("read claimed action", source))?;
+        row.map(|row| {
+            let attempts: i64 = row.get("attempts");
+            Ok(ClaimedAction {
+                action: ActionRecord {
+                    id: parse_id(row.get("id"), "action")?,
+                    project_id: parse_id(row.get("project_id"), "action project")?,
+                    kind: row.get("kind"),
+                    state: ActionState::Running,
+                    spec: from_json(row.get("spec_json"), "action spec")?,
+                    idempotency_key: row.get("idempotency_key"),
+                },
+                job_id: row
+                    .get::<Option<String>, _>("job_id")
+                    .map(|id| parse_id(&id, "action job"))
+                    .transpose()?,
+                attempt_id: row
+                    .get::<Option<String>, _>("attempt_id")
+                    .map(|id| parse_id(&id, "action attempt"))
+                    .transpose()?,
+                attempts: u32::try_from(attempts).map_err(|_| PersistenceError::InvalidValue {
+                    entity: "action attempts",
+                    value: attempts.to_string(),
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn heartbeat(
+        &self,
+        claim: &Claim<ActionId>,
+        duration: Duration,
+    ) -> PersistenceResult<()> {
+        let seconds = validate_lease(&claim.owner, duration)?;
+        let updated = sqlx::query(
+            "UPDATE actions SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?
+               AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        ).bind(seconds).bind(claim.record_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+        .execute(&self.database.pool).await.map_err(|source| db("heartbeat action", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "action claim",
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn succeed(&self, claim: &Claim<ActionId>) -> PersistenceResult<()> {
+        self.transition(claim, ActionState::Succeeded, Duration::ZERO, None)
+            .await
+    }
+
+    pub async fn enqueue_notification(
+        &self,
+        claim: &Claim<ActionId>,
+        delivery: &DeliveryRecord,
+        event_id: EventId,
+    ) -> PersistenceResult<()> {
+        if delivery.channel != "telegram" || delivery.state != DeliveryState::Pending {
+            return Err(PersistenceError::InvalidValue {
+                entity: "notification delivery",
+                value: "expected pending Telegram delivery".into(),
+            });
+        }
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin notification action", source))?;
+        let row = sqlx::query(
+            "SELECT project_id FROM actions WHERE id = ? AND kind = 'send_notification'
+             AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(claim.record_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("validate notification action", source))?;
+        let row = row.ok_or(PersistenceError::Conflict {
+            entity: "notification action",
+        })?;
+        let project_id: ProjectId = parse_id(row.get("project_id"), "notification project")?;
+        if delivery.project_id != project_id {
+            return Err(PersistenceError::Conflict {
+                entity: "notification project",
+            });
+        }
+        sqlx::query(
+            "INSERT INTO deliveries (id, project_id, event_id, channel, state, payload_json, idempotency_key, available_at)
+             VALUES (?, ?, ?, 'telegram', 'pending', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        ).bind(delivery.id.to_string()).bind(project_id.to_string()).bind(event_id.to_string())
+        .bind(json(&delivery.payload, "notification payload")?).bind(&delivery.idempotency_key)
+        .execute(&mut *transaction).await.map_err(|source| db("enqueue notification delivery", source))?;
+        let updated = sqlx::query(
+            "UPDATE actions SET state = 'succeeded', claim_id = NULL, claim_owner = NULL, claim_expires_at = NULL,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        ).bind(claim.record_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+        .execute(&mut *transaction).await.map_err(|source| db("finish notification action", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "notification action",
+            });
+        }
+        let event = state_event(
+            EventKind::ActionStateChanged,
+            "action",
+            &claim.record_id.to_string(),
+            "succeeded",
+            Some(claim.lease_id),
+            None,
+        )?;
+        insert_event(&mut transaction, project_id, None, None, &event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit notification action", source))?;
+        Ok(())
+    }
+
+    pub async fn retry(
+        &self,
+        claim: &Claim<ActionId>,
+        policy: &crate::RetryPolicy,
+        error: &str,
+    ) -> PersistenceResult<()> {
+        policy.validate()?;
+        self.transition_retry(claim, policy, error).await
+    }
+
+    async fn transition_retry(
+        &self,
+        claim: &Claim<ActionId>,
+        policy: &crate::RetryPolicy,
+        error: &str,
+    ) -> PersistenceResult<()> {
+        let attempts: Option<i64> = sqlx::query_scalar(
+            "SELECT attempts FROM actions WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        ).bind(claim.record_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+        .fetch_optional(&self.database.pool).await.map_err(|source| db("read action retries", source))?;
+        let attempts = attempts.ok_or(PersistenceError::Conflict {
+            entity: "action claim",
+        })?;
+        let attempts = u32::try_from(attempts).map_err(|_| PersistenceError::InvalidValue {
+            entity: "action attempts",
+            value: attempts.to_string(),
+        })?;
+        match policy.delay_after_failure(attempts) {
+            Some(delay) => {
+                self.transition(claim, ActionState::Pending, delay, Some(error))
+                    .await
+            }
+            None => {
+                self.transition(claim, ActionState::Failed, Duration::ZERO, Some(error))
+                    .await
+            }
+        }
+    }
+
+    async fn transition(
+        &self,
+        claim: &Claim<ActionId>,
+        state: ActionState,
+        delay: Duration,
+        error: Option<&str>,
+    ) -> PersistenceResult<()> {
+        let seconds =
+            i64::try_from(delay.as_secs()).map_err(|_| PersistenceError::InvalidValue {
+                entity: "action retry delay",
+                value: delay.as_secs().to_string(),
+            })?;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin action transition", source))?;
+        let row = sqlx::query(
+            "UPDATE actions SET state = ?, claim_id = NULL, claim_owner = NULL, claim_expires_at = NULL,
+             available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'), last_error = ?,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?
+               AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') RETURNING project_id",
+        ).bind(state.as_str()).bind(seconds).bind(error).bind(claim.record_id.to_string())
+        .bind(claim.lease_id.to_string()).bind(&claim.owner).fetch_optional(&mut *transaction).await
+        .map_err(|source| db("transition claimed action", source))?;
+        let row = row.ok_or(PersistenceError::Conflict {
+            entity: "action claim",
+        })?;
+        let project_id = parse_id(row.get("project_id"), "action project")?;
+        let event = state_event(
+            EventKind::ActionStateChanged,
+            "action",
+            &claim.record_id.to_string(),
+            state.as_str(),
+            Some(claim.lease_id),
+            None,
+        )?;
+        insert_event(&mut transaction, project_id, None, None, &event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit action transition", source))?;
+        Ok(())
     }
 }
 
@@ -3913,6 +4218,7 @@ impl DeliveryRepository<'_> {
             EventKind::DeliveryStateChanged,
             owner,
             duration,
+            "",
         )
         .await?
         .map(|claim| {
@@ -3924,6 +4230,190 @@ impl DeliveryRepository<'_> {
             })
         })
         .transpose()
+    }
+
+    pub async fn claim_telegram(
+        &self,
+        owner: &str,
+        duration: Duration,
+    ) -> PersistenceResult<Option<Claim<DeliveryId>>> {
+        claim_outbox(
+            &self.database.pool,
+            "deliveries",
+            "delivering",
+            EventKind::DeliveryStateChanged,
+            owner,
+            duration,
+            " AND channel = 'telegram'",
+        )
+        .await?
+        .map(|claim| {
+            Ok(Claim {
+                record_id: parse_id(&claim.record_id, "claimed Telegram delivery")?,
+                lease_id: claim.lease_id,
+                owner: claim.owner,
+                expires_at: claim.expires_at,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn claimed(
+        &self,
+        claim: &Claim<DeliveryId>,
+    ) -> PersistenceResult<Option<ClaimedDelivery>> {
+        let row = sqlx::query(
+            "SELECT id, project_id, channel, payload_json, idempotency_key, attempts FROM deliveries
+             WHERE id = ? AND state = 'delivering' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        ).bind(claim.record_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+        .fetch_optional(&self.database.pool).await.map_err(|source| db("read claimed delivery", source))?;
+        row.map(|row| {
+            let attempts: i64 = row.get("attempts");
+            Ok(ClaimedDelivery {
+                delivery: DeliveryRecord {
+                    id: parse_id(row.get("id"), "delivery")?,
+                    project_id: parse_id(row.get("project_id"), "delivery project")?,
+                    channel: row.get("channel"),
+                    state: DeliveryState::Delivering,
+                    payload: from_json(row.get("payload_json"), "delivery payload")?,
+                    idempotency_key: row.get("idempotency_key"),
+                },
+                attempts: u32::try_from(attempts).map_err(|_| PersistenceError::InvalidValue {
+                    entity: "delivery attempts",
+                    value: attempts.to_string(),
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn heartbeat(
+        &self,
+        claim: &Claim<DeliveryId>,
+        duration: Duration,
+    ) -> PersistenceResult<()> {
+        let seconds = validate_lease(&claim.owner, duration)?;
+        let updated = sqlx::query(
+            "UPDATE deliveries SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'delivering' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        ).bind(seconds).bind(claim.record_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+        .execute(&self.database.pool).await.map_err(|source| db("heartbeat delivery", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "delivery claim",
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn available_metrics(
+        &self,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<Vec<(String, f64)>> {
+        let rows = sqlx::query("SELECT name, value FROM metrics WHERE attempt_id = ? AND value IS NOT NULL ORDER BY name LIMIT 10")
+            .bind(attempt_id.to_string()).fetch_all(&self.database.pool).await
+            .map_err(|source| db("read notification metrics", source))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let value: f64 = row.get("value");
+                value.is_finite().then(|| (row.get("name"), value))
+            })
+            .collect())
+    }
+
+    pub async fn delivered(&self, claim: &Claim<DeliveryId>) -> PersistenceResult<()> {
+        self.transition(claim, DeliveryState::Delivered, Duration::ZERO, None)
+            .await
+    }
+
+    pub async fn retry(
+        &self,
+        claim: &Claim<DeliveryId>,
+        policy: &crate::RetryPolicy,
+        error: &str,
+        retry_after: Option<Duration>,
+    ) -> PersistenceResult<()> {
+        policy.validate()?;
+        let attempts: Option<i64> = sqlx::query_scalar(
+            "SELECT attempts FROM deliveries WHERE id = ? AND state = 'delivering' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        ).bind(claim.record_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+        .fetch_optional(&self.database.pool).await.map_err(|source| db("read delivery retries", source))?;
+        let attempts = attempts.ok_or(PersistenceError::Conflict {
+            entity: "delivery claim",
+        })?;
+        let attempts = u32::try_from(attempts).map_err(|_| PersistenceError::InvalidValue {
+            entity: "delivery attempts",
+            value: attempts.to_string(),
+        })?;
+        match policy.delay_after_failure(attempts) {
+            Some(delay) => {
+                self.transition(
+                    claim,
+                    DeliveryState::Pending,
+                    delay
+                        .max(retry_after.unwrap_or_default())
+                        .min(Duration::from_secs(policy.max_delay_seconds)),
+                    Some(error),
+                )
+                .await
+            }
+            None => {
+                self.transition(claim, DeliveryState::Failed, Duration::ZERO, Some(error))
+                    .await
+            }
+        }
+    }
+
+    async fn transition(
+        &self,
+        claim: &Claim<DeliveryId>,
+        state: DeliveryState,
+        delay: Duration,
+        error: Option<&str>,
+    ) -> PersistenceResult<()> {
+        let seconds =
+            i64::try_from(delay.as_secs()).map_err(|_| PersistenceError::InvalidValue {
+                entity: "delivery retry delay",
+                value: delay.as_secs().to_string(),
+            })?;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin delivery transition", source))?;
+        let row = sqlx::query(
+            "UPDATE deliveries SET state = ?, claim_id = NULL, claim_owner = NULL, claim_expires_at = NULL,
+             available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'), last_error = ?,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND state = 'delivering' AND claim_id = ? AND claim_owner = ?
+               AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') RETURNING project_id",
+        ).bind(state.as_str()).bind(seconds).bind(error).bind(claim.record_id.to_string())
+        .bind(claim.lease_id.to_string()).bind(&claim.owner).fetch_optional(&mut *transaction).await
+        .map_err(|source| db("transition claimed delivery", source))?;
+        let row = row.ok_or(PersistenceError::Conflict {
+            entity: "delivery claim",
+        })?;
+        let project_id = parse_id(row.get("project_id"), "delivery project")?;
+        let event = state_event(
+            EventKind::DeliveryStateChanged,
+            "delivery",
+            &claim.record_id.to_string(),
+            state.as_str(),
+            Some(claim.lease_id),
+            None,
+        )?;
+        insert_event(&mut transaction, project_id, None, None, &event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit delivery transition", source))?;
+        Ok(())
     }
 }
 
@@ -3942,6 +4432,7 @@ async fn claim_outbox(
     event_kind: EventKind,
     owner: &str,
     duration: Duration,
+    filter: &'static str,
 ) -> PersistenceResult<Option<StringClaim>> {
     let seconds = validate_lease(owner, duration)?;
     let lease_id = Uuid::new_v4();
@@ -3952,8 +4443,8 @@ async fn claim_outbox(
     let query = format!(
         "WITH candidate AS (
             SELECT id FROM {table}
-            WHERE (state = 'pending' AND available_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-               OR (state = '{claimed_state}' AND claim_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            WHERE ((state = 'pending' AND available_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+               OR (state = '{claimed_state}' AND claim_expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))){filter}
             ORDER BY available_at, created_at LIMIT 1
          )
          UPDATE {table} SET state = '{claimed_state}', claim_id = ?, claim_owner = ?,

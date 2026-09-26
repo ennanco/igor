@@ -468,29 +468,29 @@ Dependencies: milestones 3-4 and 9.
 
 ### Tasks
 
-- [ ] `M10.01` Implement supervisor action discovery and transactional claims.
-- [ ] `M10.02` Implement action leases, heartbeat, retries, and recovery.
-- [ ] `M10.03` Implement bounded exponential backoff utilities.
-- [ ] `M10.04` Create terminal job notifications transactionally with attempt
+- [x] `M10.01` Implement supervisor action discovery and transactional claims.
+- [x] `M10.02` Implement action leases, heartbeat, retries, and recovery.
+- [x] `M10.03` Implement bounded exponential backoff utilities.
+- [x] `M10.04` Create terminal job notifications transactionally with attempt
   finalization.
-- [ ] `M10.05` Implement Telegram configuration outside project files.
-- [ ] `M10.06` Implement Telegram setup and credential validation.
-- [ ] `M10.07` Implement `igor notify test`.
-- [ ] `M10.08` Implement persistent delivery claims and retry scheduling.
-- [ ] `M10.09` Redact bot tokens from URLs, errors, logs, and diagnostics.
-- [ ] `M10.10` Include useful status, duration, family progress, and available
+- [x] `M10.05` Implement Telegram configuration outside project files.
+- [x] `M10.06` Implement Telegram setup and credential validation.
+- [x] `M10.07` Implement `igor notify test`.
+- [x] `M10.08` Implement persistent delivery claims and retry scheduling.
+- [x] `M10.09` Redact bot tokens from URLs, errors, logs, and diagnostics.
+- [x] `M10.10` Include useful status, duration, family progress, and available
   metrics before technical paths.
-- [ ] `M10.11` Document at-least-once delivery and possible duplicates.
-- [ ] `M10.12` Ensure supervisor failure cannot block worker scheduling.
-- [ ] `M10.13` Add mocked network, rate-limit, timeout, duplicate, and restart
+- [x] `M10.11` Document at-least-once delivery and possible duplicates.
+- [x] `M10.12` Ensure supervisor failure cannot block worker scheduling.
+- [x] `M10.13` Add mocked network, rate-limit, timeout, duplicate, and restart
   tests.
 
 ### Acceptance
 
-- [ ] `A10.01` An unavailable Telegram endpoint does not delay the next job.
-- [ ] `A10.02` Delivery resumes after supervisor restart.
-- [ ] `A10.03` No stored error or child environment contains the Telegram token.
-- [ ] `A10.04` This milestone completes the daily-operation `v0.2` baseline.
+- [x] `A10.01` An unavailable Telegram endpoint does not delay the next job.
+- [x] `A10.02` Delivery resumes after supervisor restart.
+- [x] `A10.03` No stored error or child environment contains the Telegram token.
+- [x] `A10.04` This milestone completes the daily-operation `v0.2` baseline.
 
 ## Milestone 11: Families, Generations, And Comparable Seeds
 

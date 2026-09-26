@@ -1,4 +1,11 @@
-use std::{error::Error, fs, path::Path, process::Command};
+use std::{
+    error::Error,
+    fs,
+    io::Write,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 use tempfile::TempDir;
 
@@ -28,6 +35,103 @@ fn version_is_preserved() -> Result<(), Box<dyn Error>> {
     let output = igor().arg("--version").output()?;
     assert!(output.status.success());
     assert!(text(output.stdout)?.contains(env!("CARGO_PKG_VERSION")));
+    Ok(())
+}
+
+#[test]
+fn notify_setup_reads_token_from_stdin_and_redacts_it() -> Result<(), Box<dyn Error>> {
+    const TOKEN: &str = "123456:abcdefghijklmnopqrstuvwxyzABCDEFG";
+    let temporary = TempDir::new()?;
+    let home = temporary.path().join("home");
+    let mut child = disposable_command(&home, temporary.path())
+        .args(["notify", "setup", "--chat-id", "-12345"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("missing token stdin")?
+        .write_all(TOKEN.as_bytes())?;
+    let output = child.wait_with_output()?;
+    assert!(output.status.success(), "{}", text(output.stderr)?);
+    assert!(!text(output.stdout)?.contains(TOKEN));
+    let config = home.join("config/igor/config.toml");
+    assert!(fs::read_to_string(&config)?.contains(TOKEN));
+    assert_eq!(fs::metadata(&config)?.permissions().mode() & 0o777, 0o600);
+    let shown = disposable_command(&home, temporary.path())
+        .args(["config", "show", "--json"])
+        .output()?;
+    assert!(shown.status.success());
+    assert!(!text(shown.stdout)?.contains(TOKEN));
+
+    let mut child = disposable_command(&home, temporary.path())
+        .args(["notify", "setup", "--chat-id", "-12345"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or("missing token stdin")?
+        .write_all(b"invalid-secret-token")?;
+    let output = child.wait_with_output()?;
+    assert!(!output.status.success());
+    assert!(!text(output.stderr)?.contains("invalid-secret-token"));
+    assert!(fs::read_to_string(config)?.contains(TOKEN));
+    Ok(())
+}
+
+#[test]
+fn notify_test_uses_configured_credentials_without_leaking_them() -> Result<(), Box<dyn Error>> {
+    use std::{io::Read, net::TcpListener};
+    const TOKEN: &str = "123456:abcdefghijklmnopqrstuvwxyzABCDEFG";
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let temporary = TempDir::new()?;
+    let home = temporary.path().join("home");
+    let config = home.join("config/igor/config.toml");
+    fs::create_dir_all(config.parent().ok_or("missing config parent")?)?;
+    fs::write(
+        &config,
+        format!(
+            "schema_version = 1\n[telegram]\nbot_token = '{TOKEN}'\nchat_id = '123'\napi_base = 'http://{}'\n",
+            listener.local_addr()?
+        ),
+    )?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let mut request = [0; 2048];
+        let read = stream.read(&mut request)?;
+        if !String::from_utf8_lossy(&request[..read]).contains("/sendMessage") {
+            return Err(std::io::Error::other("unexpected endpoint"));
+        }
+        stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        )
+    });
+    let output = disposable_command(&home, temporary.path())
+        .args(["notify", "test"])
+        .output()?;
+    server
+        .join()
+        .map_err(|_| "mock Telegram server panicked")??;
+    assert!(output.status.success(), "{}", text(output.stderr)?);
+    assert!(text(output.stdout)?.contains("Telegram test delivered"));
     Ok(())
 }
 

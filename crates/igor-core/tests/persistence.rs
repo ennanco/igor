@@ -599,6 +599,268 @@ async fn concurrent_claims_and_resource_ownership_are_exclusive() -> TestResult 
 }
 
 #[tokio::test]
+async fn supervisor_action_claims_retry_and_recover_with_fenced_leases() -> TestResult {
+    let (_directory, database) = database().await?;
+    let (project, _) = insert_project_job(&database).await?;
+    let action = ActionRecord {
+        id: ActionId::new(),
+        project_id: project.id,
+        kind: "send_notification".into(),
+        state: ActionState::Pending,
+        spec: json!({"status": "succeeded"}),
+        idempotency_key: "notification-action-test".into(),
+    };
+    database.actions().insert(&action).await?;
+    let claimed = database
+        .actions()
+        .claim_pending("supervisor-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("action was not claimed"))?;
+    let work = database
+        .actions()
+        .claimed(&claimed)
+        .await?
+        .ok_or_else(|| missing("claimed action was not loaded"))?;
+    assert_eq!(work.action.spec, action.spec);
+    assert_eq!(work.attempts, 1);
+    database
+        .actions()
+        .heartbeat(&claimed, Duration::from_secs(30))
+        .await?;
+    sqlx::query("UPDATE actions SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
+        .bind(action.id.to_string()).execute(database.pool()).await?;
+    let recovered = database
+        .actions()
+        .claim_pending("supervisor-b", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("expired action was not reclaimed"))?;
+    assert_eq!(recovered.record_id, action.id);
+    assert_ne!(recovered.lease_id, claimed.lease_id);
+    assert!(database.actions().claimed(&claimed).await?.is_none());
+    assert!(database.actions().succeed(&claimed).await.is_err());
+    assert_eq!(
+        database
+            .actions()
+            .claimed(&recovered)
+            .await?
+            .ok_or_else(|| missing("recovered action missing"))?
+            .attempts,
+        2
+    );
+    let policy = igor_core::RetryPolicy {
+        max_attempts: 3,
+        initial_delay_seconds: 1,
+        max_delay_seconds: 2,
+        multiplier: 2,
+    };
+    database
+        .actions()
+        .retry(&recovered, &policy, "temporary_failure")
+        .await?;
+    assert!(
+        database
+            .actions()
+            .claim_pending("supervisor-c", Duration::from_secs(30))
+            .await?
+            .is_none()
+    );
+    sqlx::query("UPDATE actions SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
+        .bind(action.id.to_string()).execute(database.pool()).await?;
+    let third = database
+        .actions()
+        .claim_pending("supervisor-c", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("action retry was not claimed"))?;
+    database
+        .actions()
+        .retry(&third, &policy, "exhausted")
+        .await?;
+    let (state, claim, attempts): (String, Option<String>, i64) =
+        sqlx::query_as("SELECT state, claim_id, attempts FROM actions WHERE id = ?")
+            .bind(action.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(state, "failed");
+    assert!(claim.is_none());
+    assert_eq!(attempts, 3);
+    assert!(
+        database
+            .actions()
+            .claim_pending("supervisor-d", Duration::from_secs(30))
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_attempt_enqueues_notification_and_delivery_atomically() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Failed,
+                exit_code: Some(7),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let extractor = ActionRecord {
+        id: ActionId::new(),
+        project_id: project.id,
+        kind: "extract_metrics".into(),
+        state: ActionState::Pending,
+        spec: json!({}),
+        idempotency_key: "future-extractor".into(),
+    };
+    database.actions().insert(&extractor).await?;
+    let action = database
+        .actions()
+        .claim_notification("supervisor", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("terminal notification action missing"))?;
+    let work = database
+        .actions()
+        .claimed(&action)
+        .await?
+        .ok_or_else(|| missing("notification claim missing"))?;
+    assert_eq!(work.action.kind, "send_notification");
+    assert_eq!(
+        database
+            .actions()
+            .claim_pending("future-extractor", Duration::from_secs(30))
+            .await?
+            .ok_or_else(|| missing("extractor action missing"))?
+            .record_id,
+        extractor.id
+    );
+    assert_eq!(work.job_id, Some(job.id));
+    assert_eq!(work.attempt_id, Some(attempt.id()));
+    assert_eq!(work.action.spec["exit_code"], 7);
+    let event_id: igor_core::EventId = work.action.spec["event_id"]
+        .as_str()
+        .ok_or_else(|| missing("notification event missing"))?
+        .parse()?;
+    let delivery = DeliveryRecord {
+        id: DeliveryId::new(),
+        project_id: project.id,
+        channel: "telegram".into(),
+        state: DeliveryState::Pending,
+        payload: work.action.spec,
+        idempotency_key: "terminal-delivery".into(),
+    };
+    database
+        .actions()
+        .enqueue_notification(&action, &delivery, event_id)
+        .await?;
+    assert!(
+        database
+            .actions()
+            .enqueue_notification(&action, &delivery, event_id)
+            .await
+            .is_err()
+    );
+    let local = DeliveryRecord {
+        id: DeliveryId::new(),
+        project_id: project.id,
+        channel: "local".into(),
+        state: DeliveryState::Pending,
+        payload: json!({}),
+        idempotency_key: "future-local".into(),
+    };
+    database.deliveries().insert(&local, None).await?;
+    let claimed = database
+        .deliveries()
+        .claim_telegram("supervisor", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("terminal delivery missing"))?;
+    let pending = database
+        .deliveries()
+        .claimed(&claimed)
+        .await?
+        .ok_or_else(|| missing("delivery claim missing"))?;
+    assert_eq!(pending.delivery.payload["job_id"], job.id.to_string());
+    let retry = igor_core::RetryPolicy {
+        max_attempts: 2,
+        initial_delay_seconds: 1,
+        max_delay_seconds: 3,
+        multiplier: 2,
+    };
+    database
+        .deliveries()
+        .retry(
+            &claimed,
+            &retry,
+            "telegram_rate_limited",
+            Some(Duration::from_secs(3)),
+        )
+        .await?;
+    assert!(
+        database
+            .deliveries()
+            .claim_telegram("other", Duration::from_secs(30))
+            .await?
+            .is_none()
+    );
+    sqlx::query("UPDATE deliveries SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
+        .bind(delivery.id.to_string()).execute(database.pool()).await?;
+    let reclaimed = database
+        .deliveries()
+        .claim_telegram("other", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("delivery retry missing"))?;
+    assert!(database.deliveries().delivered(&claimed).await.is_err());
+    database.deliveries().delivered(&reclaimed).await?;
+    let state: String = sqlx::query_scalar("SELECT state FROM deliveries WHERE id = ?")
+        .bind(delivery.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(state, "delivered");
+    let first = database
+        .deliveries()
+        .claim_pending("future-local", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("local delivery missing"))?;
+    assert_eq!(first.record_id, local.id);
+    // The external receiver may have accepted this first send before the supervisor crashed.
+    sqlx::query("UPDATE deliveries SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
+        .bind(local.id.to_string()).execute(database.pool()).await?;
+    let replacement = database
+        .deliveries()
+        .claim_pending("restarted", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("expired delivery not reclaimed"))?;
+    assert_eq!(replacement.record_id, local.id);
+    assert_ne!(replacement.lease_id, first.lease_id);
+    assert!(database.deliveries().delivered(&first).await.is_err());
+    database.deliveries().delivered(&replacement).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn stale_job_claim_cannot_transition_or_clear_replacement_lease() -> TestResult {
     let (_directory, database) = database().await?;
     let (_project, job) = insert_project_job(&database).await?;

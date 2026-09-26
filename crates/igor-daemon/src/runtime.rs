@@ -192,6 +192,13 @@ where
             receiver,
         ));
     }
+    if role == DaemonRole::Supervisor {
+        workers.spawn(crate::supervisor::run(
+            database.clone(),
+            paths.clone(),
+            worker_receiver.clone(),
+        ));
+    }
     drop(worker_receiver);
     tokio::pin!(shutdown);
 
