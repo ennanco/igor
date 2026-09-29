@@ -687,18 +687,34 @@ async fn supervise_recovered(
                 {
                     match database.jobs().cancellation_grace(claim).await {
                         Ok(Some(remaining)) => {
-                            if cancel_deadline.is_none() {
-                                signal_group(group_id, Signal::SIGTERM);
+                            let signal = if remaining.is_zero() {
+                                Signal::SIGKILL
+                            } else {
+                                Signal::SIGTERM
+                            };
+                            if completion.is_none() && cancel_deadline.is_none()
+                                && !signal_recovered_group(pid, group_id, process.process_start_ticks, signal)
+                            {
+                                leader_present = false;
+                                completion = Some((AttemptState::Lost, "recovered process identity changed before cancellation"));
+                                timeout_deadline = None;
+                                continue;
                             }
-                            let deadline = time::Instant::now() + remaining;
-                            cancel_deadline = Some(cancel_deadline.map_or(deadline, |current| current.min(deadline)));
+                            if !remaining.is_zero() {
+                                let deadline = time::Instant::now() + remaining;
+                                cancel_deadline = Some(cancel_deadline.map_or(deadline, |current| current.min(deadline)));
+                            }
                             completion = Some((AttemptState::Cancelled, "execution cancelled after worker recovery"));
                         }
                         Ok(None) => {}
                         Err(error) => {
                             tracing::error!(%error, job_id = %claim.job.spec.id, "cannot read recovered cancellation request");
-                            terminate_group(group_id);
-                            completion = Some((AttemptState::Failed, "cannot read cancellation request after recovery"));
+                            if signal_recovered_group(pid, group_id, process.process_start_ticks, Signal::SIGKILL) {
+                                completion = Some((AttemptState::Failed, "cannot read cancellation request after recovery"));
+                            } else {
+                                leader_present = false;
+                                completion = Some((AttemptState::Lost, "recovered process identity changed before cancellation"));
+                            }
                         }
                     }
                 }
@@ -706,19 +722,32 @@ async fn supervise_recovered(
             _ = heartbeat.tick() => {
                 if let Err(error) = database.jobs().heartbeat_execution(claim, CLAIM_DURATION).await {
                     tracing::error!(%error, job_id = %claim.job.spec.id, "recovered execution heartbeat failed");
-                    terminate_group(group_id);
-                    completion = Some((AttemptState::Failed, "execution heartbeat failed after recovery"));
+                    if signal_recovered_group(pid, group_id, process.process_start_ticks, Signal::SIGKILL) {
+                        completion = Some((AttemptState::Failed, "execution heartbeat failed after recovery"));
+                    } else {
+                        leader_present = false;
+                        completion = Some((AttemptState::Lost, "recovered process identity changed before heartbeat failure"));
+                    }
+                    timeout_deadline = None;
+                    cancel_deadline = None;
                 }
             }
             _ = wait_for_deadline(cancel_deadline), if cancel_deadline.is_some() => {
-                terminate_group(group_id);
+                if !signal_recovered_group(pid, group_id, process.process_start_ticks, Signal::SIGKILL) {
+                    leader_present = false;
+                    completion = Some((AttemptState::Lost, "recovered process identity changed before cancellation deadline"));
+                }
                 cancel_deadline = None;
             }
             _ = wait_for_deadline(timeout_deadline), if timeout_deadline.is_some() => {
-                terminate_group(group_id);
+                if signal_recovered_group(pid, group_id, process.process_start_ticks, Signal::SIGKILL) {
+                    completion = Some((AttemptState::Failed, "configured execution timeout elapsed after recovery"));
+                } else {
+                    leader_present = false;
+                    completion = Some((AttemptState::Lost, "recovered process identity changed before timeout"));
+                }
                 timeout_deadline = None;
                 cancel_deadline = None;
-                completion = Some((AttemptState::Failed, "configured execution timeout elapsed after recovery"));
             }
             _ = shutdown.changed() => {
                 release_for_restart(database, claim).await;
@@ -2375,14 +2404,13 @@ async fn timeout_docker(
     {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
-            tracing::error!(error = %String::from_utf8_lossy(&output.stderr), container_id = %container.container_id, "cannot kill timed-out Docker container");
-            return;
+            tracing::warn!(error = %String::from_utf8_lossy(&output.stderr), container_id = %container.container_id, "Docker kill failed; checking whether the container already exited");
         }
         Err(error) => {
             tracing::error!(%error, container_id = %container.container_id, "Docker timeout kill was not confirmed");
             return;
         }
-    }
+    };
     let inspection = match inspect_docker(
         database,
         planner,
@@ -2587,6 +2615,17 @@ fn terminate_group(pid: u32) {
     signal_group(pid, Signal::SIGKILL);
 }
 
+fn signal_recovered_group(pid: u32, group_id: u32, start_ticks: i64, signal: Signal) -> bool {
+    if !matches!(process_identity(pid), Ok(identity)
+        if identity.process_group_id == i64::from(group_id)
+            && identity.start_ticks == start_ticks)
+    {
+        return false;
+    }
+    signal_group(group_id, signal);
+    true
+}
+
 fn signal_group(pid: u32, signal: Signal) {
     if let Ok(pid) = i32::try_from(pid) {
         let _ = killpg(Pid::from_raw(pid), signal);
@@ -2602,6 +2641,33 @@ fn process_group_exists(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recovered_group_signal_requires_original_process_identity() -> io::Result<()> {
+        let mut child = Command::new("/bin/sleep");
+        child
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        child.as_std_mut().process_group(0);
+        let mut child = child.spawn()?;
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("child has no PID"))?;
+        let identity = process_identity(pid)?;
+        assert_eq!(identity.process_group_id, i64::from(pid));
+        assert!(!signal_recovered_group(
+            pid,
+            pid,
+            identity.start_ticks + 1,
+            Signal::SIGTERM
+        ));
+        assert!(child.try_wait()?.is_none());
+        child.kill().await?;
+        child.wait().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn assigned_gpus_override_the_requested_process_environment() -> io::Result<()> {

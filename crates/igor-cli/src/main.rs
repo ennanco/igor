@@ -10,11 +10,11 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use igor_core::{
-    CommandSpec, ConfigOverrides, EffectiveConfig, Environment, EnvironmentPolicy, FamilyDetail,
-    FamilyId, HostConfigUpdate, JobDetail, JobId, JobLogs, JobState, Project, ProjectId,
-    ResourceStatus, ShellPolicy, StoredEvent, StoredJob, SubmissionInput, TransitionState,
-    initialize_project, load_effective_config, load_family_file, load_job_file,
-    load_project_config, select_global_config_path, update_global_host_config,
+    CommandSpec, ConfigOverrides, Database, DatabaseOptions, EffectiveConfig, Environment,
+    EnvironmentPolicy, FamilyDetail, FamilyId, HostConfigUpdate, IntegrityCheck, JobDetail, JobId,
+    JobLogs, JobState, Project, ProjectId, ResourceStatus, ShellPolicy, StoredEvent, StoredJob,
+    SubmissionInput, TransitionState, initialize_project, load_effective_config, load_family_file,
+    load_job_file, load_project_config, select_global_config_path, update_global_host_config,
 };
 use igor_daemon::{
     Client, ClientError, DaemonRole, DatabaseStatus, Health, Request, Response, Version,
@@ -87,6 +87,9 @@ enum Command {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+        /// Show which managed units would be removed without changing services.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Create portable project configuration.
     Init {
@@ -99,6 +102,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Inspect and verify the local database.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
     },
     /// Run the experiment worker.
     Worker,
@@ -200,6 +208,29 @@ enum ConfigCommand {
     },
     /// Set host scheduling limits in the global configuration.
     Set(ConfigSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DbCommand {
+    /// Verify database integrity, foreign keys, and schema version without a daemon.
+    Check {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Migrate an existing database to the latest schema.
+    Migrate {
+        #[arg(long)]
+        json: bool,
+        /// Preview the migration without changing the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Create and validate a backup of an existing database.
+    Backup {
+        destination: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -363,6 +394,9 @@ enum ServiceCommand {
         /// Skip the confirmation prompt.
         #[arg(long)]
         yes: bool,
+        /// Show which managed units would be removed without changing services.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -402,9 +436,11 @@ async fn run() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let overrides = ConfigOverrides::from(cli.paths);
     match cli.command {
-        Command::Uninstall { yes } => {
-            uninstall_user_services(yes).await?;
-            println!("preserved Igor binary, configuration, database, logs, and job history");
+        Command::Uninstall { yes, dry_run } => {
+            uninstall_user_services(yes, dry_run).await?;
+            if !dry_run {
+                println!("preserved Igor binary, configuration, database, logs, and job history");
+            }
         }
         Command::Init { path, force } => {
             let root = if path.is_absolute() {
@@ -455,6 +491,25 @@ async fn run() -> anyhow::Result<()> {
                 set_host_config(&overrides, arguments)?;
             }
         },
+        Command::Db { command } => match command {
+            DbCommand::Check { json } => {
+                let effective = effective_config(&overrides, &cwd)?;
+                check_database(&effective.paths.database, json).await?;
+            }
+            DbCommand::Migrate { json, dry_run } => {
+                let effective = effective_config(&overrides, &cwd)?;
+                migrate_database(&effective.paths.database, json, dry_run).await?;
+            }
+            DbCommand::Backup { destination, json } => {
+                let effective = effective_config(&overrides, &cwd)?;
+                backup_database(
+                    &effective.paths.database,
+                    &absolute(&cwd, &destination),
+                    json,
+                )
+                .await?;
+            }
+        },
         Command::Worker => {
             let effective = effective_config(&overrides, &cwd)?;
             igor_daemon::run(DaemonRole::Worker, &effective.paths).await?;
@@ -492,8 +547,12 @@ async fn run() -> anyhow::Result<()> {
             ServiceCommand::Restart => manage_user_services("restart", false).await?,
             ServiceCommand::Status { json } => show_service_status(json).await?,
             ServiceCommand::Logs { follow } => show_service_logs(follow).await?,
-            ServiceCommand::Uninstall { user: _, yes } => {
-                uninstall_user_services(yes).await?;
+            ServiceCommand::Uninstall {
+                user: _,
+                yes,
+                dry_run,
+            } => {
+                uninstall_user_services(yes, dry_run).await?;
             }
         },
         Command::Notify { command } => match command {
@@ -740,15 +799,27 @@ async fn install_user_services() -> anyhow::Result<()> {
     for unit in &units {
         let path = directory.join(unit.name);
         match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                anyhow::bail!("refusing symlinked managed service unit {}", path.display());
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                anyhow::bail!(
+                    "refusing non-regular managed service unit {}",
+                    path.display()
+                );
             }
-            Ok(_) if fs::read(&path)? == unit.contents.as_bytes() => {}
             Ok(_) => {
+                let previous = fs::read(&path)?;
+                if previous == unit.contents.as_bytes() {
+                    continue;
+                }
+                if !managed_unit_identity(&previous, unit.name) {
+                    anyhow::bail!(
+                        "refusing to overwrite unrelated service unit {}",
+                        path.display()
+                    );
+                }
                 changed = true;
                 pending.push((
                     path.clone(),
-                    Some(fs::read(&path)?),
+                    Some(previous),
                     unit.contents.as_bytes().to_vec(),
                 ));
             }
@@ -802,6 +873,45 @@ async fn install_user_services() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn managed_unit_identity(contents: &[u8], name: &str) -> bool {
+    let Ok(contents) = std::str::from_utf8(contents) else {
+        return false;
+    };
+    let (description, role) = match name {
+        "igor-worker.service" => ("Igor worker", "worker"),
+        "igor-supervisor.service" => ("Igor supervisor", "supervisor"),
+        _ => return false,
+    };
+    let mut section = "";
+    let mut found_description = false;
+    let mut found_type = false;
+    let mut found_exec = false;
+    for line in contents.lines().map(str::trim) {
+        if line.starts_with('[') && line.ends_with(']') {
+            section = &line[1..line.len() - 1];
+        } else if let Some((key, value)) = line.split_once('=') {
+            match (section, key.trim(), value.trim()) {
+                ("Unit", "Description", value) if value == description => found_description = true,
+                ("Service", "Type", "simple") => found_type = true,
+                ("Service", "ExecStart", value) => {
+                    found_exec = value
+                        .strip_prefix('"')
+                        .and_then(|quoted| quoted.rsplit_once('"'))
+                        .is_some_and(|(binary, arguments)| {
+                            Path::new(binary).is_absolute()
+                                && Path::new(binary)
+                                    .file_name()
+                                    .is_some_and(|name| name == "igor")
+                                && arguments.trim() == role
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+    found_description && found_type && found_exec
+}
+
 fn rollback_units(staged: &[(PathBuf, PathBuf, Option<Vec<u8>>)], installed: usize) {
     for (_, path, original) in staged.iter().take(installed) {
         match original {
@@ -847,7 +957,14 @@ async fn manage_user_services(action: &str, now: bool) -> anyhow::Result<()> {
     let directory = user_service_directory()?;
     for name in USER_SERVICE_NAMES {
         let path = directory.join(name);
-        if !path.is_file() || path.symlink_metadata()?.file_type().is_symlink() {
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                anyhow::bail!("managed service unit is not installed: {}", path.display())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() || !managed_unit_identity(&fs::read(&path)?, name) {
             anyhow::bail!("managed service unit is not installed: {}", path.display());
         }
     }
@@ -1050,6 +1167,156 @@ fn effective_config(
 ) -> anyhow::Result<EffectiveConfig> {
     let environment = Environment::from_process()?;
     Ok(load_effective_config(&environment, overrides, cwd)?)
+}
+
+async fn check_database(path: &Path, json: bool) -> anyhow::Result<()> {
+    let latest = Database::latest_schema_version();
+    let observed = match run_database_check(path).await {
+        Ok(schema_version) => schema_version,
+        Err(error) => anyhow::bail!("database check failed for {}: {error:#}", path.display()),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "schema_version": observed,
+                "latest_schema_version": latest,
+            }))?
+        );
+    } else {
+        println!(
+            "database check passed: integrity ok, foreign keys ok, schema version {observed} matches latest {latest}"
+        );
+    }
+    Ok(())
+}
+
+async fn run_database_check(path: &Path) -> anyhow::Result<i64> {
+    if !path.exists() {
+        anyhow::bail!(
+            "database file does not exist; run the worker once to initialize it or pass --database <path>"
+        );
+    }
+    let schema_version = validate_database(path).await?;
+    let latest = Database::latest_schema_version();
+    if schema_version != latest {
+        anyhow::bail!(
+            "schema version {schema_version} does not match latest {latest}; start the worker once to migrate the database"
+        );
+    }
+    Ok(schema_version)
+}
+
+async fn migrate_database(path: &Path, json: bool, dry_run: bool) -> anyhow::Result<()> {
+    if !path.exists() {
+        anyhow::bail!("database file does not exist; refusing to create it");
+    }
+    let before = validate_database(path).await?;
+    let latest = Database::latest_schema_version();
+    if before > latest {
+        anyhow::bail!(
+            "schema version {before} is newer than supported version {latest}; use a compatible Igor version"
+        );
+    }
+    if dry_run {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "dry_run",
+                    "schema_version_before": before,
+                    "latest_schema_version": latest,
+                    "would_migrate": before != latest,
+                }))?
+            );
+        } else if before == latest {
+            println!("database schema is already current at version {before}; no migration needed");
+        } else {
+            println!("would migrate database from schema version {before} to {latest}");
+        }
+        return Ok(());
+    }
+    let database = Database::open_with_options(
+        path,
+        DatabaseOptions {
+            writable: true,
+            create_if_missing: false,
+            ..DatabaseOptions::default()
+        },
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("database migration failed: {error}"))?;
+    let after = database.schema_version().await?;
+    database.integrity_check(IntegrityCheck::Full).await?;
+    database.foreign_key_check().await?;
+    database.pool().close().await;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": if before == after { "unchanged" } else { "migrated" },
+                "schema_version_before": before,
+                "schema_version_after": after,
+                "latest_schema_version": Database::latest_schema_version(),
+            }))?
+        );
+    } else if before == after {
+        println!("database schema is already current at version {after}");
+    } else {
+        println!("database migrated from schema version {before} to {after}");
+    }
+    Ok(())
+}
+
+async fn validate_database(path: &Path) -> anyhow::Result<i64> {
+    let database = Database::open_with_options(
+        path,
+        DatabaseOptions {
+            writable: false,
+            ..DatabaseOptions::default()
+        },
+    )
+    .await?;
+    let version = database.schema_version().await?;
+    database.integrity_check(IntegrityCheck::Full).await?;
+    database.foreign_key_check().await?;
+    database.pool().close().await;
+    Ok(version)
+}
+
+async fn backup_database(source: &Path, destination: &Path, json: bool) -> anyhow::Result<()> {
+    if !source.exists() {
+        anyhow::bail!("database file does not exist; refusing to create it");
+    }
+    let database = Database::open_with_options(
+        source,
+        DatabaseOptions {
+            writable: false,
+            ..DatabaseOptions::default()
+        },
+    )
+    .await?;
+    let version = database.schema_version().await?;
+    database.backup(destination).await?;
+    database.pool().close().await;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "source": source,
+                "destination": destination,
+                "source_schema_version": version,
+            }))?
+        );
+    } else {
+        println!(
+            "database backed up to {} (source schema version {version})",
+            destination.display()
+        );
+    }
+    Ok(())
 }
 
 async fn submit(
@@ -1528,15 +1795,53 @@ fn expect_project(response: Response) -> anyhow::Result<Project> {
     }
 }
 
-async fn uninstall_user_services(yes: bool) -> anyhow::Result<()> {
+async fn uninstall_user_services(yes: bool, dry_run: bool) -> anyhow::Result<()> {
     let unit_directory = user_service_directory()?;
-    let installed: Vec<_> = USER_SERVICE_NAMES
-        .iter()
-        .map(|name| (name, unit_directory.join(name)))
-        .filter(|(_, path)| path.symlink_metadata().is_ok())
-        .collect();
+    let mut installed = Vec::new();
+    for name in &USER_SERVICE_NAMES {
+        let path = unit_directory.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => anyhow::bail!(
+                "refusing non-regular managed service unit {}",
+                path.display()
+            ),
+            Ok(_) if managed_unit_identity(&fs::read(&path)?, name) => installed.push((name, path)),
+            Ok(_) => anyhow::bail!(
+                "refusing to uninstall unrelated service unit {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     if installed.is_empty() {
         println!("no Igor user services are installed");
+        return Ok(());
+    }
+    let staging_paths: Vec<_> = installed
+        .iter()
+        .enumerate()
+        .map(|(index, (_, path))| {
+            path.with_file_name(format!(
+                ".igor-unit-{}-uninstall-{index}.tmp",
+                std::process::id()
+            ))
+        })
+        .collect();
+    for temporary in &staging_paths {
+        match fs::symlink_metadata(temporary) {
+            Ok(_) => anyhow::bail!(
+                "refusing to reuse existing uninstall staging path {}",
+                temporary.display()
+            ),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if dry_run {
+        for (_, path) in installed {
+            println!("would stop and remove {}", path.display());
+        }
         return Ok(());
     }
     if !yes {
@@ -1561,20 +1866,65 @@ async fn uninstall_user_services(yes: bool) -> anyhow::Result<()> {
     if !status.success() {
         anyhow::bail!("systemctl --user disable --now failed with {status}");
     }
-    for (_, path) in &installed {
-        fs::remove_file(path)?;
-        println!("removed {}", path.display());
+    // Stage the owned units by rename inside their own directory so their bytes
+    // and permissions survive a failed reload, then delete them once the manager
+    // accepted the change.
+    let restore_staged = |staged: &[(PathBuf, PathBuf)]| {
+        for (temporary, path) in staged {
+            if let Err(error) = fs::rename(temporary, path) {
+                eprintln!("could not restore staged unit {}: {error}", path.display());
+            }
+        }
+    };
+    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut staging_error = None;
+    for ((_, path), temporary) in installed.iter().zip(&staging_paths) {
+        let staged_one: anyhow::Result<()> = match fs::symlink_metadata(temporary) {
+            Ok(_) => Err(anyhow::anyhow!(
+                "refusing to reuse existing uninstall staging path {}",
+                temporary.display()
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match fs::rename(path, temporary) {
+                    Ok(()) => {
+                        staged.push((temporary.clone(), path.clone()));
+                        Ok(())
+                    }
+                    Err(error) => Err(anyhow::anyhow!(
+                        "failed staging {} for removal: {error}",
+                        path.display()
+                    )),
+                }
+            }
+            Err(error) => Err(error.into()),
+        };
+        if let Err(error) = staged_one {
+            staging_error = Some(error);
+            break;
+        }
     }
-    let mut reload = tokio::process::Command::new("systemctl");
-    reload
-        .args(["--user", "daemon-reload"])
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    let status = tokio::time::timeout(SYSTEMCTL_TIMEOUT, reload.status())
-        .await
-        .map_err(|_| anyhow::anyhow!("systemctl --user daemon-reload timed out"))??;
-    if !status.success() {
-        anyhow::bail!("systemctl --user daemon-reload failed with {status}");
+    if let Some(error) = staging_error {
+        restore_staged(&staged);
+        let _ = reload_user_units().await;
+        return Err(error);
+    }
+    if let Err(error) = reload_user_units().await {
+        restore_staged(&staged);
+        let _ = reload_user_units().await;
+        return Err(error);
+    }
+    let mut removal_errors = Vec::new();
+    for (temporary, path) in &staged {
+        match fs::remove_file(temporary) {
+            Ok(()) => println!("removed {}", path.display()),
+            Err(error) => removal_errors.push(format!(
+                "could not remove staged unit {}: {error}",
+                temporary.display()
+            )),
+        }
+    }
+    if !removal_errors.is_empty() {
+        anyhow::bail!("{}", removal_errors.join("; "));
     }
     Ok(())
 }

@@ -1081,11 +1081,85 @@ Database operations:
 ```bash
 igor db check
 igor db migrate
-igor db backup
+igor db backup DESTINATION
 ```
 
-Destructive cleanup commands provide `--dry-run` and require explicit
-confirmation unless `--yes` is passed.
+User-facing service uninstall supports `--dry-run` and requires explicit
+confirmation unless `--yes` is passed. `igor db migrate --dry-run` validates
+and previews a pending schema upgrade without applying it. Automatic cleanup
+of Igor-owned attempts does not prompt the user.
+
+### 22.1 Compatibility Boundaries
+
+The local CLI/worker/supervisor wire protocol requires an exact version match
+(currently `9`); incompatible messages fail before operational dispatch. Global
+and project TOML, job and family TOML, and event payloads each have their own
+explicit version (`1` in the current implementation). Readers reject an
+unsupported version rather than silently interpreting it as the current schema.
+SQLite uses numbered, checksummed SQLx migrations (currently through `0009`).
+Writable worker startup applies available migrations; `igor db check` only
+reads, and `igor db migrate` explicitly upgrades an existing database after
+integrity and foreign-key checks. Back up before upgrades. Database migration
+does not imply TOML conversion, downgrade support, or compatibility between
+different protocol versions. Upgrade the binary and both user services together.
+
+### 22.2 Trusted-User Security Boundary
+
+Igor assumes a trusted single-user Linux account. Worker and supervisor sockets
+are private to that user and reject peers of another UID, but processes running
+as the same user are not mutually isolated. Direct jobs, transient user units,
+Docker jobs, explicit shell commands, and future hooks or coding agents must be
+treated as code with access to that account. No general hook or coding-agent
+executor is currently available; planned context limits and session cleanup
+must be implemented and audited before relying on them.
+
+Docker uses only explicitly configured mount sources; writable mounts can
+modify host paths beyond the project root and are not a security sandbox.
+Declared scientific files are checked within the project and symlinks are
+rejected, while Docker mounts deliberately use their separately declared
+absolute-path boundary. The user configuration holds Telegram credentials,
+is written with mode `0600`, and is redacted in effective-config output.
+Direct experiment process environments start cleared and apply an inheritance
+policy; names recognized as sensitive are filtered or rejected, but arbitrary
+names and job output are not guaranteed secret-free. Use minimal inheritance
+for untrusted environment contents and protect user config, logs, SQLite files
+and backups.
+
+### 22.3 Subprocess Environment Audit
+
+Current production subprocess entry points and environment boundaries:
+
+| Child | Call sites | Environment and boundary |
+|---|---|---|
+| Direct experiment | `worker.rs` process-group execution | Starts with `env_clear`; the default inherits only basic locale, user, home and path values. Explicit variables with recognized sensitive names are rejected. `inherit = "all"` is opt-in and filters recognized names, not arbitrary secret values. |
+| Transient experiment unit | `worker.rs` and `systemd.rs` `systemd-run` | Builds the same filtered process environment, then launches the attempt through `/usr/bin/env -i` inside the user unit. The manager command itself is a trusted administrative child. |
+| Docker experiment | `executor.rs` planner and `worker.rs` Docker lifecycle | The trusted host `docker` CLI inherits the worker environment for local daemon and user configuration. Container creation passes only explicit, name-validated `--env` values and assigned GPUs; it does not copy the worker's ambient environment into the container. Image defaults remain in force. Explicit values appear in Docker CLI arguments. |
+| Local metadata helpers | `submission.rs` Git, `inventory.rs` `nvidia-smi`, `executor.rs` Docker probes | Inherit the worker's environment as trusted local tools. Git's configured helpers/filters and executable resolution therefore remain within the trusted-user boundary; their environment is not used as a job's environment. |
+| Service administration | CLI `systemctl` and `journalctl`; worker `systemctl`/`systemd-run` | Inherit the invoking CLI/worker environment to contact the user manager and display service state. They do not receive Telegram credentials from project job specifications or pass the inherited environment as the experiment unit environment. |
+
+Telegram delivery uses an in-process HTTP client, not a shell child. Hooks,
+metrics extractors and coding-agent subprocesses are not implemented yet and
+must receive their own environment review when introduced. This audit does not
+claim that trusted administrative helpers are isolated from the invoking
+account or that a non-sensitive variable name cannot hold a secret. Existing
+process, Docker and systemd tests exercise the experiment/container boundary;
+re-audit when new subprocess entry points are added.
+
+### 22.4 Destructive Operation Audit
+
+| Operation | Scope and recovery contract |
+|---|---|
+| `igor init --force` and user configuration updates | `--force` explicitly authorizes replacement of the two project templates. The `.igor` directory and both target paths are checked against symlinks/nonregular entries before writing; forced replacement stages each file and preserves existing permissions. Global user settings use an atomic private-file writer. Project initialization is repeatable, but its two file replacements are not one filesystem transaction. |
+| Service installation/management/removal | Only the fixed Igor user-unit names are targeted. Preexisting units must be regular files with the expected Igor identity; symlinks and unrelated units are rejected even on uninstall. Installation skips identical units and attempts file rollback on reload failure. Uninstall offers `--dry-run`, defaults to a confirmation prompt, stages owned files for restoration if reload fails, and is a no-op if no units exist. `disable --now` can already have changed service state when a later file/reload step fails; restoration of unit bytes does not restart a stopped service. |
+| `igor db migrate` and `igor db backup` | Migration is explicit, supports `--dry-run`, refuses to create a missing source, and checks integrity/foreign keys before and after applying checksummed migrations. Backup targets an exclusive new path; the SQLite backup API verifies the copy and refuses overwrite/source alias. Neither offers a downgrade or an implicit restore. |
+| Project deregistration, job cancellation and retry | Project removal changes registration only after checking that no queued/running jobs remain; history and files are retained and registration can be restored. Cancellation targets a specific job ID and attempts a graceful stop before escalation. Retry preserves previous attempts. These explicit state transitions do not delete research history. |
+| Worker cleanup and internal database pruning | Docker commands address a persisted container ID, systemd commands a persisted attempt-derived unit name with invocation checks, and process groups are signalled only while the recovered leader identity still matches. Missing Docker objects are treated idempotently. Resource-leases and stale Igor-managed inventory rows are pruned within scoped transactions; job, attempt and event history is not pruned. Stale socket removal checks UID/type and rechecks inode under the role lock. |
+
+Remaining limits: a process-group identity check and subsequent signal cannot
+form one atomic kernel operation; use the transient user-unit backend when
+authoritative restart outcomes matter. A systemd unit name can also be reused
+between inspection and a manager operation by another process of the same
+trusted user. Crash-injection coverage for these boundaries remains in M17.10.
 
 ## 23. Rust Stack
 
@@ -1221,6 +1295,22 @@ cargo doc --workspace --no-deps
 - Request cancellation approval for obsolete active attempts.
 - Create a new generation and rerun every family member.
 - Clean failed and superseded artifacts according to policy.
+
+### Phase 5b: Release Hardening And Measured Optimization (Milestone 17)
+
+- Finish diagnostic, security, compatibility, and release-packaging work.
+- Before changing performance-sensitive code, establish reproducible baselines
+  for representative queue, scheduling, recovery, persistence, CLI, and
+  supervisor workloads. Record environment, fixture, p50/p95 latency,
+  throughput, memory, allocations, and database query costs where relevant.
+- Review module boundaries and simplify duplicated or tightly coupled code
+  when it improves cohesion and maintainability. Optimize measured bottlenecks
+  rather than making speculative rewrites; compare before and after against
+  predeclared goals and watch for regressions in other workloads.
+- Preserve public contracts, durable history, transaction boundaries, lease
+  fencing, restart recovery, and security properties with focused tests.
+- Rerun all quality gates, opt-in integration suites, and release checks on a
+  clean environment after the last optimization, before accepting Hito 17.
 
 ### Phase 6: Sleep_CNN Migration
 

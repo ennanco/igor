@@ -200,6 +200,14 @@ fn spawn_fake_docker_worker(
         )
         .env("IGOR_FAKE_DOCKER_FAIL", options.fail_command.unwrap_or(""))
         .env("IGOR_FAKE_DOCKER_CRASH", options.crash_point.unwrap_or(""))
+        .env(
+            "IGOR_FAKE_DOCKER_KILL_NONZERO_AFTER_STOP",
+            if options.crash_point == Some("kill_nonzero_after_stop") {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .env("TELEGRAM_BOT_TOKEN", "must-not-leak")
         .env("OPENCODE_TEST_SECRET", "must-not-leak");
     if let Some(state_dir) = options.state_dir {
@@ -271,6 +279,10 @@ case "$1" in
     ;;
   kill)
     if [ -n "$STATE_DIR" ]; then touch "$STATE_DIR/stopped"; fi
+    if [ "${IGOR_FAKE_DOCKER_KILL_NONZERO_AFTER_STOP:-false}" = true ]; then
+      printf 'container exited before kill\n' >&2
+      exit 1
+    fi
     ;;
   logs) printf 'fake stdout\n'; printf 'fake stderr\n' >&2 ;;
   wait)
@@ -1580,6 +1592,52 @@ async fn fake_docker_timeout_kills_and_persists_failure() -> TestResult {
     let invocations = fs::read_to_string(invocation_log)?;
     assert!(invocations.contains("kill fake-container"));
     assert!(!invocations.contains("stop --time "));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_docker_timeout_records_failure_when_kill_races_with_exit() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let mut fixture = Fixture::new()?;
+    let (invocation_log, _) = fixture.restart_with_stateful_fake_docker(
+        137,
+        false,
+        None,
+        None,
+        Some("kill_nonzero_after_stop"),
+    )?;
+    let (job_file, _) = write_docker_job(&fixture)?;
+    let specification = fs::read_to_string(&job_file)?.replace(
+        "[resources]\nmode = 'shared'",
+        "[resources]\nmode = 'shared'\ntimeout_seconds = 1",
+    );
+    fs::write(&job_file, specification)?;
+    let job_id = submit_docker_job(&fixture, &job_file)?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let running = wait_for_container(&database, job_id).await?;
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(!waited.status.success());
+    let detail = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing timed-out job")?;
+    assert_eq!(detail.job.state, JobState::Failed);
+    assert_eq!(detail.attempts[0].state, AttemptState::Failed);
+    let container = database
+        .jobs()
+        .container_for_attempt(running.attempt_id)
+        .await?
+        .ok_or("missing timed-out Docker container")?;
+    assert_eq!(container.state, DockerContainerState::Removed);
+    assert_eq!(
+        container.error.as_deref(),
+        Some("docker_timeout: configured execution timeout elapsed")
+    );
+    assert!(fs::read_to_string(invocation_log)?.contains("rm --force fake-container"));
     Ok(())
 }
 
@@ -3020,6 +3078,10 @@ async fn wait_returns_when_job_is_terminal() -> TestResult {
     let timed_out: Value = serde_json::from_slice(&timed_out.stdout)?;
     assert_eq!(timed_out["job"]["state"], "failed");
 
+    // Keep the recovered process alive across the heartbeat wait and worker
+    // restart even when the full integration suite is running slowly.
+    let observed_script = fixture._temporary.path().join("recovered-wait.sh");
+    fs::write(&observed_script, "#!/bin/sh\nsleep 60\n")?;
     let submitted = output_json(
         fixture
             .run()
@@ -3028,7 +3090,7 @@ async fn wait_returns_when_job_is_terminal() -> TestResult {
                 "--json",
                 "--",
                 "/bin/sh",
-                timeout.to_str().ok_or("non-UTF-8 sleep fixture")?,
+                observed_script.to_str().ok_or("non-UTF-8 sleep fixture")?,
             ])
             .output()?,
     )?;
@@ -3088,18 +3150,19 @@ async fn wait_returns_when_job_is_terminal() -> TestResult {
             .state,
         JobState::Running
     );
+    let cancellation = fixture
+        .run()
+        .args([
+            "cancel",
+            &observed_job_id.to_string(),
+            "--grace-seconds",
+            "0",
+        ])
+        .output()?;
     assert!(
-        fixture
-            .run()
-            .args([
-                "cancel",
-                &observed_job_id.to_string(),
-                "--grace-seconds",
-                "0"
-            ])
-            .output()?
-            .status
-            .success()
+        cancellation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cancellation.stderr)
     );
     let waited = fixture
         .run()

@@ -143,6 +143,7 @@ pub struct DatabaseOptions {
     pub max_connections: u32,
     pub busy_timeout: Duration,
     pub writable: bool,
+    pub create_if_missing: bool,
 }
 
 impl Default for DatabaseOptions {
@@ -151,6 +152,7 @@ impl Default for DatabaseOptions {
             max_connections: 8,
             busy_timeout: DEFAULT_BUSY_TIMEOUT,
             writable: true,
+            create_if_missing: true,
         }
     }
 }
@@ -172,6 +174,7 @@ impl Database {
     ) -> PersistenceResult<Self> {
         let path = path.as_ref();
         if options.writable
+            && options.create_if_missing
             && let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -238,6 +241,14 @@ impl Database {
         .map_err(|source| db("read schema version", source))
     }
 
+    #[must_use]
+    pub fn latest_schema_version() -> i64 {
+        MIGRATOR
+            .migrations
+            .last()
+            .map_or(0, |migration| migration.version)
+    }
+
     pub fn projects(&self) -> ProjectRepository<'_> {
         ProjectRepository { database: self }
     }
@@ -287,6 +298,21 @@ impl Database {
                 value: rows.join("; "),
             })
         }
+    }
+
+    pub async fn foreign_key_check(&self) -> PersistenceResult<()> {
+        let violation = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| db("run foreign key check", source))?;
+        if let Some(violation) = violation {
+            let table: String = violation.get("table");
+            return Err(PersistenceError::InvalidValue {
+                entity: "foreign key check result",
+                value: format!("foreign key violation in {table}"),
+            });
+        }
+        Ok(())
     }
 
     pub async fn backup(&self, destination: impl AsRef<Path>) -> PersistenceResult<()> {
@@ -391,7 +417,7 @@ impl Drop for TemporaryBackup {
 fn configured_options(path: &Path, options: &DatabaseOptions) -> SqliteConnectOptions {
     let connect = SqliteConnectOptions::new()
         .filename(path)
-        .create_if_missing(options.writable)
+        .create_if_missing(options.writable && options.create_if_missing)
         .read_only(!options.writable)
         .foreign_keys(true)
         .busy_timeout(options.busy_timeout);

@@ -579,26 +579,115 @@ pub fn load_project_config(path: &Path) -> Result<LoadedProjectConfig, ConfigErr
 pub fn initialize_project(root: &Path, force: bool) -> Result<Vec<PathBuf>, ConfigError> {
     let config_path = root.join(PROJECT_CONFIG_RELATIVE_PATH);
     let prompt_path = root.join(REPORT_PROMPT_RELATIVE_PATH);
-    if !force {
-        for path in [&config_path, &prompt_path] {
-            if path.exists() {
+    let config_directory = config_path.parent().unwrap_or(root);
+    match fs::symlink_metadata(config_directory) {
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+            return Err(ConfigError::Write {
+                path: config_directory.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "project config directory must be a directory, not a symlink",
+                ),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ConfigError::Write {
+                path: config_directory.to_path_buf(),
+                source,
+            });
+        }
+    }
+    for path in [&config_path, &prompt_path] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(ConfigError::Write {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "target must be a regular file, not a symlink",
+                    ),
+                });
+            }
+            Ok(_) if !force => {
                 return Err(ConfigError::AlreadyExists {
                     path: path.to_path_buf(),
                 });
             }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ConfigError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         }
     }
-    let config_directory = config_path.parent().unwrap_or(root);
     fs::create_dir_all(config_directory).map_err(|source| ConfigError::Write {
         path: config_directory.to_path_buf(),
         source,
     })?;
-    write_file(
+    let write = if force {
+        write_project_file_atomic
+    } else {
+        write_file
+    };
+    write(
         &config_path,
         include_str!("../../../config/example-project.toml"),
     )?;
-    write_file(&prompt_path, DEFAULT_REPORT_PROMPT)?;
+    write(&prompt_path, DEFAULT_REPORT_PROMPT)?;
     Ok(vec![config_path, prompt_path])
+}
+
+fn write_project_file_atomic(path: &Path, contents: &str) -> Result<(), ConfigError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let previous_permissions = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            Some(metadata.permissions())
+        }
+        Ok(_) => {
+            return Err(ConfigError::Write {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "target must be a regular file, not a symlink",
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => {
+            return Err(ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let temporary = parent.join(format!(".igor-init-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(&temporary)?;
+        if let Some(permissions) = previous_permissions {
+            file.set_permissions(permissions)?;
+        }
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok::<_, std::io::Error>(())
+    })();
+    if let Err(source) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
 }
 
 fn resolve_runtime_paths(

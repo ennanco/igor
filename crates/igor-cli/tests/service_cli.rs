@@ -492,7 +492,17 @@ fn install_units(home: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let directory = home.join("config/systemd/user");
     fs::create_dir_all(&directory)?;
     for name in UNITS {
-        fs::write(directory.join(name), b"[Unit]\nDescription=Igor test\n")?;
+        let role = if name == UNITS[0] {
+            "worker"
+        } else {
+            "supervisor"
+        };
+        fs::write(
+            directory.join(name),
+            format!(
+                "[Unit]\nDescription=Igor {role}\n\n[Service]\nType=simple\nExecStart=\"/old/path/igor\" {role}\n"
+            ),
+        )?;
     }
     Ok(directory)
 }
@@ -535,7 +545,7 @@ fn service_and_top_level_uninstall_remove_only_managed_user_units() -> TestResul
         "--user disable --now -- igor-worker.service igor-supervisor.service\n--user daemon-reload\n"
     );
 
-    fs::write(unit_directory.join(UNITS[0]), b"[Unit]\n")?;
+    fs::write(unit_directory.join(UNITS[0]), b"[Unit]\nDescription=Igor worker\n[Service]\nType=simple\nExecStart=\"/old/path/igor\" worker\n")?;
     fs::write(&log, b"")?;
     let output = command(&home, &fake_bin, &log)
         .args(["uninstall", "--yes"])
@@ -563,6 +573,39 @@ fn service_and_top_level_uninstall_remove_only_managed_user_units() -> TestResul
 }
 
 #[test]
+fn uninstall_dry_run_lists_managed_units_without_stopping_or_deleting() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let home = temporary.path().join("home");
+    let log = temporary.path().join("systemctl.log");
+    let fake_bin = fake_systemctl(
+        temporary.path(),
+        "printf '%s\n' \"$*\" >> \"$SYSTEMCTL_LOG\"",
+    )?;
+    let directory = install_units(&home)?;
+    for arguments in [
+        vec!["service", "uninstall", "--user", "--dry-run"],
+        vec!["uninstall", "--dry-run"],
+    ] {
+        let output = command(&home, &fake_bin, &log).args(arguments).output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let preview = String::from_utf8(output.stdout)?;
+        for name in UNITS {
+            assert!(preview.contains(&format!(
+                "would stop and remove {}",
+                directory.join(name).display()
+            )));
+            assert!(directory.join(name).is_file());
+        }
+        assert!(!log.exists());
+    }
+    Ok(())
+}
+
+#[test]
 fn failed_service_stop_preserves_unit_files() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let home = temporary.path().join("home");
@@ -580,6 +623,62 @@ fn failed_service_stop_preserves_unit_files() -> TestResult {
     assert_eq!(
         fs::read_to_string(log)?,
         "--user disable --now -- igor-worker.service igor-supervisor.service\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_uninstall_reload_restores_both_unit_files_and_drops_staging_temps() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let home = temporary.path().join("home");
+    let log = temporary.path().join("systemctl.log");
+    let fake_bin = fake_systemctl(
+        temporary.path(),
+        "printf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"; case \"$*\" in *daemon-reload*) exit 9 ;; esac",
+    )?;
+    let unit_directory = install_units(&home)?;
+    let before: Vec<_> = UNITS
+        .iter()
+        .map(|name| {
+            let path = unit_directory.join(name);
+            Ok((fs::read(&path)?, fs::metadata(&path)?.permissions().mode()))
+        })
+        .collect::<Result<_, Box<dyn Error>>>()?;
+
+    let output = command(&home, &fake_bin, &log)
+        .args(["service", "uninstall", "--user", "--yes"])
+        .output()?;
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("daemon-reload"),
+        "expected the reload failure to be reported: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (name, (original, mode)) in UNITS.iter().zip(&before) {
+        let path = unit_directory.join(name);
+        assert_eq!(
+            &fs::read(&path)?,
+            original,
+            "{name} bytes were not restored"
+        );
+        assert_eq!(
+            &fs::metadata(&path)?.permissions().mode(),
+            mode,
+            "{name} permissions were not preserved"
+        );
+    }
+    let staging_temps: Vec<_> = fs::read_dir(&unit_directory)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".igor-unit-"))
+        .collect();
+    assert!(
+        staging_temps.is_empty(),
+        "staging temporaries were left behind: {staging_temps:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&log)?,
+        "--user disable --now -- igor-worker.service igor-supervisor.service\n--user daemon-reload\n--user daemon-reload\n"
     );
     Ok(())
 }
@@ -843,6 +942,71 @@ fn install_rejects_symlinked_unit_without_touching_any_unit() -> TestResult {
     assert!(!output.status.success());
     assert_eq!(fs::read(directory.join(UNITS[0]))?, b"preserve");
     assert!(!directory.join(UNITS[1]).exists());
+    assert!(!log.exists());
+    Ok(())
+}
+
+#[test]
+fn install_and_uninstall_preserve_unrelated_regular_units_without_systemctl() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let home = temporary.path().join("home");
+    fs::create_dir_all(&home)?;
+    let log = temporary.path().join("systemctl.log");
+    let fake_bin = fake_systemctl(
+        temporary.path(),
+        "printf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"",
+    )?;
+    let directory = install_units(&home)?;
+    for unrelated in [
+        b"[Unit]\nDescription=My service\n[Service]\nType=simple\nExecStart=/usr/bin/other\n".as_slice(),
+        b"[Unit]\nDescription=Igor worker\n[Service]\nType=simple\nExecStart=\"/usr/bin/other\" worker\n".as_slice(),
+    ] {
+        fs::write(directory.join(UNITS[0]), unrelated)?;
+        let install = command(&home, &fake_bin, &log)
+            .args(["service", "install", "--user"])
+            .output()?;
+        assert!(!install.status.success());
+        assert_eq!(fs::read(directory.join(UNITS[0]))?, unrelated);
+        assert!(!log.exists());
+        let stop = command(&home, &fake_bin, &log)
+            .args(["service", "stop"])
+            .output()?;
+        assert!(!stop.status.success());
+        assert!(!log.exists());
+        let uninstall = command(&home, &fake_bin, &log)
+            .args(["service", "uninstall", "--user", "--yes"])
+            .output()?;
+        assert!(!uninstall.status.success());
+        assert_eq!(fs::read(directory.join(UNITS[0]))?, unrelated);
+        assert!(!log.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn uninstall_preserves_symlinked_units_without_systemctl() -> TestResult {
+    let temporary = tempfile::tempdir()?;
+    let home = temporary.path().join("home");
+    let log = temporary.path().join("systemctl.log");
+    let fake_bin = fake_systemctl(
+        temporary.path(),
+        "printf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"",
+    )?;
+    let directory = install_units(&home)?;
+    let external = temporary.path().join("external");
+    fs::write(&external, b"untouched")?;
+    fs::remove_file(directory.join(UNITS[0]))?;
+    std::os::unix::fs::symlink(&external, directory.join(UNITS[0]))?;
+    let output = command(&home, &fake_bin, &log)
+        .args(["service", "uninstall", "--user", "--yes"])
+        .output()?;
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&external)?, b"untouched");
+    assert!(
+        fs::symlink_metadata(directory.join(UNITS[0]))?
+            .file_type()
+            .is_symlink()
+    );
     assert!(!log.exists());
     Ok(())
 }

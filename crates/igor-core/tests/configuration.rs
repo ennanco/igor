@@ -270,6 +270,100 @@ fn init_preflights_overwrites_and_creates_only_portable_files() -> Result<(), Bo
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn init_force_rejects_symlink_targets_without_changing_either_target() -> Result<(), Box<dyn Error>>
+{
+    use std::os::unix::fs::symlink;
+
+    for (managed, dangling) in [
+        ("project.toml", false),
+        ("report-prompt.md", false),
+        ("project.toml", true),
+    ] {
+        let temporary = TempDir::new()?;
+        let project = temporary.path().join("project");
+        let directory = project.join(".igor");
+        fs::create_dir_all(&directory)?;
+        let config = directory.join("project.toml");
+        let prompt = directory.join("report-prompt.md");
+        let external = temporary.path().join("external");
+        let other = if managed == "project.toml" {
+            &prompt
+        } else {
+            &config
+        };
+        write(other, "preserve managed file")?;
+        if dangling {
+            symlink(
+                temporary.path().join("missing-target"),
+                if managed == "project.toml" {
+                    &config
+                } else {
+                    &prompt
+                },
+            )?;
+        } else {
+            write(&external, "preserve external file")?;
+            symlink(
+                &external,
+                if managed == "project.toml" {
+                    &config
+                } else {
+                    &prompt
+                },
+            )?;
+        }
+
+        assert!(initialize_project(&project, true).is_err());
+        assert_eq!(fs::read_to_string(other)?, "preserve managed file");
+        if !dangling {
+            assert_eq!(fs::read_to_string(external)?, "preserve external file");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn init_rejects_symlinked_config_directory_without_writing_outside_project()
+-> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TempDir::new()?;
+    let project = temporary.path().join("project");
+    let external = temporary.path().join("external");
+    fs::create_dir_all(&project)?;
+    fs::create_dir_all(&external)?;
+    write(&external.join("project.toml"), "preserve external config")?;
+    symlink(&external, project.join(".igor"))?;
+    assert!(initialize_project(&project, true).is_err());
+    assert_eq!(
+        fs::read_to_string(external.join("project.toml"))?,
+        "preserve external config"
+    );
+    assert!(!external.join("report-prompt.md").exists());
+    Ok(())
+}
+
+#[test]
+fn init_force_overwrites_regular_files() -> Result<(), Box<dyn Error>> {
+    let temporary = TempDir::new()?;
+    let project = temporary.path().join("project");
+    let config = project.join(".igor/project.toml");
+    let prompt = project.join(".igor/report-prompt.md");
+    write(&config, "old config")?;
+    write(&prompt, "old prompt")?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+
+    initialize_project(&project, true)?;
+
+    assert_ne!(fs::read_to_string(&config)?, "old config");
+    assert_eq!(fs::metadata(config)?.permissions().mode() & 0o777, 0o600);
+    assert_ne!(fs::read_to_string(prompt)?, "old prompt");
+    Ok(())
+}
+
 #[test]
 fn shipped_fixtures_cover_valid_minimal_complete_and_invalid_documents()
 -> Result<(), Box<dyn Error>> {

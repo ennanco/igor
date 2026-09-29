@@ -129,7 +129,9 @@ history, and require confirmation unless `--yes` is supplied:
 
 ```bash
 igor service uninstall --user
+igor service uninstall --user --dry-run
 igor uninstall
+igor uninstall --dry-run
 ```
 
 Most inspection commands support machine-readable output through `--json`, for
@@ -315,6 +317,105 @@ inspection identifies the highest numbered generation as
 Five-seed partial, failed, retried and repaired generations are covered by
 disposable-repository tests. The current-generation aggregate and its exclusion
 of old attempts will be verified when metrics and reports are available.
+
+## Database Integrity
+
+Check an existing Igor database without starting a daemon or applying migrations:
+
+```bash
+igor db check
+igor db check --json
+igor --database /path/to/igor.sqlite3 db check
+igor db backup /path/to/backup.sqlite3
+igor db migrate --dry-run
+igor db migrate
+```
+
+`igor db check` opens the database read-only and verifies the full SQLite integrity
+check, foreign keys, and the expected schema version. It exits unsuccessfully
+when the database is missing or a check fails; it never creates or upgrades a
+database. After an outdated-schema result, starting the worker applies available
+migrations through the existing startup path. `igor db migrate` applies available
+migrations explicitly to an existing database after checking its integrity and
+foreign keys; it also rechecks both after migration. Neither command creates a
+missing source database. Back up before migrating: `igor db backup` uses SQLite's
+online backup API, verifies the copy's integrity, and refuses to overwrite an
+existing destination or the source. `--dry-run` previews migration after
+validating the existing database; migration and backup accept `--json`.
+
+## Exit Status
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Command completed successfully. |
+| `1` | Other command failure, including failed local database checks or `igor wait` on a job that did not succeed. |
+| `2` | Invalid CLI syntax or arguments (Clap). |
+| `3` | Worker/supervisor unavailable or request timed out. |
+| `4` | Daemon protocol version mismatch. |
+| `5` | Daemon rejected an invalid request. |
+| `6` | Daemon database unavailable. |
+| `7` | Daemon internal error. |
+| `8` | Requested entity not found. |
+| `9` | Request conflicts with existing state. |
+
+Codes `3`–`9` apply to structured daemon-client errors; locally detected
+failures currently use `1`. `--json` commands produce JSON on success and
+report failures to stderr with a nonzero exit status.
+
+## Compatibility And Upgrades
+
+| Contract | Version in this build | Compatibility behavior |
+| --- | --- | --- |
+| Worker/supervisor Unix-socket protocol | `9` | CLI and daemon must use the same version; mismatches are rejected (exit `4`). |
+| Global and project TOML | `1` each | The reader rejects unsupported `schema_version` values; it does not rewrite these files on read. |
+| Job and family TOML | `1` each | Submission rejects unsupported versions before creating jobs. |
+| Event payloads | `1` | Unsupported versions are rejected when decoded. |
+| SQLite schema | `9` | Numbered, checksummed SQLx migrations run on writable worker startup or explicit `igor db migrate`. |
+
+Upgrade the CLI and both user services together; restart the services so they
+run the new binary (`igor service restart` if installed). Before a database
+upgrade, make an online backup with `igor db backup DESTINATION`; inspect an
+existing database with `igor db check`. `igor db migrate` applies available
+SQLite migrations to an existing database, but does not migrate TOML files or
+provide a downgrade path. If a configuration or payload reports an unsupported
+version, use a compatible Igor version or explicitly convert that document;
+do not change `schema_version` alone. Keep the original database backup when
+testing a new release. The protocol version changes when its wire contract
+changes; persisted schema versions are independent of the protocol version.
+
+## Security Model
+
+Igor targets a **trusted single-user Linux account**. The CLI, worker,
+supervisor, experiments and any explicitly invoked external tools run with that
+account's access. User sockets have mode `0600` and check the connecting UID;
+this is not authorization between processes of the same user. Do not share the
+account or its sockets with untrusted workloads. Neither direct processes,
+`systemd --user` units nor Docker containers are treated as a sandbox.
+
+- Direct commands use argument vectors. Shell execution requires an explicit
+  shell submission; its contents run with the user's privileges. Docker uses
+  the local daemon and explicit bind mounts: a writable mount authorizes writes
+  to that host path, including paths outside the Igor project. Images are
+  inspected locally and never pulled implicitly; pin a digest when exact image
+  identity matters.
+- Telegram credentials belong in the user config, not the project.
+  `igor notify setup` reads the token from stdin and saves the file with mode `0600`;
+  `igor config show` redacts it. Treat the private config and database backups as
+  sensitive files. Job environment variables with recognized secret-like names
+  are rejected; inherited process variables are filtered by name, so a secret
+  under an innocuous name can still pass through `inherit = "all"`. Prefer the
+  default minimal environment and review explicitly declared values.
+- Declared project input identities are hashed at submission and checked against
+  the project root; symlinked declared files are rejected. Docker mount sources
+  are an explicit exception to that root boundary. Validate file and mount
+  paths before running third-party experiments; their stdout, stderr, and
+  artifacts can contain sensitive data accessible to the same account.
+- General-purpose hooks and coding-agent execution are planned, not part of the
+  current runner. When introduced, hooks and agents will be external code under
+  the user's privileges; their configuration, context, filesystem access and
+  cleanup must be reviewed separately rather than assumed isolated.
+
+See `DESIGN.md` for the corresponding executor, session, and path contracts.
 
 ## Development
 

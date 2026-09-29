@@ -718,15 +718,15 @@ Dependencies: milestones 0-16.
 - [ ] `M17.01` Implement `igor doctor` checks for config, SQLite, socket,
   systemd, cgroups, Docker, GPUs, agents, Telegram, disk, leases, units,
   containers, worktrees, and sessions.
-- [ ] `M17.02` Implement `igor db check`.
-- [ ] `M17.03` Implement `igor db migrate`.
-- [ ] `M17.04` Implement `igor db backup`.
-- [ ] `M17.05` Add stable exit-code documentation.
-- [ ] `M17.06` Add protocol and config compatibility documentation.
-- [ ] `M17.07` Add security documentation for trusted-user operation, Docker,
+- [x] `M17.02` Implement `igor db check`.
+- [x] `M17.03` Implement `igor db migrate`.
+- [x] `M17.04` Implement `igor db backup`.
+- [x] `M17.05` Add stable exit-code documentation.
+- [x] `M17.06` Add protocol and config compatibility documentation.
+- [x] `M17.07` Add security documentation for trusted-user operation, Docker,
   hooks, agents, secrets, and path boundaries.
-- [ ] `M17.08` Audit every subprocess environment for secret leakage.
-- [ ] `M17.09` Audit every destructive operation for scope validation,
+- [x] `M17.08` Audit every subprocess environment for secret leakage.
+- [x] `M17.09` Audit every destructive operation for scope validation,
   dry-run, confirmation, and idempotency.
 - [ ] `M17.10` Add crash-injection tests around state transitions and filesystem
   publication.
@@ -742,6 +742,25 @@ Dependencies: milestones 0-16.
 - [ ] `M17.18` Paginate job and event history responses before supporting queues
   whose serialized history can exceed the local protocol frame limit.
 
+### Final Optimization And Reengineering Phase
+
+- [ ] `M17.19` Establish reproducible baselines for representative queue,
+  scheduling, recovery, SQLite, CLI, and supervisor workloads: throughput,
+  p50/p95 latency, peak memory, allocations, and database query costs where
+  applicable. Record the fixture, environment, and thresholds before changes.
+- [ ] `M17.20` Review module boundaries and responsibilities across core,
+  worker, supervisor, persistence, and CLI. Refactor measured hotspots or
+  duplicated logic into cohesive modules without changing public contracts or
+  weakening recovery, transaction, or security invariants.
+- [ ] `M17.21` Optimize proven bottlenecks (queries and indexes, allocations,
+  scheduling, I/O, or contention) with before/after measurements; retain only
+  changes with a demonstrated benefit and no significant regression elsewhere.
+- [ ] `M17.22` Add focused regression and benchmark coverage for the refactored
+  paths, including crash/restart and concurrency invariants, and document the
+  resulting architecture and measurements.
+- [ ] `M17.23` After optimization, rerun M17.17 quality gates, opt-in integration
+  suites, and release checks on a clean machine or VM before Hito 17 acceptance.
+
 ### Acceptance
 
 - [ ] `A17.01` `igor doctor` distinguishes required failures from optional
@@ -750,6 +769,11 @@ Dependencies: milestones 0-16.
   steps.
 - [ ] `A17.03` No test or diagnostic uses active Sleep_CNN state.
 - [ ] `A17.04` Release artifacts include licenses, checksums, and version info.
+- [ ] `A17.05` Before/after results show that targeted hotspots meet their
+  predeclared performance goals without significant latency, throughput, or
+  memory regression in representative workloads.
+- [ ] `A17.06` Refactored modules preserve public behavior, SQLite and event
+  history, lease fencing, recovery, security boundaries, and release checks.
 
 ## Milestone 18: Sleep_CNN Adapter And Migration
 
