@@ -1,8 +1,9 @@
 use std::{
     collections::BTreeSet,
     error::Error,
-    io,
+    fs, io,
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,11 +13,13 @@ use igor_core::{
     AttemptState, CommandSpec, ConfigurationIdentity, ContainerCreate, ContainerFinish, Database,
     DatabaseOptions, DeliveryId, DeliveryRecord, DeliveryState, DockerContainerState,
     DockerExecutorSpec, DockerImageIdentity, EnvironmentPolicy, Event, EventId, EventKind,
-    EventPayload, ExecutionClaim, ExecutionOutcome, ExecutorSpec, Family, FamilyId, Generation,
-    GenerationId, GenerationIdentity, GpuRequest, HostGpu, HostInventory, IntegrityCheck, JobId,
-    JobSpec, JobState, NamedResourceMode, NamedResourceRequest, PersistenceError,
-    ProcessExecutorSpec, ProcessIsolation, ProcessStart, Project, ProjectId, Resource, ResourceId,
-    ResourceMode, ResultContract, ShellPolicy, SourceIdentity, UnitReservation,
+    EventPayload, ExecutionClaim, ExecutionOutcome, ExecutorSpec, Family, FamilyFile, FamilyId,
+    Generation, GenerationId, GenerationIdentity, GpuRequest, HostGpu, HostInventory,
+    IntegrityCheck, JobId, JobSpec, JobState, NamedResourceMode, NamedResourceRequest,
+    PersistenceError, PreparedFamily, ProcessExecutorSpec, ProcessIsolation, ProcessStart, Project,
+    ProjectConfig, ProjectId, Resource, ResourceId, ResourceMode, ResultContract, ShellPolicy,
+    SourceIdentity, SubmissionError, UnitReservation, build_family_generation, initialize_project,
+    load_family_file, load_project_config,
 };
 use serde_json::json;
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
@@ -3380,5 +3383,956 @@ async fn direct_sqlite_connection_observes_migrated_foreign_keys() -> TestResult
     let result = sqlx::query("INSERT INTO jobs (id, project_id, name, state, priority, submission_order, spec_json) VALUES (?, ?, 'orphan', 'queued', 0, 1, '{}')")
         .bind(JobId::new().to_string()).bind(ProjectId::new().to_string()).execute(&mut connection).await;
     assert!(result.is_err());
+    Ok(())
+}
+
+const FAMILY_TOML: &str = r#"
+schema_version = 1
+name = "gnn-frozen"
+scientific_configurations = ["configs/shared.toml"]
+
+[execution]
+program = "/usr/bin/python3"
+args = ["train.py", "--frozen"]
+
+[[members]]
+seed = 1
+args = ["--seed", "1"]
+scientific_configurations = ["configs/seed1.toml"]
+
+[[members]]
+seed = 2
+args = ["--seed", "2"]
+scientific_configurations = ["configs/seed2.toml"]
+"#;
+
+fn git(root: &Path, args: &[&str]) -> Result<(), Box<dyn Error>> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()?;
+    if !status.success() {
+        return Err(format!("git {args:?} exited with {status}").into());
+    }
+    Ok(())
+}
+
+fn family_repository() -> Result<(TempDir, Project, ProjectConfig, FamilyFile), Box<dyn Error>> {
+    let temporary = TempDir::new()?;
+    let root = temporary.path().join("project");
+    initialize_project(&root, false)?;
+    fs::create_dir(root.join("configs"))?;
+    for name in ["shared", "seed1", "seed2"] {
+        fs::write(
+            root.join(format!("configs/{name}.toml")),
+            format!("name = '{name}'\n"),
+        )?;
+    }
+    fs::write(root.join("family.toml"), FAMILY_TOML)?;
+    git(&root, &["init", "-q"])?;
+    git(&root, &["config", "user.email", "igor@example.invalid"])?;
+    git(&root, &["config", "user.name", "Igor Test"])?;
+    git(&root, &["add", "."])?;
+    git(&root, &["commit", "-qm", "baseline"])?;
+    let loaded = load_project_config(&root.join(".igor/project.toml"))?;
+    let family = load_family_file(&root.join("family.toml"))?;
+    let project = Project {
+        id: ProjectId::new(),
+        name: "family-project".into(),
+        root,
+        config_path: loaded.config_file,
+    };
+    Ok((temporary, project, loaded.config, family))
+}
+
+struct FamilyFixture {
+    _repository: TempDir,
+    _database: TempDir,
+    database: Database,
+    prepared: PreparedFamily,
+}
+
+async fn family_fixture() -> Result<FamilyFixture, Box<dyn Error>> {
+    let (repository, project, config, file) = family_repository()?;
+    let (directory, database) = database().await?;
+    database.projects().insert(&project).await?;
+    let prepared = build_family_generation(&project, &config, file)?;
+    prepared.validate()?;
+    assert!(
+        prepared.submissions.len() >= 2,
+        "fixture family must contain at least two seeds"
+    );
+    Ok(FamilyFixture {
+        _repository: repository,
+        _database: directory,
+        database,
+        prepared,
+    })
+}
+
+async fn row_counts(database: &Database, tables: &[&str]) -> Result<Vec<i64>, Box<dyn Error>> {
+    let mut counts = Vec::with_capacity(tables.len());
+    for table in tables {
+        counts.push(
+            sqlx::query_scalar::<_, i64>(&format!("SELECT count(*) FROM {table}"))
+                .fetch_one(database.pool())
+                .await?,
+        );
+    }
+    Ok(counts)
+}
+
+async fn successor_for(fixture: &FamilyFixture) -> Result<PreparedFamily, Box<dyn Error>> {
+    let root = fixture._repository.path().join("project");
+    fs::write(root.join("train.py"), "print('repaired code')\n")?;
+    git(&root, &["add", "train.py"])?;
+    git(&root, &["commit", "-qm", "repair"])?;
+    let loaded = load_project_config(&root.join(".igor/project.toml"))?;
+    let file = load_family_file(&root.join("family.toml"))?;
+    let project = Project {
+        id: fixture.prepared.family.project_id,
+        name: "family-project".into(),
+        root,
+        config_path: loaded.config_file,
+    };
+    let prepared = build_family_generation(&project, &loaded.config, file)?
+        .for_existing_family(fixture.prepared.family.clone(), 2)?;
+    Ok(prepared)
+}
+
+#[tokio::test]
+async fn family_supersession_cancels_and_preserves_the_previous_generation() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let previous = &fixture.prepared;
+    let old_jobs = database.families().submit(previous).await?;
+    let successor = successor_for(&fixture).await?;
+    assert_eq!(
+        previous.generation.identity.protocol_digest,
+        successor.generation.identity.protocol_digest
+    );
+    assert_ne!(
+        previous.generation.identity.source_revision,
+        successor.generation.identity.source_revision
+    );
+    let before = row_counts(database, &["generations", "jobs", "attempts", "events"]).await?;
+
+    assert!(
+        database
+            .families()
+            .supersede(previous.generation.identity.id, &successor)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        row_counts(database, &["generations", "jobs", "attempts", "events"]).await?,
+        before
+    );
+    for job in &old_jobs {
+        assert_eq!(
+            database
+                .jobs()
+                .get_job(job.spec.id)
+                .await?
+                .ok_or("old job missing")?
+                .state,
+            JobState::Queued
+        );
+    }
+
+    for job in &old_jobs {
+        database
+            .jobs()
+            .request_cancellation(job.spec.id, Duration::from_secs(1))
+            .await?;
+    }
+    let mut old_history_lengths = Vec::with_capacity(old_jobs.len());
+    for job in &old_jobs {
+        old_history_lengths.push(database.events().for_job(job.spec.id).await?.len());
+    }
+    let old_event_counts = row_counts(database, &["events"]).await?;
+    let new_jobs = database
+        .families()
+        .supersede(previous.generation.identity.id, &successor)
+        .await?;
+
+    assert_eq!(new_jobs.len(), successor.submissions.len());
+    assert!(new_jobs.iter().all(|job| job.state == JobState::Queued));
+    assert_eq!(row_counts(database, &["generations"]).await?, vec![2]);
+    assert!(row_counts(database, &["events"]).await?[0] > old_event_counts[0]);
+    for (index, old) in old_jobs.iter().enumerate() {
+        let detail = database
+            .jobs()
+            .detail(old.spec.id)
+            .await?
+            .ok_or("old detail missing")?;
+        assert_eq!(detail.job.state, JobState::Superseded);
+        assert!(
+            detail
+                .attempts
+                .iter()
+                .all(|attempt| attempt.state == AttemptState::Cancelled)
+        );
+        let events = database.events().for_job(old.spec.id).await?;
+        assert_eq!(events.len(), old_history_lengths[index] + 1);
+        let superseded = events.last().ok_or("missing supersession event")?;
+        assert_eq!(superseded.event.kind, EventKind::JobStateChanged);
+        assert_eq!(superseded.event.payload.data["state"], "superseded");
+        assert_eq!(superseded.job_id, Some(old.spec.id));
+        assert_eq!(superseded.attempt_id, None);
+    }
+    let family = database
+        .families()
+        .detail(previous.family.id)
+        .await?
+        .ok_or("family detail missing")?;
+    assert_eq!(family.generations.len(), 2);
+    assert_eq!(
+        family.current_generation_id,
+        Some(successor.generation.identity.id)
+    );
+    assert_eq!(family.generations[1].identity.number, 2);
+    assert_eq!(family.generations[1].jobs, new_jobs);
+    assert!(database.jobs().retry(old_jobs[0].spec.id).await.is_err());
+    assert!(
+        database
+            .families()
+            .comparable_generation(previous.family.id, previous.generation.identity.id)
+            .await
+            .is_err()
+    );
+
+    let after = row_counts(database, &["generations", "jobs", "attempts", "events"]).await?;
+    assert!(
+        database
+            .families()
+            .supersede(previous.generation.identity.id, &successor)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .families()
+            .supersede(successor.generation.identity.id, &successor)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        row_counts(database, &["generations", "jobs", "attempts", "events"]).await?,
+        after
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn family_supersession_late_event_conflict_rolls_back_everything() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let previous = &fixture.prepared;
+    let old_jobs = database.families().submit(previous).await?;
+    for job in &old_jobs {
+        database
+            .jobs()
+            .request_cancellation(job.spec.id, Duration::from_secs(1))
+            .await?;
+    }
+    let mut successor = successor_for(&fixture).await?;
+    let duplicate_event_id = database
+        .events()
+        .for_job(old_jobs[0].spec.id)
+        .await?
+        .first()
+        .ok_or("missing original event")?
+        .event
+        .id;
+    successor.submissions[0].job_event = Event::new(
+        duplicate_event_id,
+        EventKind::JobSubmitted,
+        EventPayload::new(EventKind::JobSubmitted, 1, json!({"injected": true}))?,
+    )?;
+    successor.validate()?;
+    let before = row_counts(database, &["generations", "jobs", "attempts", "events"]).await?;
+    assert!(
+        database
+            .families()
+            .supersede(previous.generation.identity.id, &successor)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        row_counts(database, &["generations", "jobs", "attempts", "events"]).await?,
+        before
+    );
+    for old in &old_jobs {
+        assert_eq!(
+            database
+                .jobs()
+                .get_job(old.spec.id)
+                .await?
+                .ok_or("old job missing")?
+                .state,
+            JobState::Cancelled
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn family_supersession_rejects_changed_scientific_protocol() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let previous = &fixture.prepared;
+    let old_jobs = database.families().submit(previous).await?;
+    for job in &old_jobs {
+        database
+            .jobs()
+            .request_cancellation(job.spec.id, Duration::from_secs(1))
+            .await?;
+    }
+    let root = fixture._repository.path().join("project");
+    fs::write(
+        root.join("configs/seed2.toml"),
+        "name = 'changed science'\n",
+    )?;
+    git(&root, &["add", "configs/seed2.toml"])?;
+    git(&root, &["commit", "-qm", "change science"])?;
+    let loaded = load_project_config(&root.join(".igor/project.toml"))?;
+    let file = load_family_file(&root.join("family.toml"))?;
+    let project = Project {
+        id: previous.family.project_id,
+        name: "family-project".into(),
+        root,
+        config_path: loaded.config_file,
+    };
+    let successor = build_family_generation(&project, &loaded.config, file)?
+        .for_existing_family(previous.family.clone(), 2)?;
+    assert_ne!(
+        successor.generation.identity.protocol_digest,
+        previous.generation.identity.protocol_digest
+    );
+    let before = row_counts(database, &["generations", "jobs", "attempts", "events"]).await?;
+    assert!(matches!(
+        database
+            .families()
+            .supersede(previous.generation.identity.id, &successor)
+            .await,
+        Err(PersistenceError::Conflict {
+            entity: "family protocol"
+        })
+    ));
+    assert_eq!(
+        row_counts(database, &["generations", "jobs", "attempts", "events"]).await?,
+        before
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn family_supersession_requires_a_new_source_revision() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let previous = &fixture.prepared;
+    let old_jobs = database.families().submit(previous).await?;
+    for job in &old_jobs {
+        database
+            .jobs()
+            .request_cancellation(job.spec.id, Duration::from_secs(1))
+            .await?;
+    }
+    let root = fixture._repository.path().join("project");
+    let loaded = load_project_config(&root.join(".igor/project.toml"))?;
+    let file = load_family_file(&root.join("family.toml"))?;
+    let project = Project {
+        id: previous.family.project_id,
+        name: "family-project".into(),
+        root,
+        config_path: loaded.config_file,
+    };
+    let successor = build_family_generation(&project, &loaded.config, file)?
+        .for_existing_family(previous.family.clone(), 2)?;
+    let before = row_counts(database, &["generations", "jobs", "attempts", "events"]).await?;
+    assert!(matches!(
+        database
+            .families()
+            .supersede(previous.generation.identity.id, &successor)
+            .await,
+        Err(PersistenceError::Conflict {
+            entity: "family source revision"
+        })
+    ));
+    assert_eq!(
+        row_counts(database, &["generations", "jobs", "attempts", "events"]).await?,
+        before
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn family_supersession_competing_requests_publish_one_successor() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let previous = &fixture.prepared;
+    let old_jobs = database.families().submit(previous).await?;
+    for job in &old_jobs {
+        database
+            .jobs()
+            .request_cancellation(job.spec.id, Duration::from_secs(1))
+            .await?;
+    }
+    let successor = successor_for(&fixture).await?;
+    let families = database.families();
+    let (left, right) = tokio::join!(
+        families.supersede(previous.generation.identity.id, &successor),
+        families.supersede(previous.generation.identity.id, &successor),
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    assert_eq!(
+        row_counts(database, &["generations", "jobs", "attempts"]).await?,
+        vec![2, 4, 4]
+    );
+    let detail = database
+        .families()
+        .detail(previous.family.id)
+        .await?
+        .ok_or("family missing")?;
+    assert_eq!(
+        detail.current_generation_id,
+        Some(successor.generation.identity.id)
+    );
+    assert_eq!(detail.generations[0].counts["superseded"], 2);
+    assert_eq!(detail.generations[1].jobs.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn family_generation_submit_persists_members_attempts_and_events_atomically() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let prepared = &fixture.prepared;
+
+    let stored = database.families().submit(prepared).await?;
+    assert_eq!(stored.len(), prepared.submissions.len());
+    assert!(
+        database
+            .families()
+            .detail(igor_core::FamilyId::new())
+            .await?
+            .is_none()
+    );
+    let detail = database
+        .families()
+        .detail(prepared.family.id)
+        .await?
+        .ok_or("missing family detail")?;
+    assert_eq!(detail.family, prepared.family);
+    assert_eq!(detail.generations.len(), 1);
+    assert_eq!(detail.generations[0].identity, prepared.generation.identity);
+    assert_eq!(detail.generations[0].jobs, stored);
+    assert_eq!(
+        detail.generations[0].status,
+        igor_core::GenerationStatus::Incomplete
+    );
+    assert_eq!(detail.counts["queued"], 2);
+    assert_eq!(detail.generations[0].counts["queued"], 2);
+    assert_eq!(detail.counts["succeeded"], 0);
+    assert_eq!(
+        database.families().get_family(prepared.family.id).await?,
+        Some(prepared.family.clone())
+    );
+    assert_eq!(
+        database
+            .families()
+            .get_generation(prepared.generation.identity.id)
+            .await?,
+        Some(prepared.generation.clone())
+    );
+
+    let identity = &prepared.generation.identity;
+    let mut orders = Vec::with_capacity(stored.len());
+    for (index, (submission, job)) in prepared.submissions.iter().zip(&stored).enumerate() {
+        assert_eq!(job.spec, submission.job);
+        assert_eq!(job.state, JobState::Queued);
+        assert_eq!(job.priority, prepared.file.priority);
+        orders.push(job.submission_order);
+
+        let membership = submission
+            .job
+            .family
+            .as_ref()
+            .ok_or_else(|| missing("submitted family job lost its membership"))?;
+        assert_eq!(membership.family_id, prepared.family.id);
+        assert_eq!(membership.generation, *identity);
+        assert_eq!(membership.seed, prepared.file.members[index].seed);
+        assert_eq!(submission.attempt.family(), Some(membership));
+        assert!(
+            matches!(submission.attempt.source(), SourceIdentity::Git(git)
+                if git.revision == identity.source_revision && !git.dirty)
+        );
+
+        let (family_id, generation_id): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT family_id, generation_id FROM jobs WHERE id = ?")
+                .bind(job.spec.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(family_id, Some(prepared.family.id.to_string()));
+        assert_eq!(generation_id, Some(identity.id.to_string()));
+
+        let job_spec: serde_json::Value = serde_json::from_str(
+            &sqlx::query_scalar::<_, String>("SELECT spec_json FROM jobs WHERE id = ?")
+                .bind(job.spec.id.to_string())
+                .fetch_one(database.pool())
+                .await?,
+        )?;
+        assert_eq!(job_spec["family"], serde_json::to_value(membership)?);
+
+        let (attempt_id, sequence, state, attempt_spec): (String, i64, String, String) =
+            sqlx::query_as("SELECT id, sequence, state, spec_json FROM attempts WHERE job_id = ?")
+                .bind(job.spec.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(attempt_id, submission.attempt.id().to_string());
+        assert_eq!((sequence, state.as_str()), (1, "pending"));
+        let attempt_spec: serde_json::Value = serde_json::from_str(&attempt_spec)?;
+        assert_eq!(attempt_spec["family"], serde_json::to_value(membership)?);
+        assert_eq!(attempt_spec["source"]["kind"], "git");
+        assert_eq!(
+            attempt_spec["source"]["identity"]["revision"],
+            identity.source_revision.as_str()
+        );
+        assert_eq!(attempt_spec["source"]["identity"]["dirty"], false);
+
+        let events = database.events().for_job(job.spec.id).await?;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, submission.job_event);
+        assert_eq!(events[1].event, submission.attempt_event);
+        assert_eq!(events[0].event.kind, EventKind::JobSubmitted);
+        assert_eq!(events[1].event.kind, EventKind::AttemptCreated);
+        assert_eq!(events[0].job_id, Some(job.spec.id));
+        assert_eq!(events[1].job_id, Some(job.spec.id));
+        assert_eq!(events[0].attempt_id, None);
+        assert_eq!(events[1].attempt_id, Some(submission.attempt.id()));
+        assert!(events[0].sequence < events[1].sequence);
+        assert!(
+            events
+                .iter()
+                .all(|stored| stored.project_id == prepared.family.project_id)
+        );
+    }
+    assert_eq!(orders, (1..=stored.len() as i64).collect::<Vec<_>>());
+    assert_eq!(
+        row_counts(
+            database,
+            &["families", "generations", "jobs", "attempts", "events"]
+        )
+        .await?,
+        vec![1, 1, 2, 2, 4]
+    );
+    database
+        .jobs()
+        .request_cancellation(stored[0].spec.id, Duration::from_secs(1))
+        .await?;
+    let updated = database
+        .families()
+        .detail(prepared.family.id)
+        .await?
+        .ok_or("missing updated family")?;
+    assert_eq!(updated.counts["queued"], 1);
+    assert_eq!(updated.counts["cancelled"], 1);
+    assert_eq!(updated.generations[0].counts, updated.counts);
+    assert_eq!(
+        updated.generations[0].status,
+        igor_core::GenerationStatus::Incomplete
+    );
+    assert_eq!(updated.generations[0].jobs[0].state, JobState::Cancelled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn comparable_generation_selects_only_successful_members_of_its_generation() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let prepared = &fixture.prepared;
+    let jobs = database.families().submit(prepared).await?;
+    let family_id = prepared.family.id;
+    let generation = &prepared.generation.identity;
+
+    let error = database
+        .families()
+        .comparable_generation(family_id, generation.id)
+        .await
+        .err()
+        .ok_or_else(|| missing("queued members must not be comparable"))?;
+    assert!(matches!(
+        error,
+        PersistenceError::GenerationNotComparable {
+            status: igor_core::GenerationStatus::Incomplete,
+            ..
+        }
+    ));
+    for (id, state) in [(jobs[0].spec.id, "failed"), (jobs[1].spec.id, "succeeded")] {
+        sqlx::query("UPDATE jobs SET state = ? WHERE id = ?")
+            .bind(state)
+            .bind(id.to_string())
+            .execute(database.pool())
+            .await?;
+    }
+    let error = database
+        .families()
+        .comparable_generation(family_id, generation.id)
+        .await
+        .err()
+        .ok_or_else(|| missing("a failed required member must not be comparable"))?;
+    assert!(matches!(
+        error,
+        PersistenceError::GenerationNotComparable {
+            status: igor_core::GenerationStatus::Complete,
+            ..
+        }
+    ));
+
+    for job in &jobs {
+        sqlx::query("UPDATE jobs SET state = 'succeeded' WHERE id = ?")
+            .bind(job.spec.id.to_string())
+            .execute(database.pool())
+            .await?;
+    }
+    let selected = database
+        .families()
+        .comparable_generation(family_id, generation.id)
+        .await?;
+    assert_eq!(selected.family_id(), family_id);
+    assert_eq!(selected.identity(), generation);
+    assert_eq!(
+        selected
+            .members()
+            .iter()
+            .map(|member| member.spec.id)
+            .collect::<Vec<_>>(),
+        jobs.iter().map(|job| job.spec.id).collect::<Vec<_>>()
+    );
+
+    assert!(matches!(
+        database
+            .families()
+            .comparable_generation(igor_core::FamilyId::new(), generation.id)
+            .await,
+        Err(PersistenceError::NotFound { .. })
+    ));
+    assert!(matches!(
+        database
+            .families()
+            .comparable_generation(family_id, igor_core::GenerationId::new())
+            .await,
+        Err(PersistenceError::NotFound { .. })
+    ));
+
+    let second_generation = igor_core::Generation {
+        family_id,
+        identity: igor_core::GenerationIdentity {
+            id: igor_core::GenerationId::new(),
+            number: generation.number + 1,
+            source_revision: format!("{}-second", generation.source_revision),
+            protocol_digest: generation.protocol_digest.clone(),
+        },
+        spec: prepared.generation.spec.clone(),
+    };
+    database
+        .families()
+        .insert_generation(&second_generation)
+        .await?;
+    let error = database
+        .families()
+        .comparable_generation(family_id, second_generation.identity.id)
+        .await
+        .err()
+        .ok_or_else(|| {
+            missing("a generation without its own members cannot borrow successful jobs")
+        })?;
+    assert!(matches!(
+        error,
+        PersistenceError::GenerationNotComparable {
+            status: igor_core::GenerationStatus::Incomplete,
+            ..
+        }
+    ));
+    sqlx::query("UPDATE jobs SET generation_id = ? WHERE id = ?")
+        .bind(second_generation.identity.id.to_string())
+        .bind(jobs[0].spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let error = database
+        .families()
+        .comparable_generation(family_id, second_generation.identity.id)
+        .await
+        .err()
+        .ok_or_else(|| missing("a mixed-revision member must not belong to the new generation"))?;
+    assert!(matches!(
+        error,
+        PersistenceError::GenerationNotComparable {
+            status: igor_core::GenerationStatus::Invalid,
+            ..
+        }
+    ));
+    assert!(matches!(
+        database
+            .families()
+            .comparable_generation(family_id, generation.id)
+            .await,
+        Err(PersistenceError::GenerationNotComparable {
+            status: igor_core::GenerationStatus::Incomplete,
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn family_retry_preserves_generation_and_frozen_attempt_spec() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let prepared = &fixture.prepared;
+    let jobs = database.families().submit(prepared).await?;
+    let failed = &jobs[0];
+    let untouched = &jobs[1];
+    let original_attempt = &prepared.submissions[0].attempt;
+    let generation = &prepared.generation.identity;
+
+    for statement in [
+        "UPDATE jobs SET state = 'failed' WHERE id = ?",
+        "UPDATE attempts SET state = 'failed' WHERE job_id = ?",
+    ] {
+        sqlx::query(statement)
+            .bind(failed.spec.id.to_string())
+            .execute(database.pool())
+            .await?;
+    }
+    sqlx::query("UPDATE jobs SET state = 'succeeded' WHERE id = ?")
+        .bind(untouched.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let complete = database
+        .families()
+        .detail(prepared.family.id)
+        .await?
+        .ok_or("missing family detail")?;
+    assert_eq!(
+        complete.generations[0].status,
+        igor_core::GenerationStatus::Complete
+    );
+
+    let retried = database.jobs().retry(failed.spec.id).await?;
+    assert_eq!(retried.attempts.len(), 2);
+    assert_eq!(retried.job.state, JobState::Queued);
+    assert_ne!(retried.attempts[1].spec.id(), original_attempt.id());
+    assert_eq!(retried.attempts[1].spec.sequence(), 2);
+    assert_eq!(retried.attempts[0].spec.family(), original_attempt.family());
+    assert_eq!(retried.attempts[1].spec.family(), original_attempt.family());
+    assert_eq!(retried.attempts[1].spec.source(), original_attempt.source());
+    assert_eq!(
+        retried.attempts[1].spec.configuration(),
+        original_attempt.configuration()
+    );
+    let retry_job = database
+        .jobs()
+        .get_job(failed.spec.id)
+        .await?
+        .ok_or("missing retried job")?;
+    assert_eq!(retry_job.spec.family, failed.spec.family);
+    assert_eq!(
+        retry_job
+            .spec
+            .family
+            .as_ref()
+            .ok_or("missing family membership")?
+            .generation,
+        *generation
+    );
+    assert_eq!(
+        retry_job
+            .spec
+            .family
+            .as_ref()
+            .ok_or("missing family membership")?
+            .seed,
+        failed
+            .spec
+            .family
+            .as_ref()
+            .ok_or("missing original membership")?
+            .seed
+    );
+    let unchanged_member = database
+        .jobs()
+        .get_job(untouched.spec.id)
+        .await?
+        .ok_or("missing other family job")?;
+    assert_eq!(unchanged_member.spec, untouched.spec);
+    assert_eq!(unchanged_member.state, JobState::Succeeded);
+    assert_eq!(row_counts(database, &["generations"]).await?, vec![1]);
+    let incomplete = database
+        .families()
+        .detail(prepared.family.id)
+        .await?
+        .ok_or("missing family detail")?;
+    assert_eq!(
+        incomplete.generations[0].status,
+        igor_core::GenerationStatus::Incomplete
+    );
+
+    assert!(database.jobs().retry(failed.spec.id).await.is_err());
+    assert_eq!(row_counts(database, &["attempts"]).await?, vec![3]);
+    sqlx::query("UPDATE attempts SET state = 'succeeded' WHERE id = ?")
+        .bind(retried.attempts[1].spec.id().to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE jobs SET state = 'succeeded' WHERE id = ?")
+        .bind(failed.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let comparable = database
+        .families()
+        .comparable_generation(prepared.family.id, generation.id)
+        .await?;
+    assert_eq!(comparable.identity(), generation);
+    assert_eq!(row_counts(database, &["attempts"]).await?, vec![3]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn family_retry_rejects_tampered_persisted_membership_without_side_effects() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let jobs = database.families().submit(&fixture.prepared).await?;
+    let failed = &jobs[0];
+    sqlx::query("UPDATE jobs SET state = 'failed', spec_json = json_set(spec_json, '$.family.generation.number', 99) WHERE id = ?")
+        .bind(failed.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE attempts SET state = 'failed' WHERE job_id = ?")
+        .bind(failed.spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let attempts_before = row_counts(database, &["attempts"]).await?;
+    let events_before = row_counts(database, &["events"]).await?;
+
+    assert!(database.jobs().retry(failed.spec.id).await.is_err());
+    assert_eq!(row_counts(database, &["attempts"]).await?, attempts_before);
+    assert_eq!(row_counts(database, &["events"]).await?, events_before);
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(failed.spec.id)
+            .await?
+            .ok_or("missing job")?
+            .state,
+        JobState::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn late_member_event_conflict_rolls_back_the_whole_family_batch() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let prepared = &fixture.prepared;
+
+    // A pre-existing, append-only event reuses the second member's event id, so the
+    // conflict surfaces only after the first member has already been written.
+    let conflict = prepared.submissions[1].job_event.id;
+    assert_ne!(prepared.submissions[0].job_event.id, conflict);
+    database
+        .events()
+        .append(
+            prepared.family.project_id,
+            None,
+            None,
+            &Event::new(
+                conflict,
+                EventKind::JobSubmitted,
+                EventPayload::new(EventKind::JobSubmitted, 1, json!({"source": "preexisting"}))?,
+            )?,
+        )
+        .await?;
+
+    let error = database
+        .families()
+        .submit(prepared)
+        .await
+        .err()
+        .ok_or_else(|| missing("duplicate family event id was accepted"))?;
+    let message = error.to_string();
+    assert!(message.contains("append transition event"), "{message}");
+    assert!(
+        message.contains("UNIQUE constraint failed: events.id"),
+        "{message}"
+    );
+
+    assert_eq!(
+        row_counts(database, &["families", "generations", "jobs", "attempts"]).await?,
+        vec![0, 0, 0, 0]
+    );
+    let event_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM events ORDER BY sequence")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(event_ids, vec![conflict.to_string()]);
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE job_id IS NOT NULL")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(linked, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn tampered_mixed_revision_and_protocol_members_are_rejected_before_writes() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let prepared = &fixture.prepared;
+
+    let mut member_revision = prepared.clone();
+    member_revision.submissions[1]
+        .job
+        .family
+        .as_mut()
+        .ok_or_else(|| missing("missing membership"))?
+        .generation
+        .source_revision = "tampered-revision".into();
+
+    let mut member_protocol = prepared.clone();
+    member_protocol.submissions[1]
+        .job
+        .family
+        .as_mut()
+        .ok_or_else(|| missing("missing membership"))?
+        .generation
+        .protocol_digest = "sha256:tampered-protocol".into();
+
+    let mut generation_protocol = prepared.clone();
+    generation_protocol.generation.identity.protocol_digest = "sha256:tampered-protocol".into();
+
+    for tampered in [&member_revision, &member_protocol, &generation_protocol] {
+        let error = database
+            .families()
+            .submit(tampered)
+            .await
+            .err()
+            .ok_or_else(|| missing("tampered family generation was accepted"))?;
+        assert!(
+            matches!(
+                error,
+                PersistenceError::Submission(SubmissionError::FamilyFile { .. })
+            ),
+            "{error}"
+        );
+    }
+
+    assert_eq!(
+        row_counts(
+            database,
+            &["families", "generations", "jobs", "attempts", "events"]
+        )
+        .await?,
+        vec![0, 0, 0, 0, 0]
+    );
     Ok(())
 }

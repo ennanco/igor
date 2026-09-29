@@ -12,8 +12,10 @@ It will execute arbitrary process and Docker workloads, coordinate exclusive
 compute resources, persist execution history, extract structured results, and
 generate project reports.
 
-The project includes its first usable local process queue but remains under
-active development and is not ready for production experiment management. See
+The project includes local process and Docker queues, resource scheduling,
+recoverable supervisor notifications, and atomic submission of a family's
+first generation. It remains under active development and is not ready for
+production experiment management. See
 [`DESIGN.md`](DESIGN.md) for the agreed architecture and [`TASKS.md`](TASKS.md)
 for the ordered implementation backlog.
 
@@ -86,6 +88,24 @@ igor events JOB_ID
 igor logs --follow JOB_ID
 igor wait JOB_ID
 ```
+
+After `igor family submit --file family.toml`, inspect the returned family ID:
+
+```bash
+igor family show FAMILY_ID
+igor family show FAMILY_ID --json
+```
+
+The output lists every generation in order, its frozen revision and protocol
+digest, member jobs, current states and status (`incomplete`, `complete`,
+`comparable`, or `invalid`). A generation is comparable only when exactly its
+required seeds have succeeded under the same generation identity; terminal
+failures make it complete but not comparable. Counts are reported per generation and
+across the family for all seven job states; `queued` is the pending-job count.
+Counts describe current jobs, not accumulated attempts, and include superseded
+members rather than silently combining their results with the current
+generation. Large histories remain subject to the local protocol frame limit
+until M17.18 adds pagination.
 
 Running jobs can be cancelled, and failed, cancelled, or lost jobs can be
 retried without deleting their previous attempts:
@@ -251,6 +271,50 @@ is **at least once**: if the supervisor crashes after Telegram accepts a message
 but before Igor records acknowledgement, a duplicate can be sent. Messages
 include status, duration, available metrics and family progress before the
 technical job identifier. Metrics appear when an extractor has published them.
+
+## Experiment Families
+
+Declare a versioned `family.toml` with shared direct execution arguments and
+one `[[members]]` entry per required seed. Member arguments and scientific
+configuration files are explicit; see the complete format in `DESIGN.md`.
+Commit project-local family and configuration files to Git (or set
+`allow_dirty = true` explicitly). After registering the project and starting
+the worker, submit its first generation:
+
+```bash
+igor family submit --file family.toml --json
+```
+
+Igor freezes one Git source and protocol identity for all members before
+inserting the family, generation, jobs, attempts and initial events in one
+database transaction. A changed worktree or failed insert leaves no partial
+family submission. Each family name is unique per project; this command creates
+its first generation. Inspect it with `igor family show FAMILY_ID [--json]`.
+For an operator-confirmed transient failure, `igor retry JOB_ID` creates a new
+attempt for the affected seed in the **same** generation, preserving its frozen
+Git identity, configuration, protocol and earlier attempt history. A successful
+retry makes the generation comparable only when every other required seed has
+succeeded too. Automatic failure classification and agent-assisted repairs
+remain on the backlog.
+
+To replace a terminal generation after a committed code repair, keep the same
+scientific `family.toml` and run:
+
+```bash
+igor family supersede FAMILY_ID --file family.toml --json
+igor family show FAMILY_ID --json
+```
+
+Supersession requires every job in the previous generation to be terminal and
+the new generation to have the same scientific protocol. Cancel any queued or
+running jobs explicitly first; Igor will not stop them during supersession.
+The operation adds a complete fresh seed set and marks the older jobs
+`superseded` in one transaction, retaining their attempts and events. Family
+inspection identifies the highest numbered generation as
+`current_generation_id`; historical jobs cannot be retried once superseded.
+Five-seed partial, failed, retried and repaired generations are covered by
+disposable-repository tests. The current-generation aggregate and its exclusion
+of old attempts will be verified when metrics and reports are available.
 
 ## Development
 

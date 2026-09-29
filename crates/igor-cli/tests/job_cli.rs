@@ -2048,6 +2048,762 @@ fn process_only_worker_needs_no_docker_cli_or_path() -> TestResult {
 }
 
 #[test]
+fn family_submit_queues_both_seeds_in_one_generation() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let family_file = fixture._temporary.path().join("family.toml");
+    fs::write(
+        &family_file,
+        "schema_version = 1\nname = 'two-seeds'\n[execution]\nprogram = '/bin/echo'\nargs = ['family']\n\
+         [[members]]\nseed = 1\nargs = ['--seed', '1']\n\
+         [[members]]\nseed = 2\nargs = ['--seed', '2']\n",
+    )?;
+
+    let help = fixture
+        .run()
+        .args(["family", "submit", "--help"])
+        .output()?;
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout)?;
+    assert!(help.contains("--file"));
+
+    let file = family_file.to_str().ok_or("non-UTF-8 family file")?;
+    let plain = fixture
+        .run()
+        .args(["family", "submit", "--file", file])
+        .output()?;
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain = String::from_utf8(plain.stdout)?;
+    let mut lines = plain.lines();
+    let header = lines.next().ok_or("missing family submission header")?;
+    assert!(header.starts_with("submitted family "));
+    assert!(header.contains(" generation "));
+    assert!(header.contains("(2 jobs)"));
+    let mut plain_jobs = Vec::new();
+    for line in lines {
+        plain_jobs.push(
+            line.split_whitespace()
+                .next()
+                .ok_or("missing job id in family output")?
+                .to_owned(),
+        );
+    }
+    assert_eq!(plain_jobs.len(), 2);
+
+    // Atomic submission: both seeds are queued together or not at all.
+    let listed = output_json(fixture.run().args(["list", "--json"]).output()?)?;
+    let listed = listed.as_array().ok_or("job list is not an array")?;
+    assert_eq!(listed.len(), 2);
+    for job_id in &plain_jobs {
+        assert!(
+            listed
+                .iter()
+                .any(|job| job["spec"]["id"] == job_id.as_str())
+        );
+    }
+
+    // Stable JSON contract: family_id, generation_id, jobs.
+    fs::write(
+        &family_file,
+        fs::read_to_string(&family_file)?.replace("two-seeds", "json-two-seeds"),
+    )?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args(["family", "submit", "--file", file, "--json"])
+            .output()?,
+    )?;
+    let family_id = submitted["family_id"].as_str().ok_or("missing family_id")?;
+    let generation_id = submitted["generation_id"]
+        .as_str()
+        .ok_or("missing generation_id")?;
+    assert_eq!(family_id.len(), 36);
+    assert_eq!(generation_id.len(), 36);
+    let jobs = submitted["jobs"].as_array().ok_or("missing jobs")?;
+    assert_eq!(jobs.len(), 2);
+    let submitted_job_ids: Vec<&str> = jobs
+        .iter()
+        .map(|job| job["spec"]["id"].as_str().ok_or("missing member job id"))
+        .collect::<Result<_, _>>()?;
+    let detail = output_json(
+        fixture
+            .run()
+            .args(["family", "show", family_id, "--json"])
+            .output()?,
+    )?;
+    assert_eq!(detail["family"]["id"], family_id);
+    assert_eq!(detail["family"]["name"], "json-two-seeds");
+    let generations = detail["generations"]
+        .as_array()
+        .ok_or("missing family generations")?;
+    assert_eq!(generations.len(), 1);
+    assert_eq!(generations[0]["identity"]["id"], generation_id);
+    let detail_jobs = generations[0]["jobs"]
+        .as_array()
+        .ok_or("missing generation jobs")?;
+    let detail_job_ids: Vec<&str> = detail_jobs
+        .iter()
+        .map(|job| {
+            job["spec"]["id"]
+                .as_str()
+                .ok_or("missing generation member job id")
+        })
+        .collect::<Result<_, _>>()?;
+    assert_eq!(detail_job_ids, submitted_job_ids);
+    assert_eq!(
+        generations[0]["status"],
+        if detail_jobs.iter().all(|job| job["state"] == "succeeded") {
+            "comparable"
+        } else {
+            "incomplete"
+        }
+    );
+    let counts = detail["counts"]
+        .as_object()
+        .ok_or("missing family state counts")?;
+    assert_eq!(
+        counts
+            .values()
+            .map(|count| count.as_u64().unwrap_or(0))
+            .sum::<u64>(),
+        2
+    );
+    assert_eq!(detail["generations"][0]["counts"], detail["counts"]);
+    for job in jobs {
+        assert!(job["spec"]["id"].as_str().is_some());
+    }
+
+    for job_id in &plain_jobs {
+        let waited = fixture.run().args(["wait", job_id, "--json"]).output()?;
+        assert!(
+            waited.status.success(),
+            "{}",
+            String::from_utf8_lossy(&waited.stderr)
+        );
+        let waited: Value = serde_json::from_slice(&waited.stdout)?;
+        assert_eq!(waited["job"]["state"], "succeeded");
+    }
+    let detail = fixture
+        .run()
+        .args([
+            "family",
+            "show",
+            header
+                .split_whitespace()
+                .nth(2)
+                .ok_or("missing family id")?,
+        ])
+        .output()?;
+    assert!(detail.status.success());
+    let detail = String::from_utf8(detail.stdout)?;
+    assert!(!detail.trim().is_empty());
+    assert!(detail.contains("succeeded=2"), "{detail}");
+    assert!(detail.contains("status comparable"), "{detail}");
+
+    let missing = fixture
+        .run()
+        .args(["family", "show", "00000000-0000-4000-8000-000000000000"])
+        .output()?;
+    assert_eq!(missing.status.code(), Some(8));
+    Ok(())
+}
+
+#[test]
+fn family_supersede_replaces_terminal_generation_and_preserves_history() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let family_file = fixture._temporary.path().join("family-supersede.toml");
+    fs::write(
+        &family_file,
+        "schema_version = 1\nname = 'supersede-seeds'\n[execution]\nprogram = '/bin/echo'\nargs = ['family']\n\
+         [[members]]\nseed = 1\nargs = ['--seed', '1']\n\
+         [[members]]\nseed = 2\nargs = ['--seed', '2']\n",
+    )?;
+    let file = family_file.to_str().ok_or("non-UTF-8 family file")?;
+    let first = output_json(
+        fixture
+            .run()
+            .args(["family", "submit", "--file", file, "--json"])
+            .output()?,
+    )?;
+    let family_id = first["family_id"].as_str().ok_or("missing family id")?;
+    let previous_generation = first["generation_id"]
+        .as_str()
+        .ok_or("missing generation id")?;
+    let first_jobs = first["jobs"].as_array().ok_or("missing first jobs")?;
+    let old_ids: Vec<String> = first_jobs
+        .iter()
+        .map(|job| {
+            job["spec"]["id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or("missing job id")
+        })
+        .collect::<Result<_, _>>()?;
+    for job_id in &old_ids {
+        let waited = fixture.run().args(["wait", job_id, "--json"]).output()?;
+        assert!(
+            waited.status.success(),
+            "{}",
+            String::from_utf8_lossy(&waited.stderr)
+        );
+        let waited: Value = serde_json::from_slice(&waited.stdout)?;
+        assert_eq!(waited["job"]["state"], "succeeded");
+    }
+    let first_show = output_json(
+        fixture
+            .run()
+            .args(["show", &old_ids[0], "--json"])
+            .output()?,
+    )?;
+    let old_revision = first_show["attempts"][0]["spec"]["source"]["identity"]["revision"]
+        .as_str()
+        .ok_or("missing old attempt revision")?;
+    fs::write(fixture.project.join("science.json"), b"{\"seed\":2}\n")?;
+    git(&fixture.project, &["add", "science.json"])?;
+    git(&fixture.project, &["commit", "-qm", "change seed input"])?;
+    let superseded = output_json(
+        fixture
+            .run()
+            .args(["family", "supersede", family_id, "--file", file, "--json"])
+            .output()?,
+    )?;
+    assert_eq!(superseded["family_id"], family_id);
+    assert_eq!(superseded["previous_generation_id"], previous_generation);
+    let generation = superseded["generation_id"]
+        .as_str()
+        .ok_or("missing new generation")?;
+    assert_ne!(generation, previous_generation);
+    let new_jobs = superseded["jobs"].as_array().ok_or("missing new jobs")?;
+    assert_eq!(new_jobs.len(), 2);
+    let new_ids: Vec<String> = new_jobs
+        .iter()
+        .map(|job| {
+            job["spec"]["id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or("missing new job id")
+        })
+        .collect::<Result<_, _>>()?;
+    assert!(new_ids.iter().all(|id| !old_ids.contains(id)));
+    assert_eq!(
+        new_jobs
+            .iter()
+            .map(|job| job["spec"]["family"]["seed"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![Some(1), Some(2)]
+    );
+    let new_revision = String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(&fixture.project)
+            .args(["rev-parse", "HEAD"])
+            .output()?
+            .stdout,
+    )?;
+    let new_revision = new_revision.trim();
+    assert_ne!(new_revision, old_revision);
+    let detail = output_json(
+        fixture
+            .run()
+            .args(["family", "show", family_id, "--json"])
+            .output()?,
+    )?;
+    assert_eq!(detail["current_generation_id"], generation);
+    let generations = detail["generations"]
+        .as_array()
+        .ok_or("missing generations")?;
+    assert_eq!(generations.len(), 2);
+    let old_generation = generations
+        .iter()
+        .find(|item| item["identity"]["id"] == previous_generation)
+        .ok_or("missing old generation")?;
+    assert_eq!(old_generation["counts"]["superseded"], 2);
+    assert_eq!(old_generation["identity"]["source_revision"], old_revision);
+    for old_id in &old_ids {
+        let old = output_json(fixture.run().args(["show", old_id, "--json"]).output()?)?;
+        assert_eq!(old["job"]["state"], "superseded");
+        assert_eq!(old["attempts"][0]["state"], "succeeded");
+        assert!(
+            !fixture
+                .run()
+                .args(["retry", old_id])
+                .output()?
+                .status
+                .success()
+        );
+    }
+    let new_generation = generations
+        .iter()
+        .find(|item| item["identity"]["id"] == generation)
+        .ok_or("missing new generation")?;
+    assert_eq!(new_generation["identity"]["source_revision"], new_revision);
+    assert_eq!(
+        ["queued", "running", "succeeded"]
+            .iter()
+            .map(|state| new_generation["counts"][state].as_u64().unwrap_or(0))
+            .sum::<u64>(),
+        2
+    );
+    for job_id in &new_ids {
+        let waited = fixture.run().args(["wait", job_id, "--json"]).output()?;
+        assert!(
+            waited.status.success(),
+            "{}",
+            String::from_utf8_lossy(&waited.stderr)
+        );
+        let waited: Value = serde_json::from_slice(&waited.stdout)?;
+        assert_eq!(waited["job"]["state"], "succeeded");
+    }
+    Ok(())
+}
+
+#[test]
+fn family_retry_recovers_a_failed_seed_without_creating_a_new_generation() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let script = fixture._temporary.path().join("fail-once.sh");
+    let marker = fixture._temporary.path().join("attempted-once");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ -f '{}' ]; then exit 0; fi\ntouch '{}'\nexit 7\n",
+            marker.display(),
+            marker.display()
+        ),
+    )?;
+    let family_file = fixture._temporary.path().join("family-retry.toml");
+    fs::write(
+        &family_file,
+        format!(
+            "schema_version = 1\nname = 'retry-seeds'\n[execution]\nprogram = '/bin/sh'\n\
+             [[members]]\nseed = 1\nargs = ['{}']\n\
+             [[members]]\nseed = 2\nargs = ['/dev/null']\n",
+            script.display()
+        ),
+    )?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "family",
+                "submit",
+                "--file",
+                family_file.to_str().ok_or("non-UTF-8 family file")?,
+                "--json",
+            ])
+            .output()?,
+    )?;
+    let family_id = submitted["family_id"].as_str().ok_or("missing family id")?;
+    let generation_id = submitted["generation_id"]
+        .as_str()
+        .ok_or("missing generation id")?;
+    let jobs = submitted["jobs"].as_array().ok_or("missing family jobs")?;
+    let failed_id = jobs[0]["spec"]["id"]
+        .as_str()
+        .ok_or("missing first job id")?;
+    let succeeded_id = jobs[1]["spec"]["id"]
+        .as_str()
+        .ok_or("missing second job id")?;
+    let failed = fixture.run().args(["wait", failed_id, "--json"]).output()?;
+    assert_eq!(failed.status.code(), Some(1));
+    let failed: Value = serde_json::from_slice(&failed.stdout)?;
+    assert_eq!(failed["job"]["state"], "failed");
+    let completed = fixture.run().args(["wait", succeeded_id]).output()?;
+    assert!(completed.status.success());
+    let before = output_json(
+        fixture
+            .run()
+            .args(["family", "show", family_id, "--json"])
+            .output()?,
+    )?;
+    assert_eq!(before["generations"][0]["status"], "complete");
+
+    let retried = output_json(
+        fixture
+            .run()
+            .args(["retry", failed_id, "--json"])
+            .output()?,
+    )?;
+    assert_eq!(retried["attempts"].as_array().map(Vec::len), Some(2));
+    assert_eq!(retried["attempts"][0]["state"], "failed");
+    assert_eq!(retried["attempts"][1]["spec"]["sequence"], 2);
+    assert_ne!(
+        retried["attempts"][0]["spec"]["id"],
+        retried["attempts"][1]["spec"]["id"]
+    );
+    for field in ["family", "source", "configuration", "result"] {
+        assert_eq!(
+            retried["attempts"][0]["spec"][field],
+            retried["attempts"][1]["spec"][field]
+        );
+    }
+    let waited = fixture.run().args(["wait", failed_id, "--json"]).output()?;
+    assert!(
+        waited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let detail = output_json(
+        fixture
+            .run()
+            .args(["family", "show", family_id, "--json"])
+            .output()?,
+    )?;
+    assert_eq!(detail["generations"].as_array().map(Vec::len), Some(1));
+    assert_eq!(detail["generations"][0]["identity"]["id"], generation_id);
+    assert_eq!(detail["generations"][0]["status"], "comparable");
+    assert_eq!(detail["counts"]["succeeded"], 2);
+    Ok(())
+}
+
+fn write_five_seed_family(
+    fixture: &Fixture,
+    script: &Path,
+    name: &str,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let file = fixture._temporary.path().join(format!("{name}.toml"));
+    let members = (1..=5)
+        .map(|seed| {
+            format!(
+                "[[members]]\nseed = {seed}\nargs = ['{}', '{seed}']\n",
+                script.display()
+            )
+        })
+        .collect::<String>();
+    fs::write(
+        &file,
+        format!(
+            "schema_version = 1\nname = '{name}'\nimmutable_inputs = ['science.json']\n[execution]\nprogram = '/bin/sh'\n{members}"
+        ),
+    )?;
+    Ok(file)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn five_seed_family_is_partial_until_all_real_executions_succeed() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let barrier = fixture._temporary.path().join("five-seed-barrier");
+    fs::create_dir_all(&barrier)?;
+    let script = fixture.project.join("five-seed-run.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf ready > '{}/started-'\"$1\"\ni=0\nwhile [ ! -e '{}/release' ] && [ \"$i\" -lt 150 ]; do i=$((i + 1)); sleep 0.1; done\n[ -e '{}/release' ]\n",
+            barrier.display(),
+            barrier.display(),
+            barrier.display()
+        ),
+    )?;
+    git(&fixture.project, &["add", "five-seed-run.sh"])?;
+    git(&fixture.project, &["commit", "-qm", "five seed baseline"])?;
+    let file = write_five_seed_family(&fixture, &script, "five-seed-partial")?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "family",
+                "submit",
+                "--file",
+                file.to_str().ok_or("non-UTF-8 family file")?,
+                "--json",
+            ])
+            .output()?,
+    )?;
+    let family_id = submitted["family_id"].as_str().ok_or("missing family ID")?;
+    let generation_id: igor_core::GenerationId = submitted["generation_id"]
+        .as_str()
+        .ok_or("missing generation ID")?
+        .parse()?;
+    let jobs = submitted["jobs"].as_array().ok_or("missing family jobs")?;
+    assert_eq!(jobs.len(), 5);
+    wait_for_marker(&barrier.join("started-1"))?;
+    let partial = output_json(
+        fixture
+            .run()
+            .args(["family", "show", family_id, "--json"])
+            .output()?,
+    )?;
+    assert_eq!(partial["current_generation_id"], generation_id.to_string());
+    assert_eq!(partial["generations"][0]["status"], "incomplete");
+    assert_eq!(partial["generations"][0]["counts"]["running"], 1);
+    assert_eq!(partial["generations"][0]["counts"]["queued"], 4);
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let family_id: igor_core::FamilyId = family_id.parse()?;
+    assert!(matches!(
+        database
+            .families()
+            .comparable_generation(family_id, generation_id)
+            .await,
+        Err(igor_core::PersistenceError::GenerationNotComparable {
+            status: igor_core::GenerationStatus::Incomplete,
+            ..
+        })
+    ));
+    fs::write(barrier.join("release"), b"go")?;
+    for job in jobs {
+        let job_id = job["spec"]["id"].as_str().ok_or("missing job ID")?;
+        let waited = fixture.run().args(["wait", job_id, "--json"]).output()?;
+        assert!(
+            waited.status.success(),
+            "{}",
+            String::from_utf8_lossy(&waited.stderr)
+        );
+    }
+    let complete = output_json(
+        fixture
+            .run()
+            .args(["family", "show", &family_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    let generation = &complete["generations"][0];
+    assert_eq!(generation["status"], "comparable");
+    assert_eq!(generation["counts"]["succeeded"], 5);
+    let identity = &generation["identity"];
+    let actual = generation["jobs"]
+        .as_array()
+        .ok_or("missing generation members")?;
+    for (index, job) in actual.iter().enumerate() {
+        assert_eq!(job["spec"]["family"]["seed"], (index + 1) as u64);
+        assert_eq!(&job["spec"]["family"]["generation"], identity);
+        let detail = output_json(
+            fixture
+                .run()
+                .args([
+                    "show",
+                    job["spec"]["id"].as_str().ok_or("missing member ID")?,
+                    "--json",
+                ])
+                .output()?,
+        )?;
+        assert_eq!(
+            detail["attempts"][0]["spec"]["source"]["identity"]["revision"],
+            identity["source_revision"]
+        );
+    }
+    let comparable = database
+        .families()
+        .comparable_generation(family_id, generation_id)
+        .await?;
+    assert_eq!(comparable.members().len(), 5);
+    assert_eq!(
+        comparable.identity().source_revision,
+        identity["source_revision"]
+            .as_str()
+            .ok_or("missing revision")?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn five_seed_failure_retry_and_repaired_generation_never_mix_members() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let script = fixture.project.join("five-seed-repair.sh");
+    fs::write(
+        &script,
+        "#!/bin/sh\nif [ \"$1\" = 3 ]; then exit 17; fi\nexit 0\n",
+    )?;
+    git(&fixture.project, &["add", "five-seed-repair.sh"])?;
+    git(&fixture.project, &["commit", "-qm", "initial failing code"])?;
+    let file = write_five_seed_family(&fixture, &script, "five-seed-repair")?;
+    let file_path = file.to_str().ok_or("non-UTF-8 family file")?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args(["family", "submit", "--file", file_path, "--json"])
+            .output()?,
+    )?;
+    let family_id: igor_core::FamilyId = submitted["family_id"]
+        .as_str()
+        .ok_or("missing family ID")?
+        .parse()?;
+    let old_generation: igor_core::GenerationId = submitted["generation_id"]
+        .as_str()
+        .ok_or("missing generation ID")?
+        .parse()?;
+    let jobs = submitted["jobs"].as_array().ok_or("missing family jobs")?;
+    assert_eq!(jobs.len(), 5);
+    let old_ids: Vec<String> = jobs
+        .iter()
+        .map(|job| {
+            job["spec"]["id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or("missing job ID")
+        })
+        .collect::<Result<_, _>>()?;
+    for (index, id) in old_ids.iter().enumerate() {
+        let result = fixture.run().args(["wait", id, "--json"]).output()?;
+        assert_eq!(result.status.success(), index != 2);
+    }
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let failed = output_json(
+        fixture
+            .run()
+            .args(["family", "show", &family_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(failed["generations"][0]["status"], "complete");
+    assert_eq!(failed["generations"][0]["counts"]["succeeded"], 4);
+    assert_eq!(failed["generations"][0]["counts"]["failed"], 1);
+    assert!(
+        database
+            .families()
+            .comparable_generation(family_id, old_generation)
+            .await
+            .is_err()
+    );
+    let retried = output_json(
+        fixture
+            .run()
+            .args(["retry", &old_ids[2], "--json"])
+            .output()?,
+    )?;
+    assert_eq!(retried["attempts"].as_array().map(Vec::len), Some(2));
+    let retry_result = fixture
+        .run()
+        .args(["wait", &old_ids[2], "--json"])
+        .output()?;
+    assert_eq!(retry_result.status.code(), Some(1));
+    let failed_again = output_json(
+        fixture
+            .run()
+            .args(["family", "show", &family_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(
+        failed_again["current_generation_id"],
+        old_generation.to_string()
+    );
+    assert_eq!(failed_again["generations"][0]["status"], "complete");
+
+    fs::write(&script, "#!/bin/sh\nexit 0\n")?;
+    git(&fixture.project, &["add", "five-seed-repair.sh"])?;
+    git(&fixture.project, &["commit", "-qm", "fix failing seed"])?;
+    let mixed_file = fixture._temporary.path().join("mixed-science.toml");
+    fs::write(
+        &mixed_file,
+        fs::read_to_string(&file)?.replace("seed = 5\n", "seed = 6\n"),
+    )?;
+    let mixed = fixture
+        .run()
+        .args([
+            "family",
+            "supersede",
+            &family_id.to_string(),
+            "--file",
+            mixed_file.to_str().ok_or("non-UTF-8 mixed family")?,
+        ])
+        .output()?;
+    assert_eq!(mixed.status.code(), Some(9));
+    let unchanged = output_json(
+        fixture
+            .run()
+            .args(["family", "show", &family_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(
+        unchanged["current_generation_id"],
+        old_generation.to_string()
+    );
+    assert_eq!(unchanged["generations"].as_array().map(Vec::len), Some(1));
+
+    let successor = output_json(
+        fixture
+            .run()
+            .args([
+                "family",
+                "supersede",
+                &family_id.to_string(),
+                "--file",
+                file_path,
+                "--json",
+            ])
+            .output()?,
+    )?;
+    let new_generation: igor_core::GenerationId = successor["generation_id"]
+        .as_str()
+        .ok_or("missing successor ID")?
+        .parse()?;
+    assert_ne!(new_generation, old_generation);
+    let new_jobs = successor["jobs"]
+        .as_array()
+        .ok_or("missing successor jobs")?;
+    assert_eq!(new_jobs.len(), 5);
+    let new_ids: Vec<String> = new_jobs
+        .iter()
+        .map(|job| {
+            job["spec"]["id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or("missing new job ID")
+        })
+        .collect::<Result<_, _>>()?;
+    assert!(new_ids.iter().all(|id| !old_ids.contains(id)));
+    for id in &new_ids {
+        let result = fixture.run().args(["wait", id, "--json"]).output()?;
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let repaired = output_json(
+        fixture
+            .run()
+            .args(["family", "show", &family_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(
+        repaired["current_generation_id"],
+        new_generation.to_string()
+    );
+    assert_eq!(repaired["generations"].as_array().map(Vec::len), Some(2));
+    assert_eq!(repaired["generations"][0]["counts"]["superseded"], 5);
+    assert_eq!(repaired["generations"][1]["status"], "comparable");
+    assert_ne!(
+        repaired["generations"][0]["identity"]["source_revision"],
+        repaired["generations"][1]["identity"]["source_revision"]
+    );
+    let old_attempt = output_json(
+        fixture
+            .run()
+            .args(["show", &old_ids[2], "--json"])
+            .output()?,
+    )?;
+    assert_eq!(old_attempt["attempts"].as_array().map(Vec::len), Some(2));
+    assert!(
+        old_attempt["attempts"]
+            .as_array()
+            .is_some_and(|attempts| attempts.iter().all(|attempt| attempt["state"] == "failed"))
+    );
+    assert!(
+        database
+            .families()
+            .comparable_generation(family_id, old_generation)
+            .await
+            .is_err()
+    );
+    let comparable = database
+        .families()
+        .comparable_generation(family_id, new_generation)
+        .await?;
+    let selected_ids: Vec<String> = comparable
+        .members()
+        .iter()
+        .map(|job| job.spec.id.to_string())
+        .collect();
+    assert_eq!(selected_ids, new_ids);
+    Ok(())
+}
+
+#[test]
 fn job_file_dirty_policy_and_frozen_attempt_are_enforced() -> TestResult {
     let _guard = worker_test_guard()?;
     let fixture = Fixture::new()?;

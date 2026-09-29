@@ -38,6 +38,8 @@ pub enum SubmissionError {
     },
     #[error("invalid job file {path}: {reason}")]
     JobFile { path: PathBuf, reason: String },
+    #[error("invalid family file {path}: {reason}")]
+    FamilyFile { path: PathBuf, reason: String },
     #[error("Git provenance failed for {path}: {reason}")]
     Git { path: PathBuf, reason: String },
     #[error("declared {kind} {path} is invalid: {reason}")]
@@ -173,14 +175,29 @@ pub struct Submission {
 pub fn build_submission(
     project: &Project,
     config: &ProjectConfig,
+    input: SubmissionInput,
+) -> Result<Submission, SubmissionError> {
+    let allow_dirty = input.allow_dirty;
+    let before = capture_git(&project.root, allow_dirty)?;
+    let submission = build_submission_with_source(project, config, input, &before)?;
+    let after = capture_git(&project.root, allow_dirty)?;
+    if before != after {
+        return Err(changed_worktree(&project.root));
+    }
+    Ok(submission)
+}
+
+pub(crate) fn build_submission_with_source(
+    project: &Project,
+    config: &ProjectConfig,
     mut input: SubmissionInput,
+    source: &GitIdentity,
 ) -> Result<Submission, SubmissionError> {
     project.validate()?;
     config.validate()?;
     input.command.cwd = resolve_cwd(&project.root, Some(&input.command.cwd))?;
     input.command.validate()?;
     reject_secret_environment(&input.command.environment)?;
-    let before = capture_git(&project.root, input.allow_dirty)?;
 
     let mut declarations = Vec::new();
     declarations.extend(
@@ -229,19 +246,12 @@ pub fn build_submission(
     };
     job.validate()?;
     let job_digest = digest_json(&job, "effective job")?;
-    let after = capture_git(&project.root, input.allow_dirty)?;
-    if before != after {
-        return Err(SubmissionError::Git {
-            path: project.root.clone(),
-            reason: "worktree changed while the submission was being frozen; retry".into(),
-        });
-    }
     let attempt_id = AttemptId::new();
     let attempt = AttemptSpec::from_job(
         attempt_id,
         1,
         &job,
-        SourceIdentity::Git(before),
+        SourceIdentity::Git(source.clone()),
         ConfigurationIdentity {
             project_digest,
             job_digest,
@@ -267,6 +277,13 @@ pub fn build_submission(
         job_event,
         attempt_event,
     })
+}
+
+pub(crate) fn changed_worktree(root: &Path) -> SubmissionError {
+    SubmissionError::Git {
+        path: root.to_path_buf(),
+        reason: "worktree changed while the submission was being frozen; retry".into(),
+    }
 }
 
 fn resolve_cwd(project_root: &Path, cwd: Option<&Path>) -> Result<PathBuf, SubmissionError> {
@@ -298,7 +315,7 @@ fn resolve_cwd(project_root: &Path, cwd: Option<&Path>) -> Result<PathBuf, Submi
     Ok(canonical)
 }
 
-fn capture_git(root: &Path, allow_dirty: bool) -> Result<GitIdentity, SubmissionError> {
+pub(crate) fn capture_git(root: &Path, allow_dirty: bool) -> Result<GitIdentity, SubmissionError> {
     let repository_root = git_text(root, &["rev-parse", "--show-toplevel"])?;
     let repository_root = PathBuf::from(repository_root)
         .canonicalize()
@@ -598,7 +615,10 @@ fn role_name(role: ContentRole) -> &'static str {
     }
 }
 
-fn digest_json<T: Serialize>(value: &T, contract: &'static str) -> Result<String, SubmissionError> {
+pub(crate) fn digest_json<T: Serialize>(
+    value: &T,
+    contract: &'static str,
+) -> Result<String, SubmissionError> {
     let bytes = serde_json::to_vec(value)
         .map_err(|source| SubmissionError::Serialization { contract, source })?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))

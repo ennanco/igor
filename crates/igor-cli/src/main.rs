@@ -10,11 +10,11 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use igor_core::{
-    CommandSpec, ConfigOverrides, EffectiveConfig, Environment, EnvironmentPolicy,
-    HostConfigUpdate, JobDetail, JobId, JobLogs, JobState, Project, ProjectId, ResourceStatus,
-    ShellPolicy, StoredEvent, StoredJob, SubmissionInput, TransitionState, initialize_project,
-    load_effective_config, load_job_file, load_project_config, select_global_config_path,
-    update_global_host_config,
+    CommandSpec, ConfigOverrides, EffectiveConfig, Environment, EnvironmentPolicy, FamilyDetail,
+    FamilyId, HostConfigUpdate, JobDetail, JobId, JobLogs, JobState, Project, ProjectId,
+    ResourceStatus, ShellPolicy, StoredEvent, StoredJob, SubmissionInput, TransitionState,
+    initialize_project, load_effective_config, load_family_file, load_job_file,
+    load_project_config, select_global_config_path, update_global_host_config,
 };
 use igor_daemon::{
     Client, ClientError, DaemonRole, DatabaseStatus, Health, Request, Response, Version,
@@ -131,6 +131,11 @@ enum Command {
     },
     /// Submit a command or versioned job file.
     Submit(SubmitArgs),
+    /// Submit and inspect seed families.
+    Family {
+        #[command(subcommand)]
+        command: FamilyCommand,
+    },
     /// List submitted jobs.
     List {
         #[arg(long)]
@@ -266,6 +271,34 @@ struct SubmitArgs {
     json: bool,
     #[arg(last = true)]
     command: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
+enum FamilyCommand {
+    /// Submit every seed of a family file as one atomic generation.
+    Submit(FamilySubmitArgs),
+    /// Show every generation and its members, with counts by job state.
+    Show {
+        family_id: FamilyId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replace a terminal generation with a full new seed generation.
+    Supersede {
+        family_id: FamilyId,
+        #[arg(long, value_name = "FILE")]
+        file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+struct FamilySubmitArgs {
+    #[arg(long, value_name = "FILE")]
+    file: PathBuf,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -562,6 +595,31 @@ async fn run() -> anyhow::Result<()> {
             let effective = effective_config(&overrides, &cwd)?;
             submit(&effective, &cwd, arguments).await?;
         }
+        Command::Family { command } => match command {
+            FamilyCommand::Submit(arguments) => {
+                let effective = effective_config(&overrides, &cwd)?;
+                family_submit(&effective, &cwd, arguments).await?;
+            }
+            FamilyCommand::Show { family_id, json } => {
+                let effective = effective_config(&overrides, &cwd)?;
+                let response = Client::new(&effective.paths)
+                    .request(DaemonRole::Worker, Request::FamilyShow { family_id })
+                    .await?;
+                let family = match response {
+                    Response::Family(family) => family,
+                    response => anyhow::bail!("unexpected {response:?} family-show response"),
+                };
+                print_family(&family, json)?;
+            }
+            FamilyCommand::Supersede {
+                family_id,
+                file,
+                json,
+            } => {
+                let effective = effective_config(&overrides, &cwd)?;
+                family_supersede(&effective, &cwd, family_id, &file, json).await?;
+            }
+        },
         Command::List { json } => {
             let effective = effective_config(&overrides, &cwd)?;
             let client = Client::new(&effective.paths);
@@ -1089,6 +1147,172 @@ async fn submit(
         println!("submitted {} ({})", job.spec.id, job.spec.name);
     }
     Ok(())
+}
+
+async fn family_submit(
+    effective: &EffectiveConfig,
+    cwd: &std::path::Path,
+    arguments: FamilySubmitArgs,
+) -> anyhow::Result<()> {
+    let client = Client::new(&effective.paths);
+    let loaded = effective
+        .project
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no project configuration found; run `igor init` first"))?;
+    let project = selected_registered_project(&client, effective)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project is not registered; run `igor project add {}`",
+                loaded.project_root.display()
+            )
+        })?;
+    let file = load_family_file(&absolute(cwd, &arguments.file))?;
+    let response = client
+        .request(
+            DaemonRole::Worker,
+            Request::FamilySubmit {
+                project_id: project.id,
+                file: Box::new(file),
+            },
+        )
+        .await?;
+    let (family_id, generation_id, jobs) = match response {
+        Response::FamilySubmitted {
+            family_id,
+            generation_id,
+            jobs,
+        } => (family_id, generation_id, jobs),
+        response => anyhow::bail!("unexpected {response:?} family submission response"),
+    };
+    if arguments.json {
+        let payload = serde_json::json!({
+            "family_id": family_id,
+            "generation_id": generation_id,
+            "jobs": jobs,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!(
+            "submitted family {} generation {} ({} jobs)",
+            family_id,
+            generation_id,
+            jobs.len()
+        );
+        for job in &jobs {
+            println!("{} {}", job.spec.id, job.spec.name);
+        }
+    }
+    Ok(())
+}
+
+fn print_family(family: &FamilyDetail, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(family)?);
+        return Ok(());
+    }
+    println!("family {} ({})", family.family.id, family.family.name);
+    for generation in &family.generations {
+        println!(
+            "generation {} {} revision {} protocol {} status {}{}",
+            generation.identity.number,
+            generation.identity.id,
+            generation.identity.source_revision,
+            generation.identity.protocol_digest,
+            match generation.status {
+                igor_core::GenerationStatus::Incomplete => "incomplete",
+                igor_core::GenerationStatus::Complete => "complete",
+                igor_core::GenerationStatus::Comparable => "comparable",
+                igor_core::GenerationStatus::Invalid => "invalid",
+            },
+            if family.current_generation_id == Some(generation.identity.id) {
+                " (current)"
+            } else {
+                ""
+            }
+        );
+        for job in &generation.jobs {
+            println!(
+                "  {}\t{}\t{}",
+                job.spec.id,
+                job.spec.name,
+                job.state.as_str()
+            );
+        }
+        println!("  counts: {}", format_counts(&generation.counts));
+    }
+    println!("total: {}", format_counts(&family.counts));
+    Ok(())
+}
+
+async fn family_supersede(
+    effective: &EffectiveConfig,
+    cwd: &Path,
+    family_id: FamilyId,
+    file: &Path,
+    json: bool,
+) -> anyhow::Result<()> {
+    let client = Client::new(&effective.paths);
+    let loaded = effective
+        .project
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no project configuration found; run `igor init` first"))?;
+    let project = selected_registered_project(&client, effective)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "project is not registered; run `igor project add {}`",
+                loaded.project_root.display()
+            )
+        })?;
+    let file = load_family_file(&absolute(cwd, file))?;
+    let response = client
+        .request(
+            DaemonRole::Worker,
+            Request::FamilySupersede {
+                project_id: project.id,
+                family_id,
+                file: Box::new(file),
+            },
+        )
+        .await?;
+    let (previous_generation_id, generation_id, jobs) = match response {
+        Response::FamilySuperseded {
+            previous_generation_id,
+            generation_id,
+            jobs,
+            ..
+        } => (previous_generation_id, generation_id, jobs),
+        response => anyhow::bail!("unexpected {response:?} family supersession response"),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "family_id": family_id,
+                "previous_generation_id": previous_generation_id,
+                "generation_id": generation_id,
+                "jobs": jobs,
+            }))?
+        );
+    } else {
+        println!(
+            "superseded generation {previous_generation_id} with {generation_id} ({} jobs)",
+            jobs.len()
+        );
+        for job in &jobs {
+            println!("{} {}", job.spec.id, job.spec.name);
+        }
+    }
+    Ok(())
+}
+
+fn format_counts(counts: &std::collections::BTreeMap<String, u64>) -> String {
+    counts
+        .iter()
+        .map(|(state, count)| format!("{state}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn selected_registered_project(

@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod event;
 mod executor;
+mod family;
 mod id;
 mod inventory;
 mod job;
@@ -41,6 +42,10 @@ pub use executor::{
     parse_docker_create_stdout, parse_docker_inspect_stdout, parse_docker_recovery_candidates,
     parse_docker_recovery_inspect, parse_docker_wait_stdout, validate_docker_mount_sources,
 };
+pub use family::{
+    FAMILY_FILE_VERSION, FamilyFile, FamilyMember, PreparedFamily, build_family_generation,
+    load_family_file,
+};
 pub use id::{
     ActionId, AgentSessionId, AttemptId, DeliveryId, EventId, FamilyId, GenerationId, JobId,
     ProjectId, RecoveryId, ReportId, ResourceId,
@@ -52,12 +57,13 @@ pub use job::{
 };
 pub use persistence::{
     ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, ClaimedAction,
-    ClaimedDelivery, ContainerCreate, ContainerFinish, ContainerRecord, Database, DatabaseOptions,
-    DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim, ExecutionOutcome, Family,
-    FamilyGenerationRepository, Generation, IntegrityCheck, JobAttemptRepository, JobDetail,
-    JobLogs, PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, RecoveredExecution,
-    Resource, ResourceLease, ResourceRepository, ResourceStatus, StoredAttempt, StoredEvent,
-    StoredJob, UnitRecord, UnitReservation,
+    ClaimedDelivery, ComparableGeneration, ContainerCreate, ContainerFinish, ContainerRecord,
+    Database, DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim,
+    ExecutionOutcome, Family, FamilyDetail, FamilyGenerationDetail, FamilyGenerationRepository,
+    Generation, GenerationStatus, IntegrityCheck, JobAttemptRepository, JobDetail, JobLogs,
+    PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, RecoveredExecution, Resource,
+    ResourceLease, ResourceRepository, ResourceStatus, StoredAttempt, StoredEvent, StoredJob,
+    UnitRecord, UnitReservation,
 };
 pub use project::{
     PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,

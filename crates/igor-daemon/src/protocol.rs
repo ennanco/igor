@@ -1,12 +1,12 @@
 use std::{fmt, path::Path};
 
 use igor_core::{
-    JobDetail, JobId, JobLogs, Project, ProjectId, ResourceStatus, RuntimePaths, StoredEvent,
-    StoredJob, SubmissionInput,
+    FamilyDetail, FamilyFile, FamilyId, GenerationId, JobDetail, JobId, JobLogs, Project,
+    ProjectId, ResourceStatus, RuntimePaths, StoredEvent, StoredJob, SubmissionInput,
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +77,18 @@ pub enum Request {
         project_id: ProjectId,
         input: Box<SubmissionInput>,
     },
+    FamilySubmit {
+        project_id: ProjectId,
+        file: Box<FamilyFile>,
+    },
+    FamilyShow {
+        family_id: FamilyId,
+    },
+    FamilySupersede {
+        project_id: ProjectId,
+        family_id: FamilyId,
+        file: Box<FamilyFile>,
+    },
     JobList {
         project_id: Option<ProjectId>,
     },
@@ -134,14 +146,36 @@ pub enum Response {
     Health(Health),
     Version(Version),
     DatabaseStatus(DatabaseStatus),
-    Resources { resources: Vec<ResourceStatus> },
+    Resources {
+        resources: Vec<ResourceStatus>,
+    },
     Project(Project),
-    Projects { projects: Vec<Project> },
-    OptionalProject { project: Option<Project> },
+    Projects {
+        projects: Vec<Project>,
+    },
+    OptionalProject {
+        project: Option<Project>,
+    },
     Submitted(StoredJob),
-    Jobs { jobs: Vec<StoredJob> },
+    FamilySubmitted {
+        family_id: FamilyId,
+        generation_id: GenerationId,
+        jobs: Vec<StoredJob>,
+    },
+    Family(FamilyDetail),
+    FamilySuperseded {
+        family_id: FamilyId,
+        previous_generation_id: GenerationId,
+        generation_id: GenerationId,
+        jobs: Vec<StoredJob>,
+    },
+    Jobs {
+        jobs: Vec<StoredJob>,
+    },
     Job(JobDetail),
-    Events { events: Vec<StoredEvent> },
+    Events {
+        events: Vec<StoredEvent>,
+    },
     Cancelled(JobDetail),
     Retried(JobDetail),
     Logs(JobLogs),

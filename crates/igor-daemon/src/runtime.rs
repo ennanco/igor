@@ -483,6 +483,105 @@ async fn handle_request(
                 Err(error) => persistence_response(error),
             }
         }
+        Request::FamilySubmit { project_id, file } => {
+            let project = match database.projects().get(project_id).await {
+                Ok(Some(project)) => project,
+                Ok(None) => return ResponseEnvelope::failure(ProtocolError::not_found("project")),
+                Err(error) => return persistence_response(error),
+            };
+            let built = tokio::task::spawn_blocking(move || {
+                let config =
+                    load_project_config(&project.config_path).map_err(|error| error.to_string())?;
+                igor_core::build_family_generation(&project, &config.config, *file)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+            let prepared = match built {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    return ResponseEnvelope::failure(ProtocolError::invalid_request(error));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "family builder task failed");
+                    return ResponseEnvelope::failure(ProtocolError::internal());
+                }
+            };
+            let family_id = prepared.family.id;
+            let generation_id = prepared.generation.identity.id;
+            match database.families().submit(&prepared).await {
+                Ok(jobs) => ResponseEnvelope::success(Response::FamilySubmitted {
+                    family_id,
+                    generation_id,
+                    jobs,
+                }),
+                Err(error) => persistence_response(error),
+            }
+        }
+        Request::FamilyShow { family_id } => match database.families().detail(family_id).await {
+            Ok(Some(family)) => ResponseEnvelope::success(Response::Family(family)),
+            Ok(None) => ResponseEnvelope::failure(ProtocolError::not_found("family")),
+            Err(error) => persistence_response(error),
+        },
+        Request::FamilySupersede {
+            project_id,
+            family_id,
+            file,
+        } => {
+            let family = match database.families().detail(family_id).await {
+                Ok(Some(family)) if family.family.project_id == project_id => family,
+                Ok(_) => return ResponseEnvelope::failure(ProtocolError::not_found("family")),
+                Err(error) => return persistence_response(error),
+            };
+            let Some(previous_generation_id) = family.current_generation_id else {
+                return ResponseEnvelope::failure(ProtocolError::not_found("family generation"));
+            };
+            let Some(number) = family
+                .generations
+                .last()
+                .and_then(|generation| generation.identity.number.checked_add(1))
+            else {
+                return ResponseEnvelope::failure(ProtocolError::invalid_request(
+                    "generation number exhausted",
+                ));
+            };
+            let project = match database.projects().get(project_id).await {
+                Ok(Some(project)) => project,
+                Ok(None) => return ResponseEnvelope::failure(ProtocolError::not_found("project")),
+                Err(error) => return persistence_response(error),
+            };
+            let built = tokio::task::spawn_blocking(move || {
+                let config =
+                    load_project_config(&project.config_path).map_err(|error| error.to_string())?;
+                igor_core::build_family_generation(&project, &config.config, *file)
+                    .and_then(|prepared| prepared.for_existing_family(family.family, number))
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+            let prepared = match built {
+                Ok(Ok(prepared)) => prepared,
+                Ok(Err(error)) => {
+                    return ResponseEnvelope::failure(ProtocolError::invalid_request(error));
+                }
+                Err(error) => {
+                    tracing::error!(%error, "family successor builder task failed");
+                    return ResponseEnvelope::failure(ProtocolError::internal());
+                }
+            };
+            let generation_id = prepared.generation.identity.id;
+            match database
+                .families()
+                .supersede(previous_generation_id, &prepared)
+                .await
+            {
+                Ok(jobs) => ResponseEnvelope::success(Response::FamilySuperseded {
+                    family_id,
+                    previous_generation_id,
+                    generation_id,
+                    jobs,
+                }),
+                Err(error) => persistence_response(error),
+            }
+        }
         Request::JobList { project_id } => match database.jobs().list(project_id).await {
             Ok(jobs) => ResponseEnvelope::success(Response::Jobs { jobs }),
             Err(error) => persistence_response(error),
@@ -659,6 +758,9 @@ fn validate_response(
         | (Request::ProjectList, Response::Projects { .. })
         | (Request::ProjectByRoot { .. }, Response::OptionalProject { .. })
         | (Request::Submit { .. }, Response::Submitted(_))
+        | (Request::FamilySubmit { .. }, Response::FamilySubmitted { .. })
+        | (Request::FamilyShow { .. }, Response::Family(_))
+        | (Request::FamilySupersede { .. }, Response::FamilySuperseded { .. })
         | (Request::JobList { .. }, Response::Jobs { .. })
         | (Request::JobShow { .. }, Response::Job(_))
         | (Request::JobEvents { .. }, Response::Events { .. })

@@ -419,12 +419,116 @@ Generation 2, repaired revision B
 `-- seed 5 -> queued again
 ```
 
-A validated code correction creates a new family generation. All related seeds
-are rerun so the aggregate never mixes code revisions. Successful results from
-the previous generation become `superseded`, not comparable.
+A validated code correction can create a new family generation. All related
+seeds are rerun so the aggregate never mixes code revisions. Successful results
+from the previous generation become `superseded`, not comparable.
 
-A transient infrastructure failure that does not modify code only retries the
-failed job within the same generation.
+A transient infrastructure failure that does not modify code can be retried by
+the operator with `igor retry JOB_ID` inside the same generation. The retry
+transaction compares the job, prior attempt, frozen Git identity and generation
+record (including protocol digest and required seed) before creating the next
+attempt; it copies the previous source, configuration and result contract.
+The prior attempt and all other members remain unchanged. While a retry is
+queued or running the generation is incomplete, and it becomes comparable only
+if every required member eventually succeeds. Automatic classification of
+transient versus code failures belongs to M16.01–M16.02; this manual retry does
+not authorize replacing code or silently creating a new generation.
+Superseded jobs cannot be retried.
+
+The versioned `family.toml` declares every required seed explicitly. Shared
+`execution.program` and `execution.args` are a direct command vector; each
+`[[members]]` entry appends seed-specific `args` and/or scientific configuration
+paths, never a shell template. Shared and member configuration paths are
+frozen with the attempt. A family file cannot omit required members, repeat a
+seed, or mix direct and shell execution. The family generation freezes the
+revision and protocol identity before any member becomes runnable.
+Preparation reads the Git identity before and after freezing every member and
+rejects a changed worktree. The protocol digest includes execution and
+scientific inputs, project configuration, declared content hashes for every
+seed, and the Git dirty-worktree digest when explicitly allowed. Scheduling
+priority and display name do not change scientific comparability. Every job
+and attempt carries the same frozen generation and source identity.
+
+```toml
+schema_version = 1
+name = "gnn-frozen-unweighted"
+scientific_configurations = ["configs/shared.toml"]
+
+[execution]
+program = "/usr/bin/python3"
+args = ["train.py", "--frozen"]
+
+[[members]]
+seed = 1
+args = ["--seed", "1"]
+scientific_configurations = ["configs/seed1.toml"]
+
+[[members]]
+seed = 2
+args = ["--seed", "2"]
+scientific_configurations = ["configs/seed2.toml"]
+```
+
+`igor family show FAMILY_ID [--json]` reads the family, generation identities,
+and current member states in one SQLite read transaction. It returns members
+ordered by submission and generations ordered by number. State counts include
+every job state, with zero-valued entries for absent states, both per
+generation and across the family. These are current **job** counts, not the
+number of attempts. In protocol v9, `family_show`, `family_supersede` and their
+responses require matching CLI/daemon versions.
+
+Each generation exposes a status assessed from the immutable required seed
+list in its stored family specification and the **current job state** of every
+member. `incomplete` means a required seed is missing or any member is queued
+or running (including during a retry). `complete` means every required seed
+has exactly one terminal job but at least one failed, was cancelled, was lost,
+or was superseded. `comparable` means exactly one job per required seed,
+all succeeded, and every member carries the same family ID and complete
+generation identity (ID, number, Git revision, protocol digest). An extra or
+duplicate seed or inconsistent membership is `invalid`, never comparable;
+an unreadable frozen family specification or protocol-digest mismatch is an
+integrity error rather than an assumed complete generation. A later successful
+retry can move a generation from `complete` through `incomplete` to
+`comparable`, without treating old attempts as additional seeds. `comparable`
+qualifies results **within one generation**. The current generation is the
+highest generation number in the family, exposed as `current_generation_id`.
+
+The M11.10 read boundary for future metric/report aggregation is
+`FamilyGenerationRepository::comparable_generation(family_id, generation_id)`.
+It requires both IDs, reads only that generation and its jobs in one SQLite
+snapshot, verifies the frozen protocol and exact seed membership, and returns
+an immutable `ComparableGeneration` only when every member has succeeded.
+Incomplete, failed, invalid, or mixed-ID/revision/protocol selections fail
+closed; a successful member from another generation cannot fill a missing
+seed. Historic generations remain readable but cannot be selected as
+comparable after supersession. Future M12/M14 consumers must use this selection
+rather than family-wide counts or `jobs.list`,
+and revalidate before publishing if the state can change after selection.
+Current aggregates must select `current_generation_id` and exclude superseded
+historical results; their final publication remains part of M12/M14.
+
+`igor family supersede FAMILY_ID --file family.toml` requires an existing
+registered project and an unchanged scientific protocol digest, while freezing
+a fresh Git source revision for all seeds. It rejects incomplete or invalid
+old generations: queued jobs must be cancelled explicitly, and running jobs
+must finish or be cancelled with the normal job command first. The repository
+verifies the expected previous generation, project scope and consecutive
+generation number, then atomically marks old terminal jobs `superseded`, appends
+their state-change events and inserts every new job/attempt/event. Old attempt
+states and history remain untouched. A stale or concurrent supersession cannot
+publish a second successor; failure at any insertion rolls the whole change
+back. This command does not apply an agent repair or implicitly cancel work;
+the approval-controlled repair workflow remains in M16.
+
+M11.13 exercises a five-seed family against a disposable Git repository and
+real local worker. A held first seed demonstrates `incomplete` while the other
+four remain queued; releasing the barrier produces one comparable generation.
+A separate deterministic failure remains non-comparable through a retry, then
+repaired code is committed and all five seeds are rerun in a successor. The
+superseded attempts remain readable but cannot satisfy the new generation's
+selection; changing a required seed instead of repairing code changes the
+scientific protocol and is rejected. This validates the M11/A11 selection
+boundary; A11.03 requires the actual current-generation aggregate from M12/M14.
 
 ### 10.3 Running Old Generations
 

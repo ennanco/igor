@@ -246,7 +246,7 @@ async fn client_rejects_response_from_the_wrong_role() -> Result<(), Box<dyn Err
             let mut request = String::new();
             let _ = BufReader::new(&stream).read_line(&mut request);
             let _ = stream.write_all(
-                b"{\"protocol_version\":5,\"response\":{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}\n",
+                format!("{{\"protocol_version\":{PROTOCOL_VERSION},\"response\":{{\"type\":\"health\",\"role\":\"supervisor\",\"healthy\":true,\"pid\":1}}}}\n").as_bytes(),
             );
         }
     });

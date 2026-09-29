@@ -11,6 +11,8 @@ use std::{
 
 use tempfile::TempDir;
 
+use igor_daemon::PROTOCOL_VERSION;
+
 fn command(home: &Path, cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_igor"));
     command
@@ -127,7 +129,7 @@ fn daemon_exit_codes_distinguish_transport_and_protocol_errors() -> Result<(), B
     let socket = home.join("runtime/igor/worker.sock");
     serve_once(
         &socket,
-        b"{\"protocol_version\":99,\"response\":{\"type\":\"health\",\"role\":\"worker\",\"healthy\":true,\"pid\":1}}\n",
+        b"{\"protocol_version\":99,\"response\":{\"type\":\"health\",\"role\":\"worker\",\"healthy\":true,\"pid\":1}}\n".to_vec(),
     )?;
     let mismatch = command(&home, temporary.path())
         .args(["daemon", "health"])
@@ -136,7 +138,7 @@ fn daemon_exit_codes_distinguish_transport_and_protocol_errors() -> Result<(), B
 
     serve_once(
         &socket,
-        b"{\"protocol_version\":5,\"error\":{\"code\":\"IGOR-PROTO-002\",\"kind\":\"invalid_request\",\"message\":\"bad request\"}}\n",
+        format!("{{\"protocol_version\":{PROTOCOL_VERSION},\"error\":{{\"code\":\"IGOR-PROTO-002\",\"kind\":\"invalid_request\",\"message\":\"bad request\"}}}}\n").into_bytes(),
     )?;
     let invalid = command(&home, temporary.path())
         .args(["daemon", "health"])
@@ -145,7 +147,7 @@ fn daemon_exit_codes_distinguish_transport_and_protocol_errors() -> Result<(), B
 
     serve_once(
         &socket,
-        b"{\"protocol_version\":5,\"error\":{\"code\":\"IGOR-DAEMON-002\",\"kind\":\"internal\",\"message\":\"request failed\"}}\n",
+        format!("{{\"protocol_version\":{PROTOCOL_VERSION},\"error\":{{\"code\":\"IGOR-DAEMON-002\",\"kind\":\"internal\",\"message\":\"request failed\"}}}}\n").into_bytes(),
     )?;
     let internal = command(&home, temporary.path())
         .args(["daemon", "health"])
@@ -167,7 +169,7 @@ fn wait_for_socket(path: &Path) -> Result<(), Box<dyn Error>> {
 fn wait_for_protocol(path: &Path) -> Result<(), Box<dyn Error>> {
     for _ in 0..100 {
         if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) {
-            stream.write_all(b"{\"protocol_version\":5,\"request\":{\"type\":\"health\"}}\n")?;
+            stream.write_all(format!("{{\"protocol_version\":{PROTOCOL_VERSION},\"request\":{{\"type\":\"health\"}}}}\n").as_bytes())?;
             let mut response = String::new();
             BufReader::new(stream).read_line(&mut response)?;
             if response.contains("\"healthy\":true") {
@@ -179,7 +181,7 @@ fn wait_for_protocol(path: &Path) -> Result<(), Box<dyn Error>> {
     Err("restarted worker did not answer the protocol".into())
 }
 
-fn serve_once(path: &Path, response: &'static [u8]) -> Result<(), Box<dyn Error>> {
+fn serve_once(path: &Path, response: Vec<u8>) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -191,7 +193,7 @@ fn serve_once(path: &Path, response: &'static [u8]) -> Result<(), Box<dyn Error>
         if let Ok((mut stream, _)) = listener.accept() {
             let mut request = String::new();
             let _ = BufReader::new(&stream).read_line(&mut request);
-            let _ = stream.write_all(response);
+            let _ = stream.write_all(&response);
         }
     });
     Ok(())

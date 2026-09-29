@@ -496,31 +496,36 @@ Dependencies: milestones 3-4 and 9.
 
 Dependencies: milestones 3, 5, and 7.
 
+Status (2026-09-29): M11.01–M11.13 implemented. A11.01–A11.02 verified with
+five-seed fixtures; A11.03 remains pending until M12/M14 publishes a current
+aggregate. Future metric/report consumers must use the current generation and
+generation-scoped comparable selection.
+
 ### Tasks
 
-- [ ] `M11.01` Define the versioned `family.toml` format.
-- [ ] `M11.02` Represent required members and seed-specific argument or config
+- [x] `M11.01` Define the versioned `family.toml` format.
+- [x] `M11.02` Represent required members and seed-specific argument or config
   substitutions without shell templates.
-- [ ] `M11.03` Freeze one Git revision and protocol identity per generation.
-- [ ] `M11.04` Validate that every member uses the same generation invariants.
-- [ ] `M11.05` Implement `igor family submit --file family.toml`.
-- [ ] `M11.06` Insert the family, generation, jobs, and initial events in one
+- [x] `M11.03` Freeze one Git revision and protocol identity per generation.
+- [x] `M11.04` Validate that every member uses the same generation invariants.
+- [x] `M11.05` Implement `igor family submit --file family.toml`.
+- [x] `M11.06` Insert the family, generation, jobs, and initial events in one
   transaction.
-- [ ] `M11.07` Implement `igor family show FAMILY_ID`.
-- [ ] `M11.08` Report pending, running, failed, succeeded, and superseded member
+- [x] `M11.07` Implement `igor family show FAMILY_ID`.
+- [x] `M11.08` Report pending, running, failed, succeeded, and superseded member
   counts.
-- [ ] `M11.09` Define when a generation is complete and comparable.
-- [ ] `M11.10` Prevent aggregation across revisions or generation IDs.
-- [ ] `M11.11` Permit transient retries within the same generation.
-- [ ] `M11.12` Implement superseding a generation without deleting its database
+- [x] `M11.09` Define when a generation is complete and comparable.
+- [x] `M11.10` Prevent aggregation across revisions or generation IDs.
+- [x] `M11.11` Permit transient retries within the same generation.
+- [x] `M11.12` Implement superseding a generation without deleting its database
   history.
-- [ ] `M11.13` Add tests for complete, partial, failed, repaired, and mixed
+- [x] `M11.13` Add tests for complete, partial, failed, repaired, and mixed
   generation scenarios.
 
 ### Acceptance
 
-- [ ] `A11.01` Five configured seeds run against one immutable generation.
-- [ ] `A11.02` A mixed-revision family cannot be marked comparable.
+- [x] `A11.01` Five configured seeds run against one immutable generation.
+- [x] `A11.02` A mixed-revision family cannot be marked comparable.
 - [ ] `A11.03` Superseded attempts are never selected for the current aggregate.
 
 ## Milestone 12: Metrics And Artifact Publication

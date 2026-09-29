@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
     path::{Path, PathBuf},
     str::FromStr,
@@ -18,9 +19,9 @@ use uuid::Uuid;
 use crate::{
     ActionId, ActionState, ArtifactRole, AttemptId, AttemptSpec, AttemptState, DeliveryId,
     DeliveryState, DockerContainerState, DockerExecutorSpec, DockerImageIdentity, DomainError,
-    Event, EventId, EventKind, EventPayload, ExecutorSpec, FamilyId, GenerationId,
-    GenerationIdentity, GpuRequest, JobId, JobSpec, JobState, Project, ProjectId, ResourceId,
-    ResourceMode, ResourceRequest, TransitionState,
+    Event, EventId, EventKind, EventPayload, ExecutorSpec, FamilyFile, FamilyId, GenerationId,
+    GenerationIdentity, GpuRequest, JobId, JobSpec, JobState, PreparedFamily, Project, ProjectId,
+    ResourceId, ResourceMode, ResourceRequest, TransitionState,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!();
@@ -62,6 +63,11 @@ pub enum PersistenceError {
     NotFound { entity: &'static str },
     #[error("{entity} changed concurrently")]
     Conflict { entity: &'static str },
+    #[error("generation {generation_id} is {status:?}, not comparable")]
+    GenerationNotComparable {
+        generation_id: GenerationId,
+        status: GenerationStatus,
+    },
     #[error("invalid lease: {0}")]
     InvalidLease(&'static str),
     #[error("backup destination must differ from the source database")]
@@ -72,6 +78,8 @@ pub enum PersistenceError {
     InMemoryBackup,
     #[error(transparent)]
     Domain(#[from] DomainError),
+    #[error(transparent)]
+    Submission(#[from] crate::SubmissionError),
     #[error("blocking database task failed: {0}")]
     BlockingTask(#[from] tokio::task::JoinError),
 }
@@ -408,7 +416,7 @@ pub struct Claim<T> {
     pub expires_at: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct Family {
     pub id: FamilyId,
     pub project_id: ProjectId,
@@ -420,6 +428,116 @@ pub struct Generation {
     pub family_id: FamilyId,
     pub identity: GenerationIdentity,
     pub spec: Value,
+}
+
+/// A complete, single-generation selection for downstream metrics and reports.
+/// Constructed only after checking the frozen contract and current member states.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComparableGeneration {
+    family_id: FamilyId,
+    identity: GenerationIdentity,
+    members: Vec<StoredJob>,
+}
+
+impl ComparableGeneration {
+    #[must_use]
+    pub const fn family_id(&self) -> FamilyId {
+        self.family_id
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &GenerationIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub fn members(&self) -> &[StoredJob] {
+        &self.members
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationStatus {
+    Incomplete,
+    Complete,
+    Comparable,
+    Invalid,
+}
+
+impl Generation {
+    pub fn assess(&self, jobs: &[StoredJob]) -> PersistenceResult<GenerationStatus> {
+        let file: FamilyFile =
+            serde_json::from_value(self.spec["family"].clone()).map_err(|error| {
+                PersistenceError::InvalidValue {
+                    entity: "generation family file",
+                    value: error.to_string(),
+                }
+            })?;
+        file.validate()
+            .map_err(|error| PersistenceError::InvalidValue {
+                entity: "generation family file",
+                value: error.to_string(),
+            })?;
+        let actual_digest =
+            crate::family::generation_protocol_digest(&self.spec, &file).map_err(|error| {
+                PersistenceError::InvalidValue {
+                    entity: "generation protocol",
+                    value: error.to_string(),
+                }
+            })?;
+        if actual_digest != self.identity.protocol_digest {
+            return Err(PersistenceError::InvalidValue {
+                entity: "generation protocol",
+                value: "frozen specification does not match protocol digest".into(),
+            });
+        }
+        let expected: BTreeSet<_> = file.members.iter().map(|member| member.seed.0).collect();
+        let mut observed = BTreeSet::new();
+        for job in jobs {
+            let Some(membership) = &job.spec.family else {
+                return Ok(GenerationStatus::Invalid);
+            };
+            if membership.family_id != self.family_id
+                || membership.generation != self.identity
+                || !expected.contains(&membership.seed.0)
+                || !observed.insert(membership.seed.0)
+            {
+                return Ok(GenerationStatus::Invalid);
+            }
+        }
+        if observed != expected || jobs.iter().any(|job| !job.state.is_terminal()) {
+            return Ok(GenerationStatus::Incomplete);
+        }
+        if jobs.iter().all(|job| job.state == JobState::Succeeded) {
+            Ok(GenerationStatus::Comparable)
+        } else {
+            Ok(GenerationStatus::Complete)
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct FamilyDetail {
+    pub family: Family,
+    pub generations: Vec<FamilyGenerationDetail>,
+    pub current_generation_id: Option<GenerationId>,
+    pub counts: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct FamilyGenerationDetail {
+    pub identity: GenerationIdentity,
+    pub jobs: Vec<StoredJob>,
+    pub counts: BTreeMap<String, u64>,
+    pub status: GenerationStatus,
+}
+
+fn job_state_counts() -> BTreeMap<String, u64> {
+    JobState::ALL
+        .iter()
+        .map(|state| (state.as_str().to_owned(), 0))
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -1322,6 +1440,321 @@ pub struct FamilyGenerationRepository<'a> {
 }
 
 impl FamilyGenerationRepository<'_> {
+    /// Select exactly one comparable generation in a consistent SQLite snapshot.
+    /// Historic generations require an explicit ID; this does not select the
+    /// current generation, which will be defined by supersession policy.
+    pub async fn comparable_generation(
+        &self,
+        family_id: FamilyId,
+        generation_id: GenerationId,
+    ) -> PersistenceResult<ComparableGeneration> {
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin comparable generation read", source))?;
+        let row = sqlx::query("SELECT id, family_id, generation_number, source_revision, protocol_digest, spec_json FROM generations WHERE id = ? AND family_id = ?")
+            .bind(generation_id.to_string())
+            .bind(family_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read comparable generation", source))?
+            .ok_or(PersistenceError::NotFound { entity: "family generation" })?;
+        let generation = decode_generation(row)?;
+        let rows = sqlx::query("SELECT id, spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE generation_id = ? AND family_id = ? ORDER BY submission_order")
+            .bind(generation_id.to_string())
+            .bind(family_id.to_string())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| db("read comparable generation members", source))?;
+        let mut members = Vec::with_capacity(rows.len());
+        for row in rows {
+            let stored_id: String = row.get("id");
+            let job = decode_job(row)?;
+            if job.spec.id.to_string() != stored_id {
+                return Err(PersistenceError::InvalidValue {
+                    entity: "family member job ID",
+                    value: stored_id,
+                });
+            }
+            members.push(job);
+        }
+        let status = generation.assess(&members)?;
+        if status != GenerationStatus::Comparable {
+            return Err(PersistenceError::GenerationNotComparable {
+                generation_id,
+                status,
+            });
+        }
+        Ok(ComparableGeneration {
+            family_id,
+            identity: generation.identity,
+            members,
+        })
+    }
+
+    pub async fn detail(&self, id: FamilyId) -> PersistenceResult<Option<FamilyDetail>> {
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin family detail read", source))?;
+        let family = sqlx::query("SELECT id, project_id, name FROM families WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read family detail", source))?;
+        let Some(family) = family else {
+            return Ok(None);
+        };
+        let family = Family {
+            id: parse_id(family.get("id"), "family")?,
+            project_id: parse_id(family.get("project_id"), "family project")?,
+            name: family.get("name"),
+        };
+        let rows = sqlx::query("SELECT id, family_id, generation_number, source_revision, protocol_digest, spec_json FROM generations WHERE family_id = ? ORDER BY generation_number")
+            .bind(id.to_string())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| db("list family generations", source))?;
+        let mut generations = Vec::with_capacity(rows.len());
+        let mut originals = Vec::with_capacity(rows.len());
+        let mut by_id = BTreeMap::new();
+        for row in rows {
+            let generation = decode_generation(row)?;
+            by_id.insert(generation.identity.id, generations.len());
+            generations.push(FamilyGenerationDetail {
+                identity: generation.identity.clone(),
+                jobs: Vec::new(),
+                counts: job_state_counts(),
+                status: GenerationStatus::Incomplete,
+            });
+            originals.push(generation);
+        }
+        let rows = sqlx::query("SELECT generation_id, spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE family_id = ? ORDER BY submission_order")
+            .bind(id.to_string())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| db("list family members", source))?;
+        let mut counts = job_state_counts();
+        for row in rows {
+            let generation_id: GenerationId =
+                parse_id(row.get("generation_id"), "member generation")?;
+            let job = decode_job(row)?;
+            let Some(index) = by_id.get(&generation_id) else {
+                return Err(PersistenceError::InvalidValue {
+                    entity: "member generation",
+                    value: generation_id.to_string(),
+                });
+            };
+            *counts.entry(job.state.as_str().to_owned()).or_default() += 1;
+            let generation = &mut generations[*index];
+            *generation
+                .counts
+                .entry(job.state.as_str().to_owned())
+                .or_default() += 1;
+            generation.jobs.push(job);
+        }
+        for (original, generation) in originals.iter().zip(&mut generations) {
+            generation.status = original.assess(&generation.jobs)?;
+        }
+        let current_generation_id = generations
+            .iter()
+            .max_by_key(|generation| generation.identity.number)
+            .map(|generation| generation.identity.id);
+        Ok(Some(FamilyDetail {
+            family,
+            generations,
+            current_generation_id,
+            counts,
+        }))
+    }
+
+    pub async fn submit(&self, prepared: &PreparedFamily) -> PersistenceResult<Vec<StoredJob>> {
+        validate_prepared_family(prepared)?;
+
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin family submission", source))?;
+        sqlx::query("INSERT INTO families (id, project_id, name) VALUES (?, ?, ?)")
+            .bind(prepared.family.id.to_string())
+            .bind(prepared.family.project_id.to_string())
+            .bind(&prepared.family.name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| db("insert submitted family", source))?;
+        sqlx::query("INSERT INTO generations (id, family_id, project_id, generation_number, source_revision, protocol_digest, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(prepared.generation.identity.id.to_string())
+            .bind(prepared.family.id.to_string())
+            .bind(prepared.family.project_id.to_string())
+            .bind(i64::from(prepared.generation.identity.number))
+            .bind(&prepared.generation.identity.source_revision)
+            .bind(&prepared.generation.identity.protocol_digest)
+            .bind(json(&prepared.generation.spec, "generation spec")?)
+            .execute(&mut *transaction).await
+            .map_err(|source| db("insert submitted generation", source))?;
+
+        let stored = insert_prepared_family_jobs(&mut transaction, prepared).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit family submission", source))?;
+        Ok(stored)
+    }
+
+    pub async fn supersede(
+        &self,
+        expected: GenerationId,
+        prepared: &PreparedFamily,
+    ) -> PersistenceResult<Vec<StoredJob>> {
+        validate_prepared_family(prepared)?;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin family supersession", source))?;
+        let family_row = sqlx::query("SELECT id, project_id, name FROM families WHERE id = ?")
+            .bind(prepared.family.id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read superseded family", source))?
+            .ok_or(PersistenceError::NotFound { entity: "family" })?;
+        let existing_family = Family {
+            id: parse_id(family_row.get("id"), "family")?,
+            project_id: parse_id(family_row.get("project_id"), "family project")?,
+            name: family_row.get("name"),
+        };
+        if existing_family != prepared.family {
+            return Err(PersistenceError::Conflict { entity: "family" });
+        }
+        let project_root: String =
+            sqlx::query_scalar("SELECT root_path FROM projects WHERE id = ?")
+                .bind(prepared.family.project_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| db("read superseded family project root", source))?;
+        let project_root = Path::new(&project_root);
+        if prepared.submissions.iter().any(|submission| {
+            !submission.job.command.cwd.starts_with(project_root)
+                || !matches!(submission.attempt.source(), crate::SourceIdentity::Git(source)
+                    if project_root.starts_with(&source.root))
+        }) {
+            return Err(PersistenceError::Conflict {
+                entity: "family project",
+            });
+        }
+        let rows = sqlx::query("SELECT id, family_id, generation_number, source_revision, protocol_digest, spec_json FROM generations WHERE family_id = ? ORDER BY generation_number DESC LIMIT 1")
+            .bind(prepared.family.id.to_string()).fetch_all(&mut *transaction).await
+            .map_err(|source| db("read family generations for supersession", source))?;
+        let current_row = rows.into_iter().next().ok_or(PersistenceError::NotFound {
+            entity: "family generation",
+        })?;
+        let current = decode_generation(current_row)?;
+        let next_number = current.identity.number.checked_add(1);
+        if current.identity.id != expected
+            || next_number != Some(prepared.generation.identity.number)
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "family generation",
+            });
+        }
+        if current.identity.protocol_digest != prepared.generation.identity.protocol_digest {
+            return Err(PersistenceError::Conflict {
+                entity: "family protocol",
+            });
+        }
+        if current.identity.source_revision == prepared.generation.identity.source_revision {
+            return Err(PersistenceError::Conflict {
+                entity: "family source revision",
+            });
+        }
+        let old_rows = sqlx::query("SELECT id, spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE family_id = ? AND generation_id = ? ORDER BY submission_order")
+            .bind(prepared.family.id.to_string()).bind(expected.to_string()).fetch_all(&mut *transaction).await
+            .map_err(|source| db("read previous generation members", source))?;
+        let mut old_jobs = Vec::with_capacity(old_rows.len());
+        for row in old_rows {
+            let stored_id: String = row.get("id");
+            let member = decode_job(row)?;
+            if member.spec.id.to_string() != stored_id {
+                return Err(PersistenceError::InvalidValue {
+                    entity: "family member job ID",
+                    value: stored_id,
+                });
+            }
+            old_jobs.push(member);
+        }
+        match current.assess(&old_jobs)? {
+            GenerationStatus::Complete | GenerationStatus::Comparable => {}
+            _ => {
+                return Err(PersistenceError::Conflict {
+                    entity: "family generation",
+                });
+            }
+        }
+        let mut superseded = 0;
+        for member in &old_jobs {
+            if !matches!(
+                member.state,
+                JobState::Succeeded | JobState::Failed | JobState::Cancelled | JobState::Lost
+            ) {
+                return Err(PersistenceError::Conflict {
+                    entity: "family generation jobs",
+                });
+            }
+            let event = state_event(
+                EventKind::JobStateChanged,
+                "job",
+                &member.spec.id.to_string(),
+                "superseded",
+                None,
+                Some(serde_json::json!({
+                    "previous_state": member.state.as_str(),
+                    "generation_id": expected,
+                    "replacement_generation_id": prepared.generation.identity.id,
+                })),
+            )?;
+            let result = sqlx::query("UPDATE jobs SET state = 'superseded', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND generation_id = ? AND state IN ('succeeded', 'failed', 'cancelled', 'lost')")
+                .bind(member.spec.id.to_string()).bind(expected.to_string()).execute(&mut *transaction).await
+                .map_err(|source| db("supersede previous generation job", source))?;
+            if result.rows_affected() != 1 {
+                return Err(PersistenceError::Conflict {
+                    entity: "family generation jobs",
+                });
+            }
+            insert_event(
+                &mut transaction,
+                member.spec.project_id,
+                Some(member.spec.id),
+                None,
+                &event,
+            )
+            .await?;
+            superseded += 1;
+        }
+        if superseded != old_jobs.len() {
+            return Err(PersistenceError::Conflict {
+                entity: "family generation jobs",
+            });
+        }
+        sqlx::query("INSERT INTO generations (id, family_id, project_id, generation_number, source_revision, protocol_digest, spec_json) VALUES (?, ?, ?, ?, ?, ?, ?)")
+            .bind(prepared.generation.identity.id.to_string()).bind(prepared.family.id.to_string()).bind(prepared.family.project_id.to_string())
+            .bind(i64::from(prepared.generation.identity.number)).bind(&prepared.generation.identity.source_revision)
+            .bind(&prepared.generation.identity.protocol_digest).bind(json(&prepared.generation.spec, "generation spec")?)
+            .execute(&mut *transaction).await.map_err(|source| db("insert superseding generation", source))?;
+        let stored = insert_prepared_family_jobs(&mut transaction, prepared).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit family supersession", source))?;
+        Ok(stored)
+    }
+
     pub async fn insert_family(&self, family: &Family) -> PersistenceResult<()> {
         sqlx::query("INSERT INTO families (id, project_id, name) VALUES (?, ?, ?)")
             .bind(family.id.to_string())
@@ -1376,26 +1809,115 @@ impl FamilyGenerationRepository<'_> {
             .fetch_optional(&self.database.pool)
             .await
             .map_err(|source| db("get generation", source))?;
-        row.map(|row| {
-            let number = u32::try_from(row.get::<i64, _>("generation_number")).map_err(|_| {
-                PersistenceError::InvalidValue {
-                    entity: "generation number",
-                    value: row.get::<i64, _>("generation_number").to_string(),
-                }
-            })?;
-            Ok(Generation {
-                family_id: parse_id(row.get("family_id"), "generation family")?,
-                identity: GenerationIdentity {
-                    id: parse_id(row.get("id"), "generation")?,
-                    number,
-                    source_revision: row.get("source_revision"),
-                    protocol_digest: row.get("protocol_digest"),
-                },
-                spec: from_json(row.get("spec_json"), "generation spec")?,
-            })
-        })
-        .transpose()
+        row.map(decode_generation).transpose()
     }
+}
+
+fn validate_prepared_family(prepared: &PreparedFamily) -> PersistenceResult<()> {
+    prepared.validate()?;
+    for submission in &prepared.submissions {
+        submission.job.validate()?;
+        submission.attempt.validate()?;
+        if submission.attempt.job_id() != submission.job.id
+            || submission.attempt.sequence() != 1
+            || submission.attempt.command() != &submission.job.command
+            || submission.attempt.executor() != &submission.job.executor
+            || submission.attempt.resources() != &submission.job.resources
+            || submission.attempt.family() != submission.job.family.as_ref()
+        {
+            return Err(PersistenceError::InvalidValue {
+                entity: "initial attempt",
+                value: format!(
+                    "job {}, sequence {}",
+                    submission.attempt.job_id(),
+                    submission.attempt.sequence()
+                ),
+            });
+        }
+        require_event_kind(
+            &submission.job_event,
+            EventKind::JobSubmitted,
+            "job creation event kind",
+        )?;
+        require_event_kind(
+            &submission.attempt_event,
+            EventKind::AttemptCreated,
+            "attempt creation event kind",
+        )?;
+    }
+    Ok(())
+}
+
+async fn insert_prepared_family_jobs(
+    transaction: &mut Transaction<'_, Sqlite>,
+    prepared: &PreparedFamily,
+) -> PersistenceResult<Vec<StoredJob>> {
+    let mut stored = Vec::with_capacity(prepared.submissions.len());
+    for submission in &prepared.submissions {
+        let job = &submission.job;
+        let attempt = &submission.attempt;
+        let family_id = job
+            .family
+            .as_ref()
+            .map(|family| family.family_id.to_string());
+        let generation_id = job
+            .family
+            .as_ref()
+            .map(|family| family.generation.id.to_string());
+        let order: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(submission_order), 0) + 1 FROM jobs")
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(|source| db("allocate family submission order", source))?;
+        sqlx::query("INSERT INTO jobs (id, project_id, family_id, generation_id, name, state, priority, submission_order, spec_json) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)")
+            .bind(job.id.to_string()).bind(job.project_id.to_string()).bind(family_id).bind(generation_id)
+            .bind(&job.name).bind(submission.priority).bind(order).bind(json(job, "job spec")?)
+            .execute(&mut **transaction).await.map_err(|source| db("insert family job", source))?;
+        insert_event(
+            transaction,
+            job.project_id,
+            Some(job.id),
+            None,
+            &submission.job_event,
+        )
+        .await?;
+        sqlx::query("INSERT INTO attempts (id, job_id, project_id, sequence, state, spec_json) VALUES (?, ?, ?, 1, 'pending', ?)")
+            .bind(attempt.id().to_string()).bind(job.id.to_string()).bind(job.project_id.to_string())
+            .bind(json(attempt, "attempt spec")?).execute(&mut **transaction).await
+            .map_err(|source| db("insert family initial attempt", source))?;
+        insert_event(
+            transaction,
+            job.project_id,
+            Some(job.id),
+            Some(attempt.id()),
+            &submission.attempt_event,
+        )
+        .await?;
+        let row = sqlx::query("SELECT spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE id = ?")
+            .bind(job.id.to_string()).fetch_one(&mut **transaction).await
+            .map_err(|source| db("read submitted family job", source))?;
+        stored.push(decode_job(row)?);
+    }
+    Ok(stored)
+}
+
+fn decode_generation(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<Generation> {
+    let number = u32::try_from(row.get::<i64, _>("generation_number")).map_err(|_| {
+        PersistenceError::InvalidValue {
+            entity: "generation number",
+            value: row.get::<i64, _>("generation_number").to_string(),
+        }
+    })?;
+    Ok(Generation {
+        family_id: parse_id(row.get("family_id"), "generation family")?,
+        identity: GenerationIdentity {
+            id: parse_id(row.get("id"), "generation")?,
+            number,
+            source_revision: row.get("source_revision"),
+            protocol_digest: row.get("protocol_digest"),
+        },
+        spec: from_json(row.get("spec_json"), "generation spec")?,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3188,23 +3710,24 @@ impl JobAttemptRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin job retry", source))?;
-        let row = sqlx::query("SELECT project_id, spec_json, state FROM jobs WHERE id = ?")
+        let row = sqlx::query("SELECT project_id, spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE id = ?")
             .bind(job_id.to_string())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(|source| db("read retry job", source))?
             .ok_or(PersistenceError::NotFound { entity: "job" })?;
-        let state = parse_job_state(row.get("state"))?;
+        let project_id: ProjectId = parse_id(row.get("project_id"), "retry project")?;
+        let stored = decode_job(row)?;
+        let state = stored.state;
         if !matches!(
             state,
             JobState::Failed | JobState::Cancelled | JobState::Lost
         ) {
             return Err(PersistenceError::Conflict { entity: "job" });
         }
-        let project_id: ProjectId = parse_id(row.get("project_id"), "retry project")?;
-        let job: JobSpec = from_json(row.get("spec_json"), "retry job spec")?;
+        let job = &stored.spec;
         let previous_row = sqlx::query(
-            "SELECT spec_json FROM attempts WHERE job_id = ? ORDER BY sequence DESC LIMIT 1",
+            "SELECT spec_json, state FROM attempts WHERE job_id = ? ORDER BY sequence DESC LIMIT 1",
         )
         .bind(job_id.to_string())
         .fetch_one(&mut *transaction)
@@ -3212,6 +3735,59 @@ impl JobAttemptRepository<'_> {
         .map_err(|source| db("read previous retry attempt", source))?;
         let previous: AttemptSpec =
             from_json(previous_row.get("spec_json"), "previous attempt spec")?;
+        if let Some(membership) = &job.family {
+            let generation_row = sqlx::query("SELECT id, family_id, generation_number, source_revision, protocol_digest, spec_json FROM generations WHERE id = ? AND family_id = ?")
+                .bind(membership.generation.id.to_string())
+                .bind(membership.family_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| db("read family retry generation", source))?
+                .ok_or(PersistenceError::InvalidValue {
+                    entity: "family retry generation",
+                    value: membership.generation.id.to_string(),
+                })?;
+            let generation = decode_generation(generation_row)?;
+            let source = match previous.source() {
+                crate::SourceIdentity::Git(source) => source,
+                _ => {
+                    return Err(PersistenceError::InvalidValue {
+                        entity: "family retry source",
+                        value: "previous attempt is not pinned to Git".into(),
+                    });
+                }
+            };
+            if stored.spec.id != job_id
+                || stored.spec.project_id != project_id
+                || generation.identity != membership.generation
+                || generation.assess(std::slice::from_ref(&stored))? == GenerationStatus::Invalid
+                || previous.job_id() != job_id
+                || previous.family() != Some(membership)
+                || previous.command() != &job.command
+                || previous.executor() != &job.executor
+                || previous.resources() != &job.resources
+                || previous.configuration().job_digest
+                    != crate::submission::digest_json(job, "family member job")?
+                || source.revision != membership.generation.source_revision
+                || generation.spec["dirty_digest"]
+                    != serde_json::to_value(&source.dirty_digest).map_err(|source| {
+                        PersistenceError::Serialization {
+                            contract: "family retry source",
+                            source,
+                        }
+                    })?
+                || !matches!(
+                    (state, parse_attempt_state(previous_row.get("state"))?),
+                    (JobState::Failed, AttemptState::Failed)
+                        | (JobState::Cancelled, AttemptState::Cancelled)
+                        | (JobState::Lost, AttemptState::Lost)
+                )
+            {
+                return Err(PersistenceError::InvalidValue {
+                    entity: "family retry",
+                    value: "frozen job, generation, source or last attempt does not match".into(),
+                });
+            }
+        }
         let sequence =
             previous
                 .sequence()
@@ -3223,7 +3799,7 @@ impl JobAttemptRepository<'_> {
         let attempt = AttemptSpec::from_job(
             AttemptId::new(),
             sequence,
-            &job,
+            job,
             previous.source().clone(),
             previous.configuration().clone(),
             previous.result().clone(),
