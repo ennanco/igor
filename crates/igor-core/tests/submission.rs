@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, error::Error, fs, path::Path, process::Command};
 
 use igor_core::{
-    CommandSpec, EnvironmentPolicy, Project, ProjectId, ShellPolicy, SourceIdentity,
-    SubmissionInput, build_submission, initialize_project, load_job_file, load_project_config,
+    CommandSpec, EnvironmentInheritance, EnvironmentPolicy, Project, ProjectId, ShellPolicy,
+    SourceIdentity, SubmissionInput, build_submission, initialize_project, load_job_file,
+    load_project_config,
 };
 use tempfile::TempDir;
 
@@ -108,6 +109,84 @@ fn submission_freezes_git_command_defaults_and_file_hashes() -> TestResult {
                 && identity.revision.len() == 40
                 && identity.repository == "https://example.invalid/research.git"
     ));
+    Ok(())
+}
+
+#[test]
+fn results_extractor_is_frozen_directly_without_inheriting_environment() -> TestResult {
+    let (_temporary, project, mut config) = repository()?;
+    fs::write(project.root.join("exporter"), "not executed")?;
+    git(&project.root, &["add", "exporter"])?;
+    git(&project.root, &["commit", "-qm", "add extractor"])?;
+    config.results = Some(igor_core::ResultsConfig {
+        extractor: vec!["./exporter".into(), "a b".into(), "".into()],
+        working_directory: "attempt".into(),
+    });
+    let submission = build_submission(&project, &config, input(&project))?;
+    let extractor = submission
+        .attempt
+        .result()
+        .extractor
+        .as_ref()
+        .ok_or("extractor missing")?;
+    assert_eq!(
+        extractor.program,
+        project
+            .root
+            .join("exporter")
+            .canonicalize()?
+            .to_string_lossy()
+    );
+    assert_eq!(extractor.args, ["a b", ""]);
+    assert_eq!(extractor.shell, ShellPolicy::Direct);
+    assert!(extractor.environment.set.is_empty());
+    assert_eq!(extractor.environment.inherit, EnvironmentInheritance::None);
+    assert_eq!(
+        submission.attempt.result().publication_root.as_deref(),
+        Some(project.root.join("artifacts").as_path())
+    );
+    let frozen = submission.attempt.result().publication_root.clone();
+    config.paths.artifact_root = project.root.join("custom-results");
+    let later = build_submission(&project, &config, input(&project))?;
+    assert_eq!(
+        later.attempt.result().publication_root.as_deref(),
+        Some(config.paths.artifact_root.as_path())
+    );
+    assert_eq!(submission.attempt.result().publication_root, frozen);
+    let mut legacy = serde_json::to_value(&submission.attempt)?;
+    legacy["result"]
+        .as_object_mut()
+        .ok_or("missing result object")?
+        .remove("publication_root");
+    let legacy: igor_core::AttemptSpec = serde_json::from_value(legacy)?;
+    assert!(legacy.result().publication_root.is_none());
+    config.paths.artifact_root = project.root.join("../escape");
+    assert!(build_submission(&project, &config, input(&project)).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn results_extractor_symlink_cannot_escape_project() -> TestResult {
+    use std::os::unix::fs::symlink;
+    let (_temporary, project, mut config) = repository()?;
+    let outside = project
+        .root
+        .parent()
+        .ok_or("no parent")?
+        .join("outside-extractor");
+    fs::write(&outside, "not executed")?;
+    symlink(&outside, project.root.join("linked-extractor"))?;
+    git(&project.root, &["add", "linked-extractor"])?;
+    git(&project.root, &["commit", "-qm", "add linked extractor"])?;
+    config.results = Some(igor_core::ResultsConfig {
+        extractor: vec!["./linked-extractor".into()],
+        working_directory: "attempt".into(),
+    });
+    let error = build_submission(&project, &config, input(&project))
+        .err()
+        .ok_or("extractor symlink escape accepted")?;
+    assert!(error.to_string().contains("escapes the project root"));
     Ok(())
 }
 

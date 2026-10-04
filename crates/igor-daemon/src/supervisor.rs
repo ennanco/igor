@@ -12,6 +12,22 @@ const LEASE: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(200);
 
 pub async fn run(database: Database, paths: RuntimePaths, mut shutdown: watch::Receiver<bool>) {
+    let extraction = tokio::spawn(crate::extract::run(
+        database.clone(),
+        paths.clone(),
+        shutdown.clone(),
+    ));
+    run_notifications(database, paths, &mut shutdown).await;
+    if let Err(error) = extraction.await {
+        tracing::error!(%error, "metric extraction supervisor task failed");
+    }
+}
+
+async fn run_notifications(
+    database: Database,
+    paths: RuntimePaths,
+    shutdown: &mut watch::Receiver<bool>,
+) {
     let owner = format!("supervisor:{}", std::process::id());
     let telegram = if paths.config_file.is_file() {
         match igor_core::load_global_config(&paths.config_file) {

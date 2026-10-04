@@ -32,6 +32,7 @@ use crate::protocol::{
 };
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 32 * MAX_FRAME_BYTES;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const MAX_DATABASE_CONNECTIONS: u32 = 32;
@@ -132,14 +133,13 @@ impl Client {
                     path: path.clone(),
                     source,
                 })?;
-            let frame =
-                read_frame(&mut stream)
-                    .await
-                    .map_err(|source| ClientError::Unavailable {
-                        role,
-                        path: path.clone(),
-                        source,
-                    })?;
+            let frame = read_frame(&mut stream, MAX_RESPONSE_BYTES)
+                .await
+                .map_err(|source| ClientError::Unavailable {
+                    role,
+                    path: path.clone(),
+                    source,
+                })?;
             let response = decode_response(&frame)?;
             validate_response(role, request, response)
         };
@@ -364,7 +364,7 @@ async fn serve_connection(
     role: DaemonRole,
     database: Database,
 ) -> io::Result<()> {
-    let response = match read_frame(&mut stream).await {
+    let response = match read_frame(&mut stream, MAX_FRAME_BYTES).await {
         Ok(frame) => match decode_request(&frame) {
             Ok(request) => handle_request(role, &database, request).await,
             Err(error) => ResponseEnvelope::failure(error),
@@ -375,6 +375,10 @@ async fn serve_connection(
         Err(error) => ResponseEnvelope::failure(ProtocolError::invalid_request(error.to_string())),
     };
     let mut encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
+    if encoded.len() + 1 > MAX_RESPONSE_BYTES {
+        encoded = serde_json::to_vec(&ResponseEnvelope::failure(ProtocolError::frame_too_large()))
+            .map_err(io::Error::other)?;
+    }
     encoded.push(b'\n');
     stream.write_all(&encoded).await
 }
@@ -591,6 +595,24 @@ async fn handle_request(
             Ok(None) => ResponseEnvelope::failure(ProtocolError::not_found("job")),
             Err(error) => persistence_response(error),
         },
+        Request::JobMetrics { job_id } => match database.jobs().detail(job_id).await {
+            Ok(Some(job)) => {
+                let mut attempts = Vec::with_capacity(job.attempts.len());
+                for attempt in job.attempts {
+                    match database
+                        .actions()
+                        .metrics_for_attempt(attempt.spec.id())
+                        .await
+                    {
+                        Ok(metrics) => attempts.push(metrics),
+                        Err(error) => return persistence_response(error),
+                    }
+                }
+                ResponseEnvelope::success(Response::Metrics { job_id, attempts })
+            }
+            Ok(None) => ResponseEnvelope::failure(ProtocolError::not_found("job")),
+            Err(error) => persistence_response(error),
+        },
         Request::JobEvents { job_id } => match database.jobs().get_job(job_id).await {
             Ok(Some(_)) => match database.events().for_job(job_id).await {
                 Ok(events) => ResponseEnvelope::success(Response::Events { events }),
@@ -767,6 +789,12 @@ fn validate_response(
         | (Request::JobCancel { .. }, Response::Cancelled(_))
         | (Request::JobRetry { .. }, Response::Retried(_))
         | (Request::JobLogs { .. }, Response::Logs(_)) => role == DaemonRole::Worker,
+        (
+            Request::JobMetrics { job_id },
+            Response::Metrics {
+                job_id: returned, ..
+            },
+        ) => role == DaemonRole::Worker && job_id == returned,
         _ => false,
     };
     if valid {
@@ -778,7 +806,7 @@ fn validate_response(
     }
 }
 
-async fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+async fn read_frame(stream: &mut UnixStream, max_bytes: usize) -> io::Result<Vec<u8>> {
     let mut frame = Vec::new();
     let mut chunk = [0_u8; 1024];
     loop {
@@ -790,7 +818,7 @@ async fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
             ));
         }
         frame.extend_from_slice(&chunk[..read]);
-        if frame.len() > MAX_FRAME_BYTES {
+        if frame.len() > max_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::FileTooLarge,
                 "protocol frame is too large",

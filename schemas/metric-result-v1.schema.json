@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/ennanco/igor/main/schemas/metric-result-v1.schema.json",
+  "title": "Igor metric result v1",
+  "description": "One project extractor result for one attempt. It does not change the attempt's execution outcome.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "metrics"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["success", "partial", "failed"],
+      "description": "Extractor result status, independent of the Igor job and attempt states."
+    },
+    "metrics": {
+      "$ref": "#/$defs/scalarMetrics",
+      "description": "Project-defined scalar metrics; no metric name or split is assumed."
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["split", "metric", "value"],
+      "properties": {
+        "split": { "$ref": "#/$defs/name" },
+        "metric": { "$ref": "#/$defs/name" },
+        "value": { "type": "number" },
+        "epoch": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "trained_epochs": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        "checkpoint": {
+          "$ref": "#/$defs/relativePath",
+          "description": "Optional attempt-relative selected checkpoint."
+        }
+      }
+    },
+    "classes": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/name" },
+      "additionalProperties": { "$ref": "#/$defs/scalarMetrics" },
+      "description": "Optional class names and their project-defined scalar metrics."
+    },
+    "artifacts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" },
+      "description": "Declared attempt outputs; Igor must verify paths and compute digests before publication."
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S",
+      "description": "Attempt-relative path. Filesystem containment and symlink checks are required separately."
+    },
+    "scalarMetrics": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/name" },
+      "additionalProperties": { "type": "number" }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "role": {
+          "type": "string",
+          "enum": ["metrics", "model", "checkpoint", "figure", "log", "crash_dump", "report", "other"]
+        },
+        "role_detail": { "$ref": "#/$defs/name" },
+        "sha256": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "Optional claimed digest; Igor independently hashes the published file."
+        }
+      },
+      "if": {
+        "properties": { "role": { "const": "other" } },
+        "required": ["role"]
+      },
+      "then": { "required": ["role_detail"] },
+      "else": { "not": { "required": ["role_detail"] } }
+    }
+  }
+}

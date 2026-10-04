@@ -213,10 +213,16 @@ async fn db_migrate_existing_older_and_current_databases() -> TestResult {
         .filename(&database)
         .create_if_missing(false);
     let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    sqlx::query("DROP TABLE metric_selections")
+        .execute(&mut connection)
+        .await?;
+    sqlx::query("DROP TABLE metric_documents")
+        .execute(&mut connection)
+        .await?;
     sqlx::query("DROP TABLE attempt_units")
         .execute(&mut connection)
         .await?;
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 9")
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (9, 10, 11, 12)")
         .execute(&mut connection)
         .await?;
     connection.close().await?;
@@ -282,6 +288,18 @@ async fn db_migrate_existing_older_and_current_databases() -> TestResult {
     .fetch_one(pool)
     .await?;
     assert_eq!(exists, 1);
+    let documents: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='metric_documents'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(documents, 1);
+    let selections: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='metric_selections'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(selections, 1);
     read_only.pool().close().await;
 
     let output = command(&home, temporary.path())

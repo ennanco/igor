@@ -10,11 +10,12 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use igor_core::{
-    CommandSpec, ConfigOverrides, Database, DatabaseOptions, EffectiveConfig, Environment,
-    EnvironmentPolicy, FamilyDetail, FamilyId, HostConfigUpdate, IntegrityCheck, JobDetail, JobId,
-    JobLogs, JobState, Project, ProjectId, ResourceStatus, ShellPolicy, StoredEvent, StoredJob,
-    SubmissionInput, TransitionState, initialize_project, load_effective_config, load_family_file,
-    load_job_file, load_project_config, select_global_config_path, update_global_host_config,
+    AttemptMetrics, CommandSpec, ConfigOverrides, Database, DatabaseOptions, EffectiveConfig,
+    Environment, EnvironmentPolicy, FamilyDetail, FamilyId, HostConfigUpdate, IntegrityCheck,
+    JobDetail, JobId, JobLogs, JobState, Project, ProjectId, ResourceStatus, ShellPolicy,
+    StoredEvent, StoredJob, SubmissionInput, TransitionState, initialize_project,
+    load_effective_config, load_family_file, load_job_file, load_project_config,
+    select_global_config_path, update_global_host_config,
 };
 use igor_daemon::{
     Client, ClientError, DaemonRole, DatabaseStatus, Health, Request, Response, Version,
@@ -151,6 +152,12 @@ enum Command {
     },
     /// Show a job and its immutable attempts.
     Show {
+        job_id: JobId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show extracted metrics for every attempt of a job.
+    Metrics {
         job_id: JobId,
         #[arg(long)]
         json: bool,
@@ -700,6 +707,20 @@ async fn run() -> anyhow::Result<()> {
             let effective = effective_config(&overrides, &cwd)?;
             let detail = request_job(&Client::new(&effective.paths), job_id).await?;
             print_job(&detail, json)?;
+        }
+        Command::Metrics { job_id, json } => {
+            let effective = effective_config(&overrides, &cwd)?;
+            let response = Client::new(&effective.paths)
+                .request(DaemonRole::Worker, Request::JobMetrics { job_id })
+                .await?;
+            let attempts = match response {
+                Response::Metrics {
+                    job_id: returned,
+                    attempts,
+                } if returned == job_id => attempts,
+                response => anyhow::bail!("unexpected {response:?} metrics response"),
+            };
+            print_metrics(job_id, &attempts, json)?;
         }
         Command::Events { job_id, json } => {
             let effective = effective_config(&overrides, &cwd)?;
@@ -1757,6 +1778,43 @@ fn print_job(detail: &JobDetail, json: bool) -> anyhow::Result<()> {
                 attempt.spec.sequence(),
                 attempt.state.as_str()
             );
+        }
+    }
+    Ok(())
+}
+
+fn print_metrics(job_id: JobId, attempts: &[AttemptMetrics], json: bool) -> anyhow::Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "job_id": job_id,
+                "attempts": attempts,
+            }))?
+        );
+    } else {
+        println!("job {job_id}");
+        for attempt in attempts {
+            println!(
+                "attempt {}: {}",
+                attempt.attempt_id,
+                attempt
+                    .action_state
+                    .as_deref()
+                    .unwrap_or("no extractor action")
+            );
+            if let Some(error) = &attempt.last_error {
+                println!("  extractor error: {error}");
+            }
+            if let Some(document) = &attempt.document {
+                println!("  result: {}", document["status"]);
+            }
+            for (name, value) in &attempt.metrics {
+                println!("  {name}: {value}");
+            }
+            if let Some(selection) = &attempt.selection {
+                println!("  selection: {selection}");
+            }
         }
     }
     Ok(())

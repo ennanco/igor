@@ -534,30 +534,30 @@ Dependencies: milestones 10-11.
 
 ### Tasks
 
-- [ ] `M12.01` Publish the versioned metric-result JSON Schema.
-- [ ] `M12.02` Define project extractor configuration as program and arguments.
-- [ ] `M12.03` Run the extractor as an independent supervisor action.
-- [ ] `M12.04` Provide only declared attempt paths and metadata to the extractor.
-- [ ] `M12.05` Validate extractor JSON and schema version.
-- [ ] `M12.06` Store the original structured result.
-- [ ] `M12.07` Index scalar metrics without assuming scientific names.
-- [ ] `M12.08` Store selection split, metric, value, and checkpoint metadata.
-- [ ] `M12.09` Register artifact path, role, size, digest, and publication state.
-- [ ] `M12.10` Stage outputs in attempt-specific directories.
-- [ ] `M12.11` Publish declared successful artifacts atomically.
-- [ ] `M12.12` Ensure extractor failure does not change experiment success.
-- [ ] `M12.13` Implement `igor metrics JOB_ID` and JSON output.
-- [ ] `M12.14` Add fixture extractors in Python, Julia-compatible shell output,
+- [x] `M12.01` Publish the versioned metric-result JSON Schema.
+- [x] `M12.02` Define project extractor configuration as program and arguments.
+- [x] `M12.03` Run the extractor as an independent supervisor action.
+- [x] `M12.04` Provide only declared attempt paths and metadata to the extractor.
+- [x] `M12.05` Validate extractor JSON and schema version.
+- [x] `M12.06` Store the original structured result.
+- [x] `M12.07` Index scalar metrics without assuming scientific names.
+- [x] `M12.08` Store selection split, metric, value, and checkpoint metadata.
+- [x] `M12.09` Register artifact path, role, size, digest, and publication state.
+- [x] `M12.10` Stage outputs in attempt-specific directories.
+- [x] `M12.11` Publish declared successful artifacts atomically.
+- [x] `M12.12` Ensure extractor failure does not change experiment success.
+- [x] `M12.13` Implement `igor metrics JOB_ID` and JSON output.
+- [x] `M12.14` Add fixture extractors in Python, Julia-compatible shell output,
   and native test binaries.
-- [ ] `M12.15` Add malformed, missing, duplicate, non-finite, and unsupported
+- [x] `M12.15` Add malformed, missing, duplicate, non-finite, and unsupported
   schema tests.
 
 ### Acceptance
 
-- [ ] `A12.01` Igor processes project metrics without knowing their names.
-- [ ] `A12.02` Repeating extraction is idempotent.
-- [ ] `A12.03` Partial outputs cannot be mistaken for published artifacts.
-- [ ] `A12.04` Telegram can include indexed metrics after extraction succeeds.
+- [x] `A12.01` Igor processes project metrics without knowing their names.
+- [x] `A12.02` Repeating extraction is idempotent.
+- [x] `A12.03` Partial outputs cannot be mistaken for published artifacts.
+- [x] `A12.04` Telegram can include indexed metrics after extraction succeeds.
 
 ## Milestone 13: Retention, Storage, And Garbage Collection
 

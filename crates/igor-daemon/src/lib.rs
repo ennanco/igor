@@ -1,5 +1,6 @@
 //! Worker and supervisor runtime and local protocol for Igor.
 
+mod extract;
 mod protocol;
 mod runtime;
 mod supervisor;

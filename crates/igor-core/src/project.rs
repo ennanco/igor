@@ -124,6 +124,47 @@ pub struct ProjectConfig {
     pub attempt_retry: AttemptRetryPolicy,
     pub action_retry: ActionRetryPolicy,
     pub delivery_retry: DeliveryRetryPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<ResultsConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultsConfig {
+    pub extractor: Vec<String>,
+    #[serde(default = "attempt_working_directory")]
+    pub working_directory: String,
+}
+
+fn attempt_working_directory() -> String {
+    "attempt".into()
+}
+
+impl ResultsConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.extractor.is_empty() || self.extractor[0].trim().is_empty() {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidProject,
+                "results.extractor",
+                "must contain a non-empty program",
+            ));
+        }
+        if self.extractor.iter().any(|part| part.contains('\0')) {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidProject,
+                "results.extractor",
+                "must not contain NUL characters",
+            ));
+        }
+        if self.working_directory != "attempt" {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidProject,
+                "results.working_directory",
+                "only 'attempt' is supported",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -144,6 +185,8 @@ struct ProjectConfigDocument {
     action_retry: ActionRetryPolicy,
     #[serde(default)]
     delivery_retry: DeliveryRetryPolicy,
+    #[serde(default)]
+    results: Option<ResultsConfig>,
 }
 
 impl Default for ProjectConfigDocument {
@@ -157,6 +200,7 @@ impl Default for ProjectConfigDocument {
             attempt_retry: AttemptRetryPolicy::default(),
             action_retry: ActionRetryPolicy::default(),
             delivery_retry: DeliveryRetryPolicy::default(),
+            results: None,
         }
     }
 }
@@ -191,7 +235,11 @@ impl ProjectConfig {
         self.resources.validate()?;
         self.attempt_retry.0.validate()?;
         self.action_retry.0.validate()?;
-        self.delivery_retry.0.validate()
+        self.delivery_retry.0.validate()?;
+        if let Some(results) = &self.results {
+            results.validate()?;
+        }
+        Ok(())
     }
 
     fn try_from_document(document: ProjectConfigDocument) -> Result<Self> {
@@ -210,6 +258,7 @@ impl ProjectConfig {
             attempt_retry: document.attempt_retry,
             action_retry: document.action_retry,
             delivery_retry: document.delivery_retry,
+            results: document.results,
         }
     }
 }

@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "status": "success",
+  "metrics": {
+    "accuracy": 0.86702,
+    "kappa": 0.814708,
+    "macro_f1": 0.793544
+  },
+  "selection": {
+    "split": "validation",
+    "metric": "macro_f1",
+    "value": 0.790778,
+    "epoch": 31,
+    "trained_epochs": 41,
+    "checkpoint": "checkpoints/epoch-31.weights"
+  },
+  "classes": {
+    "Wake": { "f1": 0.924787 },
+    "N1": { "f1": 0.455164 },
+    "N2": { "f1": 0.878496 },
+    "N3": { "f1": 0.843338 },
+    "REM": { "f1": 0.865937 }
+  },
+  "artifacts": [
+    { "path": "metrics.json", "role": "metrics" },
+    { "path": "checkpoints/epoch-31.weights", "role": "checkpoint" }
+  ]
+}

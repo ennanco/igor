@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     error::Error,
     fs, io,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -22,6 +23,7 @@ use igor_core::{
     load_family_file, load_project_config,
 };
 use serde_json::json;
+use sha2::Digest;
 use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 use tempfile::TempDir;
 use tokio::sync::{Barrier, oneshot};
@@ -88,6 +90,7 @@ fn attempt(job: &JobSpec, sequence: u32) -> Result<AttemptSpec, Box<dyn Error>> 
         ResultContract {
             schema_version: 1,
             extractor: None,
+            publication_root: None,
         },
     )?)
 }
@@ -202,6 +205,8 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "generations",
         "jobs",
         "metrics",
+        "metric_documents",
+        "metric_selections",
         "project_aliases",
         "projects",
         "recoveries",
@@ -235,6 +240,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "jobs_generation_idx",
         "jobs_queue_order_idx",
         "metrics_attempt_idx",
+        "metric_selections_split_metric_idx",
         "recoveries_attempt_idx",
         "report_runs_generation_idx",
         "resource_leases_expiry_idx",
@@ -258,7 +264,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(ledger.len(), 9);
+    assert_eq!(ledger.len(), 12);
     for (index, row) in ledger.iter().enumerate() {
         assert_eq!(row.get::<i64, _>("version"), (index + 1) as i64);
         assert!(row.get::<bool, _>("success"));
@@ -306,7 +312,7 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
             .fetch_all(database.pool())
             .await?;
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     let checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
             .fetch_one(database.pool())
@@ -451,6 +457,8 @@ async fn repositories_round_trip_and_events_are_append_only() -> TestResult {
             path: format!("artifact-{index}"),
             role,
             sha256: Some(format!("digest-{index}")),
+            size_bytes: None,
+            state: igor_core::ArtifactPublicationState::Published,
             metadata: json!({"index": index}),
         };
         database.artifacts().insert(&artifact).await?;
@@ -860,6 +868,1232 @@ async fn terminal_attempt_enqueues_notification_and_delivery_atomically() -> Tes
     assert_ne!(replacement.lease_id, first.lease_id);
     assert!(database.deliveries().delivered(&first).await.is_err());
     database.deliveries().delivered(&replacement).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_extractor_is_queued_and_completed_transactionally() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let mut attempt = attempt(&job, 1)?;
+    let attempt_value = serde_json::to_value(&attempt)?;
+    let mut attempt_value = attempt_value;
+    attempt_value["result"]["extractor"] = json!({
+        "program":"python3", "args":["extract.py"], "cwd":"/tmp",
+        "shell":"direct", "environment":{"inherit":"none","set":{}}
+    });
+    attempt = serde_json::from_value(attempt_value)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let action_claim = database
+        .actions()
+        .claim_extraction("extractor", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("extractor action missing"))?;
+    let action = database
+        .actions()
+        .claimed(&action_claim)
+        .await?
+        .ok_or_else(|| missing("action missing"))?;
+    assert_eq!(action.action.project_id, project.id);
+    assert_eq!(action.job_id, Some(job.id));
+    assert_eq!(action.attempt_id, Some(attempt.id()));
+    assert_eq!(
+        action.action.idempotency_key,
+        format!("extract:attempt:{}", attempt.id())
+    );
+    assert_eq!(action.action.spec["version"], 1);
+    assert!(database.actions().succeed(&action_claim).await.is_err());
+    let document = json!({
+        "schema_version": 1,
+        "status": "success",
+        "metrics": {"score": 4, "μ-score": -0.25, "zero": 0},
+        "selection": {
+            "split": "validation", "metric": "μ-score", "value": -0.25,
+            "epoch": 31, "trained_epochs": 41, "checkpoint": "checkpoints/epoch-31.weights"
+        }
+    });
+    let invalid = json!({"schema_version": 99, "status": "success", "metrics": {"score": 4}});
+    assert!(
+        database
+            .actions()
+            .complete_extraction(&action_claim, attempt.id(), &invalid)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    database
+        .actions()
+        .complete_extraction(&action_claim, attempt.id(), &document)
+        .await?;
+    assert_eq!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?,
+        Some(document.clone())
+    );
+    assert_eq!(
+        database
+            .deliveries()
+            .available_metrics(attempt.id())
+            .await?,
+        vec![
+            ("score".into(), 4.0),
+            ("zero".into(), 0.0),
+            ("μ-score".into(), -0.25)
+        ]
+    );
+    assert_eq!(
+        database
+            .actions()
+            .selection_for_attempt(attempt.id())
+            .await?,
+        Some(document["selection"].clone())
+    );
+    let selection: (String, String, f64, Option<i64>, Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT split, metric, value, epoch, trained_epochs, checkpoint_path FROM metric_selections WHERE attempt_id = ?",
+    )
+    .bind(attempt.id().to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        selection,
+        (
+            "validation".into(),
+            "μ-score".into(),
+            -0.25,
+            Some(31),
+            Some(41),
+            Some("checkpoints/epoch-31.weights".into()),
+        )
+    );
+    assert!(
+        database
+            .actions()
+            .claim_extraction("again", Duration::from_secs(30))
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn claimed_artifact_registration_is_fenced_idempotent_and_required_for_extraction()
+-> TestResult {
+    let (directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let mut project = project();
+    project.root = directory.path().join("project");
+    project.config_path = project.root.join(".igor/project.toml");
+    fs::create_dir_all(&project.root)?;
+    let publication_root = project.root.join("artifacts");
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let mut attempt = attempt(&job, 1)?;
+    let mut value = serde_json::to_value(&attempt)?;
+    value["result"]["extractor"] = json!({
+        "program":"python3", "args":["extract.py"], "cwd":project.root,
+        "shell":"direct", "environment":{"inherit":"none","set":{}}
+    });
+    value["result"]["publication_root"] = json!(publication_root);
+    attempt = serde_json::from_value(value)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let base = directory.path().join("attempt-logs");
+    let attempt_dir = base.join(attempt.id().to_string());
+    fs::create_dir_all(attempt_dir.join("checkpoints"))?;
+    fs::write(attempt_dir.join("stdout.log"), "stdout")?;
+    fs::write(attempt_dir.join("stderr.log"), "stderr")?;
+    let contents = b"checkpoint bytes";
+    fs::write(attempt_dir.join("checkpoints/epoch-3.bin"), contents)?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .record_process_started(
+            &claim,
+            &ProcessStart {
+                pid: 42,
+                process_group_id: 42,
+                process_start_ticks: 1,
+                stdout_path: attempt_dir.join("stdout.log"),
+                stderr_path: attempt_dir.join("stderr.log"),
+            },
+        )
+        .await?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let action_claim = database
+        .actions()
+        .claim_extraction("extractor", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("extractor action missing"))?;
+    let sha = format!("sha256:{:x}", sha2::Sha256::digest(contents));
+    let declaration = json!({"path":"checkpoints/epoch-3.bin", "role":"checkpoint", "sha256":sha});
+    let document =
+        json!({"schema_version":1,"status":"success","metrics":{},"artifacts":[declaration]});
+    assert!(
+        database
+            .actions()
+            .complete_extraction(&action_claim, attempt.id(), &document)
+            .await
+            .is_err()
+    );
+
+    let artifact = database
+        .artifacts()
+        .register_claimed(&action_claim, attempt.id(), &attempt_dir, &declaration)
+        .await?;
+    assert_eq!(artifact.path, "checkpoints/epoch-3.bin");
+    assert_eq!(artifact.role, ArtifactRole::Checkpoint);
+    assert_eq!(artifact.sha256.as_deref(), Some(sha.as_str()));
+    assert_eq!(artifact.size_bytes, Some(contents.len() as u64));
+    assert_eq!(
+        artifact.state,
+        igor_core::ArtifactPublicationState::Registered
+    );
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE kind = 'artifact_registered'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(event_count, 1);
+    assert_eq!(
+        database
+            .artifacts()
+            .register_claimed(&action_claim, attempt.id(), &attempt_dir, &declaration)
+            .await?,
+        artifact
+    );
+    let after_idempotent: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE kind = 'artifact_registered'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(after_idempotent, 1);
+    let symlink_destination = directory.path().join("external-staging");
+    fs::create_dir_all(&symlink_destination)?;
+    let symlink_root = directory.path().join("staging-symlink");
+    std::os::unix::fs::symlink(&symlink_destination, &symlink_root)?;
+    assert!(
+        database
+            .artifacts()
+            .stage_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &attempt_dir,
+                &symlink_root,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!symlink_destination.join(attempt.id().to_string()).exists());
+    let staging_root = directory.path().join("artifact-staging");
+    let staged = database
+        .artifacts()
+        .stage_claimed(
+            &action_claim,
+            artifact.id,
+            attempt.id(),
+            &attempt_dir,
+            &staging_root,
+        )
+        .await?;
+    assert_eq!(staged.state, igor_core::ArtifactPublicationState::Staged);
+    let staged_path = staging_root
+        .join(attempt.id().to_string())
+        .join(artifact.id.to_string());
+    assert_eq!(
+        staged.metadata["staged_path"],
+        staged_path.to_str().ok_or("non-UTF-8 staged path")?
+    );
+    assert_eq!(fs::read(&staged_path)?, contents);
+    assert_eq!(
+        fs::metadata(&staged_path)?.permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        database
+            .artifacts()
+            .stage_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &attempt_dir,
+                &staging_root,
+            )
+            .await?,
+        staged
+    );
+    let late_path = attempt_dir.join("late-before-stage.bin");
+    fs::write(&late_path, b"original")?;
+    let late = database
+        .artifacts()
+        .register_claimed(
+            &action_claim,
+            attempt.id(),
+            &attempt_dir,
+            &json!({"path":"late-before-stage.bin","role":"other","role_detail":"auxiliary"}),
+        )
+        .await?;
+    fs::write(&late_path, b"mutated")?;
+    assert!(
+        database
+            .artifacts()
+            .stage_claimed(
+                &action_claim,
+                late.id,
+                attempt.id(),
+                &attempt_dir,
+                &staging_root,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !staging_root
+            .join(attempt.id().to_string())
+            .join(late.id.to_string())
+            .exists()
+    );
+    assert_eq!(
+        database
+            .artifacts()
+            .get(late.id)
+            .await?
+            .ok_or("late artifact missing")?
+            .state,
+        igor_core::ArtifactPublicationState::Registered
+    );
+    // Simulate a crash after rename but before the artifact state transition.
+    sqlx::query("UPDATE artifacts SET state = 'registered', metadata_json = ? WHERE id = ?")
+        .bind(serde_json::to_string(&artifact.metadata)?)
+        .bind(artifact.id.to_string())
+        .execute(database.pool())
+        .await?;
+    fs::write(&staged_path, b"corrupted staged file")?;
+    assert!(
+        database
+            .artifacts()
+            .stage_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &attempt_dir,
+                &staging_root,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .artifacts()
+            .get(artifact.id)
+            .await?
+            .ok_or("artifact missing")?
+            .state,
+        igor_core::ArtifactPublicationState::Registered
+    );
+    fs::write(&staged_path, contents)?;
+    assert_eq!(
+        database
+            .artifacts()
+            .stage_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &attempt_dir,
+                &staging_root,
+            )
+            .await?
+            .state,
+        igor_core::ArtifactPublicationState::Staged
+    );
+    for bad in [
+        json!({"path":"../escape", "role":"checkpoint"}),
+        json!({"path":attempt_dir.join("checkpoints/epoch-3.bin"), "role":"checkpoint"}),
+        json!({"path":"missing.bin", "role":"checkpoint"}),
+        json!({"path":"checkpoints/epoch-3.bin", "role":"checkpoint", "sha256":format!("sha256:{}", "0".repeat(64))}),
+        json!({"path":"checkpoints/epoch-3.bin", "role":"figure"}),
+    ] {
+        assert!(
+            database
+                .artifacts()
+                .register_claimed(&action_claim, attempt.id(), &attempt_dir, &bad)
+                .await
+                .is_err()
+        );
+    }
+    let external = directory.path().join("outside.bin");
+    fs::write(&external, b"external")?;
+    std::os::unix::fs::symlink(&external, attempt_dir.join("linked.bin"))?;
+    let outside_dir = directory.path().join("outside-directory");
+    fs::create_dir_all(&outside_dir)?;
+    fs::write(outside_dir.join("child.bin"), b"external")?;
+    std::os::unix::fs::symlink(&outside_dir, attempt_dir.join("linked-directory"))?;
+    for path in ["linked.bin", "linked-directory/child.bin"] {
+        assert!(
+            database
+                .artifacts()
+                .register_claimed(
+                    &action_claim,
+                    attempt.id(),
+                    &attempt_dir,
+                    &json!({"path":path,"role":"checkpoint"})
+                )
+                .await
+                .is_err()
+        );
+    }
+    fs::write(attempt_dir.join("checkpoints/epoch-3.bin"), b"changed")?;
+    assert!(
+        database
+            .artifacts()
+            .register_claimed(&action_claim, attempt.id(), &attempt_dir, &declaration)
+            .await
+            .is_err()
+    );
+    fs::write(attempt_dir.join("checkpoints/epoch-3.bin"), contents)?;
+    let external_publication = directory.path().join("outside-publication");
+    fs::create_dir_all(&external_publication)?;
+    std::os::unix::fs::symlink(&external_publication, &publication_root)?;
+    assert!(
+        database
+            .artifacts()
+            .prepare_publication_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &staging_root,
+                &publication_root,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!external_publication.join(attempt.id().to_string()).exists());
+    fs::remove_file(&publication_root)?;
+    let published = database
+        .artifacts()
+        .prepare_publication_claimed(
+            &action_claim,
+            artifact.id,
+            attempt.id(),
+            &staging_root,
+            &publication_root,
+        )
+        .await?;
+    assert_eq!(fs::read(&published)?, contents);
+    let final_dir = publication_root.join(attempt.id().to_string());
+    assert!(!final_dir.exists(), "partial artifact set became visible");
+    assert_eq!(
+        database
+            .artifacts()
+            .get(artifact.id)
+            .await?
+            .ok_or("artifact missing")?
+            .state,
+        igor_core::ArtifactPublicationState::Staged
+    );
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    fs::write(&published, b"corrupted final file")?;
+    assert!(
+        database
+            .artifacts()
+            .prepare_publication_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &staging_root,
+                &publication_root,
+            )
+            .await
+            .is_err()
+    );
+    fs::write(&published, contents)?;
+    assert_eq!(
+        database
+            .artifacts()
+            .prepare_publication_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &staging_root,
+                &publication_root,
+            )
+            .await?,
+        published
+    );
+    let second_bytes = b"second checkpoint";
+    fs::write(attempt_dir.join("checkpoints/epoch-4.bin"), second_bytes)?;
+    let second_declaration = json!({"path":"checkpoints/epoch-4.bin","role":"checkpoint"});
+    let second = database
+        .artifacts()
+        .register_claimed(
+            &action_claim,
+            attempt.id(),
+            &attempt_dir,
+            &second_declaration,
+        )
+        .await?;
+    database
+        .artifacts()
+        .stage_claimed(
+            &action_claim,
+            second.id,
+            attempt.id(),
+            &attempt_dir,
+            &staging_root,
+        )
+        .await?;
+    let document = json!({
+        "schema_version":1,"status":"success","metrics":{},
+        "artifacts":[declaration, second_declaration]
+    });
+    assert!(
+        database
+            .actions()
+            .complete_extraction(&action_claim, attempt.id(), &document)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    for id in [artifact.id, second.id] {
+        assert_eq!(
+            database
+                .artifacts()
+                .get(id)
+                .await?
+                .ok_or("artifact missing")?
+                .state,
+            igor_core::ArtifactPublicationState::Staged
+        );
+    }
+    let second_published = database
+        .artifacts()
+        .prepare_publication_claimed(
+            &action_claim,
+            second.id,
+            attempt.id(),
+            &staging_root,
+            &publication_root,
+        )
+        .await?;
+    assert_eq!(fs::read(&second_published)?, second_bytes);
+    let orphan = publication_root
+        .join(".igor-publication-staging")
+        .join(attempt.id().to_string())
+        .join(format!(".{}.{}.tmp", artifact.id, uuid::Uuid::new_v4()));
+    fs::write(&orphan, b"interrupted copy")?;
+    assert!(
+        !final_dir.exists(),
+        "artifact files were exposed before group publication"
+    );
+    database
+        .artifacts()
+        .finalize_publication_claimed(
+            &action_claim,
+            attempt.id(),
+            &staging_root,
+            &publication_root,
+            &document,
+        )
+        .await?;
+    let published_final = final_dir.join(artifact.id.to_string());
+    let second_final = final_dir.join(second.id.to_string());
+    assert_eq!(fs::read(&published_final)?, contents);
+    assert_eq!(fs::read(&second_final)?, second_bytes);
+    assert!(
+        !final_dir
+            .join(orphan.file_name().ok_or("missing temp name")?)
+            .exists()
+    );
+    assert!(
+        !publication_root
+            .join(".igor-publication-staging")
+            .join(attempt.id().to_string())
+            .exists()
+    );
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .artifacts()
+            .get(artifact.id)
+            .await?
+            .ok_or("artifact missing")?
+            .state,
+        igor_core::ArtifactPublicationState::Staged
+    );
+    sqlx::query("CREATE TRIGGER reject_first_artifact_publication BEFORE INSERT ON events WHEN NEW.kind = 'action_state_changed' AND json_extract(NEW.payload_json, '$.data.state') = 'succeeded' BEGIN SELECT RAISE(ABORT, 'injected publication event failure'); END")
+        .execute(database.pool()).await?;
+    assert!(
+        database
+            .actions()
+            .complete_extraction(&action_claim, attempt.id(), &document)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    for id in [artifact.id, second.id] {
+        assert_eq!(
+            database
+                .artifacts()
+                .get(id)
+                .await?
+                .ok_or("artifact missing")?
+                .state,
+            igor_core::ArtifactPublicationState::Staged
+        );
+    }
+    sqlx::query("DROP TRIGGER reject_first_artifact_publication")
+        .execute(database.pool())
+        .await?;
+    fs::write(attempt_dir.join("late.bin"), b"late")?;
+    sqlx::query("UPDATE actions SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
+        .bind(action_claim.record_id.to_string()).execute(database.pool()).await?;
+    assert!(
+        database
+            .artifacts()
+            .register_claimed(
+                &action_claim,
+                attempt.id(),
+                &attempt_dir,
+                &json!({"path":"late.bin","role":"other","role_detail":"auxiliary"})
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .artifacts()
+            .stage_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &attempt_dir,
+                &staging_root,
+            )
+            .await
+            .is_err()
+    );
+    let replacement = database
+        .actions()
+        .claim_extraction("replacement", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("expired extraction was not reclaimed"))?;
+    database
+        .artifacts()
+        .finalize_publication_claimed(
+            &replacement,
+            attempt.id(),
+            &staging_root,
+            &publication_root,
+            &document,
+        )
+        .await?;
+    database
+        .actions()
+        .complete_extraction(&replacement, attempt.id(), &document)
+        .await?;
+    assert_eq!(
+        database
+            .artifacts()
+            .get(artifact.id)
+            .await?
+            .ok_or_else(|| missing("artifact missing"))?
+            .state,
+        igor_core::ArtifactPublicationState::Published
+    );
+    assert_eq!(
+        database
+            .artifacts()
+            .get(second.id)
+            .await?
+            .ok_or("second artifact missing")?
+            .state,
+        igor_core::ArtifactPublicationState::Published
+    );
+    assert_eq!(
+        database
+            .artifacts()
+            .get(artifact.id)
+            .await?
+            .ok_or("artifact missing")?
+            .metadata["published_path"],
+        published_final.to_str().ok_or("non-UTF-8 published path")?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn artifact_registration_migration_preserves_legacy_published_metadata() -> TestResult {
+    let (directory, database) = database().await?;
+    let (_project, job) = insert_project_job(&database).await?;
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .insert_attempt_with_event(&attempt, &event(EventKind::AttemptCreated, json!({}))?)
+        .await?;
+    let artifact = ArtifactRecord {
+        id: uuid::Uuid::new_v4(),
+        attempt_id: attempt.id(),
+        path: "legacy/model.bin".into(),
+        role: ArtifactRole::Model,
+        sha256: None,
+        size_bytes: None,
+        state: igor_core::ArtifactPublicationState::Published,
+        metadata: json!({"origin": "old schema"}),
+    };
+    sqlx::query("DROP TABLE artifacts")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("CREATE TABLE artifacts (
+        id TEXT PRIMARY KEY NOT NULL, attempt_id TEXT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+        path TEXT NOT NULL, role TEXT NOT NULL, role_detail TEXT, sha256 TEXT,
+        state TEXT NOT NULL DEFAULT 'published' CHECK (state IN ('published','removed')),
+        metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        UNIQUE (attempt_id, path))")
+        .execute(database.pool()).await?;
+    sqlx::query("INSERT INTO artifacts (id, attempt_id, path, role, sha256, state, metadata_json) VALUES (?, ?, ?, 'model', NULL, 'published', ?)")
+        .bind(artifact.id.to_string())
+        .bind(attempt.id().to_string())
+        .bind(&artifact.path)
+        .bind(serde_json::to_string(&artifact.metadata)?)
+        .execute(database.pool()).await?;
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 12")
+        .execute(database.pool())
+        .await?;
+    database.pool().close().await;
+    let migrated = Database::open(directory.path().join("nested/igor.db")).await?;
+    assert_eq!(migrated.schema_version().await?, 12);
+    assert_eq!(migrated.artifacts().get(artifact.id).await?, Some(artifact));
+    migrated.integrity_check(IntegrityCheck::Full).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_attempt_with_extractor_does_not_enqueue_extraction() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let mut attempt = attempt(&job, 1)?;
+    let mut value = serde_json::to_value(&attempt)?;
+    value["result"]["extractor"] = json!({
+        "program":"python3", "args":["extract.py"], "cwd":"/tmp",
+        "shell":"direct", "environment":{"inherit":"none","set":{}}
+    });
+    attempt = serde_json::from_value(value)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Failed,
+                exit_code: Some(1),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM actions WHERE kind = 'extract_metrics'")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    assert!(
+        database
+            .actions()
+            .claim_extraction("extractor", Duration::from_secs(30))
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_attempt_without_extractor_does_not_enqueue_extraction() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM actions WHERE kind = 'extract_metrics'")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    assert!(
+        database
+            .actions()
+            .claim_extraction("extractor", Duration::from_secs(30))
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn extraction_replacement_claim_fences_stale_completion() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let mut attempt = attempt(&job, 1)?;
+    let mut value = serde_json::to_value(&attempt)?;
+    value["result"]["extractor"] = json!({
+        "program":"python3", "args":["extract.py"], "cwd":"/tmp",
+        "shell":"direct", "environment":{"inherit":"none","set":{}}
+    });
+    attempt = serde_json::from_value(value)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let stale = database
+        .actions()
+        .claim_extraction("extractor-a", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("extraction action missing"))?;
+    sqlx::query("UPDATE actions SET claim_expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+        .bind(stale.record_id.to_string())
+        .execute(database.pool())
+        .await?;
+    let replacement = database
+        .actions()
+        .claim_extraction("extractor-b", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("expired extraction not reclaimed"))?;
+    assert_ne!(stale.lease_id, replacement.lease_id);
+    let document = json!({
+        "schema_version": 1, "status": "success", "metrics": {"score": 4},
+        "selection": {"split": "validation", "metric": "score", "value": 4, "checkpoint": "model.bin"}
+    });
+    assert!(
+        database
+            .actions()
+            .complete_extraction(&stale, attempt.id(), &document)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    for table in ["metrics", "metric_selections"] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE attempt_id = ?"
+        ))
+        .bind(attempt.id().to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(count, 0, "{table} was published before the action event");
+    }
+    database
+        .actions()
+        .complete_extraction(&replacement, attempt.id(), &document)
+        .await?;
+    assert_eq!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?,
+        Some(document)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn extraction_duplicate_and_invalid_documents_do_not_mutate_completion() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let mut attempt = attempt(&job, 1)?;
+    let mut value = serde_json::to_value(&attempt)?;
+    value["result"]["extractor"] = json!({
+        "program":"python3", "args":["extract.py"], "cwd":"/tmp",
+        "shell":"direct", "environment":{"inherit":"none","set":{}}
+    });
+    attempt = serde_json::from_value(value)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let claim = database
+        .actions()
+        .claim_extraction("extractor", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("extraction action missing"))?;
+    let document = json!({"schema_version":1,"status":"success","metrics":{"score":4}});
+    sqlx::query(
+        "INSERT INTO metrics (attempt_id, name, value, document_json) VALUES (?, 'score', 9, '9')",
+    )
+    .bind(attempt.id().to_string())
+    .execute(database.pool())
+    .await?;
+    assert!(matches!(
+        database
+            .actions()
+            .complete_extraction(&claim, attempt.id(), &document)
+            .await,
+        Err(PersistenceError::Conflict {
+            entity: "metric scalar"
+        })
+    ));
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    sqlx::query("DELETE FROM metrics WHERE attempt_id = ? AND name = 'score'")
+        .bind(attempt.id().to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .actions()
+        .complete_extraction(&claim, attempt.id(), &document)
+        .await?;
+    assert!(
+        database
+            .actions()
+            .selection_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    let indexed_before = row_counts(
+        &database,
+        &["metric_documents", "metrics", "metric_selections"],
+    )
+    .await?;
+    assert_eq!(indexed_before, vec![1, 1, 0]);
+    let events_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE kind = 'action_state_changed'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        database
+            .actions()
+            .complete_extraction(
+                &claim,
+                attempt.id(),
+                &json!({"schema_version":1,"status":"success","metrics":{"score":9}})
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .actions()
+            .complete_extraction(
+                &claim,
+                attempt.id(),
+                &json!({"schema_version":99,"status":"success","metrics":{"score":9}})
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?,
+        Some(document)
+    );
+    let events_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE kind = 'action_state_changed'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(events_after, events_before);
+    sqlx::query("UPDATE actions SET state = 'pending' WHERE id = ?")
+        .bind(claim.record_id.to_string())
+        .execute(database.pool())
+        .await?;
+    let replay = database
+        .actions()
+        .claim_extraction("replay", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("replayed extraction was not claimed"))?;
+    database
+        .actions()
+        .complete_extraction(
+            &replay,
+            attempt.id(),
+            &json!({"schema_version":1,"status":"success","metrics":{"score":4}}),
+        )
+        .await?;
+    assert_eq!(
+        row_counts(
+            &database,
+            &["metric_documents", "metrics", "metric_selections"]
+        )
+        .await?,
+        indexed_before
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_extraction_completion_event_rolls_back_document_and_action() -> TestResult {
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let mut attempt = attempt(&job, 1)?;
+    let mut value = serde_json::to_value(&attempt)?;
+    value["result"]["extractor"] = json!({
+        "program":"python3", "args":["extract.py"], "cwd":"/tmp",
+        "shell":"direct", "environment":{"inherit":"none","set":{}}
+    });
+    attempt = serde_json::from_value(value)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Succeeded,
+                exit_code: Some(0),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let claim = database
+        .actions()
+        .claim_extraction("extractor", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("extraction action missing"))?;
+    sqlx::query("CREATE TRIGGER reject_extraction_completion BEFORE INSERT ON events WHEN NEW.kind = 'action_state_changed' AND json_extract(NEW.payload_json, '$.data.state') = 'succeeded' BEGIN SELECT RAISE(ABORT, 'injected extraction event failure'); END")
+        .execute(database.pool()).await?;
+    let document = json!({
+        "schema_version": 1, "status": "success", "metrics": {"score": 4},
+        "selection": {"split": "validation", "metric": "score", "value": 4, "checkpoint": "model.bin"}
+    });
+    assert!(
+        database
+            .actions()
+            .complete_extraction(&claim, attempt.id(), &document)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt.id())
+            .await?
+            .is_none()
+    );
+    for table in ["metrics", "metric_selections"] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE attempt_id = ?"
+        ))
+        .bind(attempt.id().to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(count, 0, "{table} was published before the action event");
+    }
+    let state: String = sqlx::query_scalar("SELECT state FROM actions WHERE id = ?")
+        .bind(claim.record_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(state, "running");
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE kind = 'action_state_changed' AND json_extract(payload_json, '$.data.state') = 'succeeded'")
+        .fetch_one(database.pool()).await?;
+    assert_eq!(events, 0);
     Ok(())
 }
 
@@ -3787,6 +5021,19 @@ async fn family_supersession_competing_requests_publish_one_successor() -> TestR
         families.supersede(previous.generation.identity.id, &successor),
     );
     assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    let loser = match (left, right) {
+        (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+        _ => return Err(missing("expected one successful supersession and one conflict").into()),
+    };
+    assert!(
+        matches!(
+            loser,
+            PersistenceError::Conflict {
+                entity: "family generation"
+            }
+        ),
+        "{loser}"
+    );
     assert_eq!(
         row_counts(database, &["generations", "jobs", "attempts"]).await?,
         vec![2, 4, 4]

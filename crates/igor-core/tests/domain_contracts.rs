@@ -141,6 +141,7 @@ fn persisted_models_round_trip_without_losing_arguments() -> Result<(), Box<dyn 
         ResultContract {
             schema_version: 1,
             extractor: Some(command()),
+            publication_root: None,
         },
     )?;
     round_trip(&attempt)?;

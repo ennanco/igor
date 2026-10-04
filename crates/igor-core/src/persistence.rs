@@ -1,13 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::OpenOptions,
-    path::{Path, PathBuf},
+    fs::{File, Metadata, OpenOptions},
+    io::{Read, Write},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    path::{Component, Path, PathBuf},
     str::FromStr,
     time::Duration,
 };
 
 use rusqlite::backup::Backup;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{
     Row, Sqlite, SqlitePool, Transaction,
     migrate::{MigrateError, Migrator},
@@ -17,11 +20,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ActionId, ActionState, ArtifactRole, AttemptId, AttemptSpec, AttemptState, DeliveryId,
-    DeliveryState, DockerContainerState, DockerExecutorSpec, DockerImageIdentity, DomainError,
-    Event, EventId, EventKind, EventPayload, ExecutorSpec, FamilyFile, FamilyId, GenerationId,
-    GenerationIdentity, GpuRequest, JobId, JobSpec, JobState, PreparedFamily, Project, ProjectId,
-    ResourceId, ResourceMode, ResourceRequest, TransitionState,
+    ActionId, ActionState, ArtifactPublicationState, ArtifactRole, AttemptId, AttemptSpec,
+    AttemptState, DeliveryId, DeliveryState, DockerContainerState, DockerExecutorSpec,
+    DockerImageIdentity, DomainError, Event, EventId, EventKind, EventPayload, ExecutorSpec,
+    FamilyFile, FamilyId, GenerationId, GenerationIdentity, GpuRequest, JobId, JobSpec, JobState,
+    PreparedFamily, Project, ProjectId, ResourceId, ResourceMode, ResourceRequest, TransitionState,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!();
@@ -731,6 +734,22 @@ pub struct JobDetail {
     pub attempts: Vec<StoredAttempt>,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct AttemptMetrics {
+    pub attempt_id: AttemptId,
+    pub action_state: Option<String>,
+    pub last_error: Option<String>,
+    pub document: Option<Value>,
+    pub selection: Option<Value>,
+    pub metrics: Vec<(String, f64)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptLogPaths {
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionRecord {
     pub id: ActionId,
@@ -1274,6 +1293,8 @@ pub struct ArtifactRecord {
     pub path: String,
     pub role: ArtifactRole,
     pub sha256: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub state: ArtifactPublicationState,
     pub metadata: Value,
 }
 
@@ -1645,6 +1666,14 @@ impl FamilyGenerationRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin family supersession", source))?;
+        let locked = sqlx::query("UPDATE families SET name = name WHERE id = ?")
+            .bind(prepared.family.id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| db("lock family supersession", source))?;
+        if locked.rows_affected() != 1 {
+            return Err(PersistenceError::NotFound { entity: "family" });
+        }
         let family_row = sqlx::query("SELECT id, project_id, name FROM families WHERE id = ?")
             .bind(prepared.family.id.to_string())
             .fetch_optional(&mut *transaction)
@@ -1952,6 +1981,38 @@ pub struct JobAttemptRepository<'a> {
 }
 
 impl JobAttemptRepository<'_> {
+    pub async fn logs_for_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<AttemptLogPaths> {
+        let row = sqlx::query(
+            "SELECT COALESCE(u.stdout_path, p.stdout_path, c.stdout_path) AS stdout_path,
+                    COALESCE(u.stderr_path, p.stderr_path, c.stderr_path) AS stderr_path
+             FROM attempts a
+             LEFT JOIN attempt_units u ON u.attempt_id = a.id
+             LEFT JOIN attempt_processes p ON p.attempt_id = a.id
+             LEFT JOIN attempt_containers c ON c.attempt_id = a.id
+             WHERE a.id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(&self.database.pool)
+        .await
+        .map_err(|source| db("read attempt log paths", source))?
+        .ok_or(PersistenceError::NotFound { entity: "attempt" })?;
+        let stdout: Option<String> = row.get("stdout_path");
+        let stderr: Option<String> = row.get("stderr_path");
+        match (stdout, stderr) {
+            (Some(stdout), Some(stderr)) => Ok(AttemptLogPaths {
+                stdout: PathBuf::from(stdout),
+                stderr: PathBuf::from(stderr),
+            }),
+            _ => Err(PersistenceError::InvalidValue {
+                entity: "attempt log paths",
+                value: "no persisted execution log paths".into(),
+            }),
+        }
+    }
+
     pub async fn reserve_unit(
         &self,
         claim: &ExecutionClaim,
@@ -4293,6 +4354,24 @@ async fn finish_execution_transaction(
         "family_id": claim.job.spec.family.as_ref().map(|family| family.family_id),
         "generation_id": claim.job.spec.family.as_ref().map(|family| family.generation.id),
     });
+    if outcome.state == AttemptState::Succeeded
+        && let Some(extractor) = claim.attempt.spec.result().extractor.as_ref()
+    {
+        let spec = serde_json::json!({"version": 1, "extractor": extractor});
+        sqlx::query(
+            "INSERT INTO actions (id, project_id, job_id, attempt_id, kind, state, spec_json, idempotency_key, available_at)
+             VALUES (?, ?, ?, ?, 'extract_metrics', 'pending', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .bind(ActionId::new().to_string())
+        .bind(project_id.to_string())
+        .bind(job_id.to_string())
+        .bind(attempt_id.to_string())
+        .bind(json(&spec, "metric extraction action")?)
+        .bind(format!("extract:attempt:{attempt_id}"))
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| db("enqueue metric extraction action", source))?;
+    }
     sqlx::query(
         "INSERT INTO actions (id, project_id, job_id, attempt_id, kind, state, spec_json, idempotency_key, available_at)
          VALUES (?, ?, ?, ?, 'send_notification', 'pending', ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
@@ -4493,6 +4572,54 @@ pub struct ActionRepository<'a> {
 }
 
 impl ActionRepository<'_> {
+    pub async fn metrics_for_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<AttemptMetrics> {
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin attempt metrics read", source))?;
+        let row = sqlx::query("SELECT state, last_error FROM actions WHERE attempt_id = ? AND kind = 'extract_metrics' ORDER BY created_at DESC, id DESC LIMIT 1")
+            .bind(attempt_id.to_string()).fetch_optional(&mut *transaction).await
+            .map_err(|source| db("read metric extraction state", source))?;
+        let document: Option<String> =
+            sqlx::query_scalar("SELECT document_json FROM metric_documents WHERE attempt_id = ?")
+                .bind(attempt_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| db("read metric document", source))?;
+        let selection: Option<String> =
+            sqlx::query_scalar("SELECT selection_json FROM metric_selections WHERE attempt_id = ?")
+                .bind(attempt_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| db("read metric selection", source))?;
+        let values = sqlx::query("SELECT name, value FROM metrics WHERE attempt_id = ? AND value IS NOT NULL ORDER BY name")
+            .bind(attempt_id.to_string()).fetch_all(&mut *transaction).await
+            .map_err(|source| db("read attempt metrics", source))?;
+        Ok(AttemptMetrics {
+            attempt_id,
+            action_state: row.as_ref().map(|row| row.get("state")),
+            last_error: row.as_ref().and_then(|row| row.get("last_error")),
+            document: document
+                .map(|value| from_json(&value, "metric document"))
+                .transpose()?,
+            selection: selection
+                .map(|value| from_json(&value, "metric selection"))
+                .transpose()?,
+            metrics: values
+                .into_iter()
+                .filter_map(|row| {
+                    let value: f64 = row.get("value");
+                    value.is_finite().then(|| (row.get("name"), value))
+                })
+                .collect(),
+        })
+    }
+
     pub async fn insert(&self, action: &ActionRecord) -> PersistenceResult<()> {
         if action.state != ActionState::Pending {
             return Err(PersistenceError::InvalidValue {
@@ -4551,6 +4678,32 @@ impl ActionRepository<'_> {
         .map(|claim| {
             Ok(Claim {
                 record_id: parse_id(&claim.record_id, "claimed notification action")?,
+                lease_id: claim.lease_id,
+                owner: claim.owner,
+                expires_at: claim.expires_at,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn claim_extraction(
+        &self,
+        owner: &str,
+        duration: Duration,
+    ) -> PersistenceResult<Option<Claim<ActionId>>> {
+        claim_outbox(
+            &self.database.pool,
+            "actions",
+            "running",
+            EventKind::ActionStateChanged,
+            owner,
+            duration,
+            " AND kind = 'extract_metrics'",
+        )
+        .await?
+        .map(|claim| {
+            Ok(Claim {
+                record_id: parse_id(&claim.record_id, "claimed extraction action")?,
                 lease_id: claim.lease_id,
                 owner: claim.owner,
                 expires_at: claim.expires_at,
@@ -4620,8 +4773,379 @@ impl ActionRepository<'_> {
     }
 
     pub async fn succeed(&self, claim: &Claim<ActionId>) -> PersistenceResult<()> {
+        let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM actions WHERE id = ?")
+            .bind(claim.record_id.to_string())
+            .fetch_optional(&self.database.pool)
+            .await
+            .map_err(|source| db("read action kind", source))?;
+        if kind.as_deref() == Some("extract_metrics") {
+            return Err(PersistenceError::InvalidValue {
+                entity: "action completion",
+                value: "extract_metrics requires a metric document".into(),
+            });
+        }
         self.transition(claim, ActionState::Succeeded, Duration::ZERO, None)
             .await
+    }
+
+    pub async fn complete_extraction(
+        &self,
+        claim: &Claim<ActionId>,
+        attempt_id: AttemptId,
+        document: &Value,
+    ) -> PersistenceResult<()> {
+        crate::validate_metric_document(document).map_err(|error| {
+            PersistenceError::InvalidValue {
+                entity: "metric document",
+                value: error.to_string(),
+            }
+        })?;
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin metric extraction", source))?;
+        let locked = sqlx::query(
+            "UPDATE actions SET updated_at = updated_at WHERE id = ? AND kind = 'extract_metrics'
+             AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(claim.record_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("lock metric extraction", source))?;
+        if locked.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "extraction claim",
+            });
+        }
+        let row = sqlx::query(
+            "SELECT project_id, attempt_id FROM actions WHERE id = ? AND kind = 'extract_metrics'
+             AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(claim.record_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("validate extraction claim", source))?
+        .ok_or(PersistenceError::Conflict {
+            entity: "extraction claim",
+        })?;
+        let project_id: ProjectId = parse_id(row.get("project_id"), "extraction project")?;
+        if row.get::<Option<String>, _>("attempt_id").as_deref() != Some(&attempt_id.to_string()) {
+            return Err(PersistenceError::Conflict {
+                entity: "extraction attempt",
+            });
+        }
+        let successful_spec: Option<String> = sqlx::query_scalar(
+            "SELECT spec_json FROM attempts WHERE id = ? AND project_id = ? AND state = 'succeeded'",
+        )
+        .bind(attempt_id.to_string())
+        .bind(project_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("validate succeeded extraction attempt", source))?;
+        let successful_spec = successful_spec.ok_or(PersistenceError::Conflict {
+            entity: "extraction attempt",
+        })?;
+        let attempt: AttemptSpec = from_json(&successful_spec, "successful extraction attempt")?;
+        let document_json = json(document, "metric document")?;
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT document_json FROM metric_documents WHERE attempt_id = ?")
+                .bind(attempt_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| db("read existing metric document", source))?;
+        if let Some(existing) = existing {
+            if from_json::<Value>(&existing, "metric document")? != *document {
+                return Err(PersistenceError::Conflict {
+                    entity: "metric document",
+                });
+            }
+        } else {
+            sqlx::query("INSERT INTO metric_documents (attempt_id, version, document_json) VALUES (?, 1, ?)")
+                .bind(attempt_id.to_string()).bind(&document_json)
+                .execute(&mut *transaction).await
+                .map_err(|source| db("insert metric document", source))?;
+        }
+        let metrics =
+            document["metrics"]
+                .as_object()
+                .ok_or_else(|| PersistenceError::InvalidValue {
+                    entity: "metric document metrics",
+                    value: "expected scalar metrics object".into(),
+                })?;
+        for (name, scalar) in metrics {
+            let value = scalar
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| PersistenceError::InvalidValue {
+                    entity: "metric scalar",
+                    value: "expected finite number".into(),
+                })?;
+            let scalar_json = json(scalar, "metric scalar")?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT document_json FROM metrics WHERE attempt_id = ? AND name = ?",
+            )
+            .bind(attempt_id.to_string())
+            .bind(name)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read existing metric scalar", source))?;
+            if let Some(existing) = existing {
+                if from_json::<Value>(&existing, "metric scalar")? != *scalar {
+                    return Err(PersistenceError::Conflict {
+                        entity: "metric scalar",
+                    });
+                }
+            } else {
+                sqlx::query("INSERT INTO metrics (attempt_id, name, value, document_json) VALUES (?, ?, ?, ?)")
+                    .bind(attempt_id.to_string()).bind(name).bind(value).bind(scalar_json)
+                    .execute(&mut *transaction).await
+                    .map_err(|source| db("insert metric scalar", source))?;
+            }
+        }
+        if let Some(selection) = document.get("selection") {
+            let object = selection
+                .as_object()
+                .ok_or_else(|| PersistenceError::InvalidValue {
+                    entity: "metric selection",
+                    value: "expected selection object".into(),
+                })?;
+            let split = object.get("split").and_then(Value::as_str).ok_or_else(|| {
+                PersistenceError::InvalidValue {
+                    entity: "metric selection split",
+                    value: "expected split name".into(),
+                }
+            })?;
+            let metric = object
+                .get("metric")
+                .and_then(Value::as_str)
+                .ok_or_else(|| PersistenceError::InvalidValue {
+                    entity: "metric selection metric",
+                    value: "expected metric name".into(),
+                })?;
+            let value = object
+                .get("value")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| PersistenceError::InvalidValue {
+                    entity: "metric selection value",
+                    value: "expected finite number".into(),
+                })?;
+            let optional_integer = |field: &'static str| -> PersistenceResult<Option<i64>> {
+                object
+                    .get(field)
+                    .map(|value| {
+                        value.as_i64().filter(|value| *value >= 0).ok_or_else(|| {
+                            PersistenceError::InvalidValue {
+                                entity: "metric selection integer",
+                                value: format!("{field} exceeds supported range"),
+                            }
+                        })
+                    })
+                    .transpose()
+            };
+            let epoch = optional_integer("epoch")?;
+            let trained_epochs = optional_integer("trained_epochs")?;
+            let checkpoint_path = object
+                .get("checkpoint")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| PersistenceError::InvalidValue {
+                            entity: "metric selection checkpoint path",
+                            value: "expected relative checkpoint path".into(),
+                        })
+                })
+                .transpose()?;
+            let selection_json = json(selection, "metric selection")?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT selection_json FROM metric_selections WHERE attempt_id = ?",
+            )
+            .bind(attempt_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| db("read existing metric selection", source))?;
+            if let Some(existing) = existing {
+                if from_json::<Value>(&existing, "metric selection")? != *selection {
+                    return Err(PersistenceError::Conflict {
+                        entity: "metric selection",
+                    });
+                }
+            } else {
+                sqlx::query("INSERT INTO metric_selections (attempt_id, split, metric, value, epoch, trained_epochs, checkpoint_path, selection_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+                    .bind(attempt_id.to_string()).bind(split).bind(metric).bind(value).bind(epoch).bind(trained_epochs).bind(checkpoint_path).bind(selection_json)
+                    .execute(&mut *transaction).await
+                    .map_err(|source| db("insert metric selection", source))?;
+            }
+        }
+        if let Some(declarations) = document.get("artifacts").and_then(Value::as_array) {
+            let mut paths = BTreeSet::new();
+            for declaration in declarations {
+                let path =
+                    declaration["path"]
+                        .as_str()
+                        .ok_or_else(|| PersistenceError::InvalidValue {
+                            entity: "artifact declaration",
+                            value: "missing relative path".into(),
+                        })?;
+                if !paths.insert(path) {
+                    return Err(PersistenceError::InvalidValue {
+                        entity: "artifact declaration",
+                        value: "duplicate path".into(),
+                    });
+                }
+                let row = sqlx::query("SELECT id, role, role_detail, sha256, size_bytes, state, metadata_json FROM artifacts WHERE attempt_id = ? AND path = ?")
+                    .bind(attempt_id.to_string()).bind(path)
+                    .fetch_optional(&mut *transaction).await
+                    .map_err(|source| db("verify registered artifact", source))?
+                    .ok_or(PersistenceError::Conflict { entity: "artifact registration" })?;
+                let role: String = row.get("role");
+                let role_detail: Option<String> = row.get("role_detail");
+                let digest: Option<String> = row.get("sha256");
+                let size: Option<i64> = row.get("size_bytes");
+                let state: String = row.get("state");
+                let artifact_id: String = row.get("id");
+                if role != declaration["role"].as_str().unwrap_or("")
+                    || role_detail.as_deref()
+                        != declaration.get("role_detail").and_then(Value::as_str)
+                    || declaration
+                        .get("sha256")
+                        .and_then(Value::as_str)
+                        .is_some_and(|claimed| digest.as_deref() != Some(claimed))
+                    || digest.is_none()
+                    || size.is_none_or(|size| size < 0)
+                    || !matches!(state.as_str(), "staged" | "published")
+                {
+                    return Err(PersistenceError::Conflict {
+                        entity: "artifact registration",
+                    });
+                }
+                if document["status"] != "success" {
+                    if state != "staged" {
+                        return Err(PersistenceError::Conflict {
+                            entity: "artifact staging state",
+                        });
+                    }
+                    continue;
+                }
+                let root = attempt.result().publication_root.as_ref().ok_or(
+                    PersistenceError::Conflict {
+                        entity: "artifact publication root",
+                    },
+                )?;
+                let published = root.join(attempt_id.to_string()).join(&artifact_id);
+                if !std::fs::symlink_metadata(&published).is_ok_and(|metadata| {
+                    metadata.file_type().is_file()
+                        && Some(metadata.len()) == size.and_then(|n| u64::try_from(n).ok())
+                }) {
+                    return Err(PersistenceError::Conflict {
+                        entity: "artifact publication file",
+                    });
+                }
+                let published_path =
+                    published
+                        .to_str()
+                        .ok_or_else(|| PersistenceError::InvalidValue {
+                            entity: "artifact publication path",
+                            value: "must be UTF-8".into(),
+                        })?;
+                let mut metadata: Value = from_json(row.get("metadata_json"), "artifact metadata")?;
+                if state == "published" {
+                    if metadata.get("published_path").and_then(Value::as_str)
+                        != Some(published_path)
+                    {
+                        return Err(PersistenceError::Conflict {
+                            entity: "artifact publication path",
+                        });
+                    }
+                } else {
+                    if metadata
+                        .get("staged_path")
+                        .and_then(Value::as_str)
+                        .is_none()
+                        || !metadata.is_object()
+                    {
+                        return Err(PersistenceError::Conflict {
+                            entity: "artifact staging path",
+                        });
+                    }
+                    metadata["published_path"] = Value::String(published_path.into());
+                    let updated = sqlx::query("UPDATE artifacts SET state = 'published', metadata_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND attempt_id = ? AND state = 'staged'")
+                        .bind(json(&metadata, "published artifact metadata")?)
+                        .bind(&artifact_id).bind(attempt_id.to_string())
+                        .execute(&mut *transaction).await
+                        .map_err(|source| db("publish staged artifact", source))?;
+                    if updated.rows_affected() != 1 {
+                        return Err(PersistenceError::Conflict {
+                            entity: "artifact publication state",
+                        });
+                    }
+                }
+            }
+        }
+        let updated = sqlx::query(
+            "UPDATE actions SET state = 'succeeded', claim_id = NULL, claim_owner = NULL, claim_expires_at = NULL,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ? AND kind = 'extract_metrics' AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        ).bind(claim.record_id.to_string()).bind(claim.lease_id.to_string()).bind(&claim.owner)
+            .execute(&mut *transaction).await.map_err(|source| db("finish extraction action", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "extraction claim",
+            });
+        }
+        let event = state_event(
+            EventKind::ActionStateChanged,
+            "action",
+            &claim.record_id.to_string(),
+            "succeeded",
+            Some(claim.lease_id),
+            None,
+        )?;
+        insert_event(&mut transaction, project_id, None, None, &event).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit metric extraction", source))?;
+        Ok(())
+    }
+
+    pub async fn document_for_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<Option<Value>> {
+        let document: Option<String> =
+            sqlx::query_scalar("SELECT document_json FROM metric_documents WHERE attempt_id = ?")
+                .bind(attempt_id.to_string())
+                .fetch_optional(&self.database.pool)
+                .await
+                .map_err(|source| db("read metric document", source))?;
+        document
+            .map(|value| from_json(&value, "metric document"))
+            .transpose()
+    }
+
+    pub async fn selection_for_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<Option<Value>> {
+        let selection: Option<String> =
+            sqlx::query_scalar("SELECT selection_json FROM metric_selections WHERE attempt_id = ?")
+                .bind(attempt_id.to_string())
+                .fetch_optional(&self.database.pool)
+                .await
+                .map_err(|source| db("read metric selection", source))?;
+        selection
+            .map(|value| from_json(&value, "metric selection"))
+            .transpose()
     }
 
     pub async fn enqueue_notification(
@@ -5150,12 +5674,633 @@ pub struct ArtifactRepository<'a> {
 }
 
 impl ArtifactRepository<'_> {
+    pub async fn prepare_publication_claimed(
+        &self,
+        claim: &Claim<ActionId>,
+        artifact_id: Uuid,
+        attempt_id: AttemptId,
+        staging_root: &Path,
+        publication_root: &Path,
+    ) -> PersistenceResult<PathBuf> {
+        let claimed =
+            self.database
+                .actions()
+                .claimed(claim)
+                .await?
+                .ok_or(PersistenceError::Conflict {
+                    entity: "artifact publication claim",
+                })?;
+        if claimed.action.kind != "extract_metrics" || claimed.attempt_id != Some(attempt_id) {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication claim",
+            });
+        }
+        let artifact = self
+            .get(artifact_id)
+            .await?
+            .ok_or(PersistenceError::NotFound { entity: "artifact" })?;
+        let (Some(size), Some(digest)) = (artifact.size_bytes, artifact.sha256.as_deref()) else {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact registration",
+            });
+        };
+        if artifact.attempt_id != attempt_id
+            || !matches!(
+                artifact.state,
+                ArtifactPublicationState::Staged | ArtifactPublicationState::Published
+            )
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact staging",
+            });
+        }
+        let row = sqlx::query("SELECT a.spec_json, p.root_path FROM attempts a JOIN projects p ON p.id = a.project_id WHERE a.id = ? AND a.project_id = ?")
+            .bind(attempt_id.to_string()).bind(claimed.action.project_id.to_string())
+            .fetch_optional(&self.database.pool).await
+            .map_err(|source| db("read artifact publication identity", source))?
+            .ok_or(PersistenceError::Conflict { entity: "artifact publication project" })?;
+        let attempt: AttemptSpec = from_json(row.get("spec_json"), "publication attempt spec")?;
+        let frozen_root =
+            attempt
+                .result()
+                .publication_root
+                .as_deref()
+                .ok_or(PersistenceError::Conflict {
+                    entity: "artifact publication root",
+                })?;
+        let project_root = PathBuf::from(row.get::<String, _>("root_path"));
+        if frozen_root != publication_root || !publication_root.starts_with(&project_root) {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication root",
+            });
+        }
+        ensure_artifact_publication_root(&project_root, publication_root)?;
+        let staged_attempt = staging_root.join(attempt_id.to_string());
+        let staged_path = staged_attempt.join(artifact_id.to_string());
+        if artifact.metadata.get("staged_path").and_then(Value::as_str) != staged_path.to_str() {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact staging path",
+            });
+        }
+        let final_dir = publication_root.join(attempt_id.to_string());
+        if artifact.state == ArtifactPublicationState::Published
+            && artifact
+                .metadata
+                .get("published_path")
+                .and_then(Value::as_str)
+                != final_dir.join(artifact_id.to_string()).to_str()
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication path",
+            });
+        }
+        match std::fs::symlink_metadata(&final_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                let name = artifact_id.to_string();
+                let (size, final_digest) = hash_artifact_file(&final_dir, Path::new(&name))?;
+                if size != artifact.size_bytes.unwrap_or_default() || final_digest != digest {
+                    return Err(PersistenceError::Conflict {
+                        entity: "artifact publication identity",
+                    });
+                }
+                return Ok(final_dir.join(name));
+            }
+            Ok(_) => {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact publication directory",
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if artifact.state == ArtifactPublicationState::Published {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication directory",
+            });
+        }
+        let root = staged_attempt;
+        let relative = PathBuf::from(artifact_id.to_string());
+        let target = publication_root.join(".igor-publication-staging");
+        let digest = digest.to_owned();
+        let mut copying = tokio::task::spawn_blocking(move || {
+            stage_artifact_file(ArtifactCopy {
+                source_root: &root,
+                relative: &relative,
+                destination_root: &target,
+                attempt_id,
+                artifact_id,
+                expected_size: size,
+                expected_digest: &digest,
+            })
+        });
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let (path, copied_size, copied_digest) = loop {
+            tokio::select! {
+                result = &mut copying => break result??,
+                _ = heartbeat.tick() => self.database.actions().heartbeat(claim, Duration::from_secs(30)).await?,
+            }
+        };
+        if copied_size != size || copied_digest != artifact.sha256.as_deref().unwrap_or_default() {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication identity",
+            });
+        }
+        Ok(path)
+    }
+
+    pub async fn finalize_publication_claimed(
+        &self,
+        claim: &Claim<ActionId>,
+        attempt_id: AttemptId,
+        staging_root: &Path,
+        publication_root: &Path,
+        document: &Value,
+    ) -> PersistenceResult<()> {
+        let Some(declarations) = document.get("artifacts").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        if declarations.is_empty() {
+            return Ok(());
+        }
+        let claimed =
+            self.database
+                .actions()
+                .claimed(claim)
+                .await?
+                .ok_or(PersistenceError::Conflict {
+                    entity: "artifact publication claim",
+                })?;
+        if claimed.action.kind != "extract_metrics" || claimed.attempt_id != Some(attempt_id) {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication claim",
+            });
+        }
+        let row = sqlx::query("SELECT a.spec_json, p.root_path FROM attempts a JOIN projects p ON p.id = a.project_id WHERE a.id = ? AND a.project_id = ?")
+            .bind(attempt_id.to_string()).bind(claimed.action.project_id.to_string())
+            .fetch_optional(&self.database.pool).await
+            .map_err(|source| db("read publication attempt", source))?
+            .ok_or(PersistenceError::Conflict { entity: "artifact publication project" })?;
+        let attempt: AttemptSpec = from_json(row.get("spec_json"), "publication attempt spec")?;
+        let project_root = PathBuf::from(row.get::<String, _>("root_path"));
+        if attempt.result().publication_root.as_deref() != Some(publication_root)
+            || !publication_root.starts_with(&project_root)
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication root",
+            });
+        }
+        ensure_artifact_publication_root(&project_root, publication_root)?;
+        let mut expected = BTreeMap::new();
+        let mut paths = BTreeSet::new();
+        for declaration in declarations {
+            let path = declaration["path"]
+                .as_str()
+                .ok_or(PersistenceError::Conflict {
+                    entity: "artifact declaration",
+                })?;
+            if !paths.insert(path) {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact declaration",
+                });
+            }
+            let row = sqlx::query("SELECT id, role, role_detail, sha256, size_bytes, state, metadata_json FROM artifacts WHERE attempt_id = ? AND path = ?")
+                .bind(attempt_id.to_string()).bind(path)
+                .fetch_optional(&self.database.pool).await
+                .map_err(|source| db("read artifact publication candidate", source))?
+                .ok_or(PersistenceError::Conflict { entity: "artifact registration" })?;
+            let id: String = row.get("id");
+            let role: &str = row.get("role");
+            let detail: Option<&str> = row.get("role_detail");
+            let size: Option<i64> = row.get("size_bytes");
+            let digest: Option<String> = row.get("sha256");
+            let state: &str = row.get("state");
+            let metadata: Value = from_json(row.get("metadata_json"), "artifact metadata")?;
+            if role != declaration["role"].as_str().unwrap_or("")
+                || detail != declaration.get("role_detail").and_then(Value::as_str)
+                || !matches!(state, "staged" | "published")
+                || declaration
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| digest.as_deref() != Some(hash))
+            {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact registration",
+                });
+            }
+            let (Some(size), Some(digest)) =
+                (size.and_then(|size| u64::try_from(size).ok()), digest)
+            else {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact registration",
+                });
+            };
+            let staged_expected = staging_root.join(attempt_id.to_string()).join(&id);
+            if state == "staged"
+                && metadata.get("staged_path").and_then(Value::as_str) != staged_expected.to_str()
+            {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact staging path",
+                });
+            }
+            expected.insert(id, (size, digest));
+        }
+        let final_dir = publication_root.join(attempt_id.to_string());
+        let hidden_dir = publication_root
+            .join(".igor-publication-staging")
+            .join(attempt_id.to_string());
+        let candidate = match std::fs::symlink_metadata(&final_dir) {
+            Ok(metadata) if metadata.file_type().is_dir() => final_dir.clone(),
+            Ok(_) => {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact publication directory",
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => hidden_dir.clone(),
+            Err(error) => return Err(error.into()),
+        };
+        let hidden = candidate == hidden_dir;
+        let mut verification = tokio::task::spawn_blocking(move || {
+            verify_publication_files(&candidate, &expected, hidden)
+        });
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                result = &mut verification => { result??; break; },
+                _ = heartbeat.tick() => self.database.actions().heartbeat(claim, Duration::from_secs(30)).await?,
+            }
+        }
+        if hidden {
+            if std::fs::symlink_metadata(&final_dir).is_ok() {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact publication directory",
+                });
+            }
+            std::fs::rename(&hidden_dir, &final_dir)?;
+            File::open(publication_root)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    pub async fn stage_claimed(
+        &self,
+        claim: &Claim<ActionId>,
+        artifact_id: Uuid,
+        attempt_id: AttemptId,
+        attempt_dir: &Path,
+        staging_root: &Path,
+    ) -> PersistenceResult<ArtifactRecord> {
+        let artifact = self
+            .get(artifact_id)
+            .await?
+            .ok_or(PersistenceError::NotFound { entity: "artifact" })?;
+        let (Some(expected_size), Some(expected_digest)) =
+            (artifact.size_bytes, artifact.sha256.clone())
+        else {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact registration",
+            });
+        };
+        if artifact.attempt_id != attempt_id {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact registration",
+            });
+        }
+        let logs = self.database.jobs().logs_for_attempt(attempt_id).await?;
+        if logs.stdout != attempt_dir.join("stdout.log")
+            || logs.stderr != attempt_dir.join("stderr.log")
+            || !std::fs::symlink_metadata(attempt_dir)
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact attempt directory",
+            });
+        }
+        let source_root = attempt_dir.to_path_buf();
+        let relative = PathBuf::from(&artifact.path);
+        let staging_root = staging_root.to_path_buf();
+        let mut copying = tokio::task::spawn_blocking(move || {
+            stage_artifact_file(ArtifactCopy {
+                source_root: &source_root,
+                relative: &relative,
+                destination_root: &staging_root,
+                attempt_id,
+                artifact_id,
+                expected_size,
+                expected_digest: &expected_digest,
+            })
+        });
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let (staged_path, size, digest) = loop {
+            tokio::select! {
+                result = &mut copying => break result??,
+                _ = heartbeat.tick() => self.database.actions().heartbeat(claim, Duration::from_secs(30)).await?,
+            }
+        };
+        if artifact.size_bytes != Some(size) || artifact.sha256.as_deref() != Some(&digest) {
+            return Err(PersistenceError::Conflict {
+                entity: "staged artifact identity",
+            });
+        }
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin artifact staging", source))?;
+        let claimed = sqlx::query(
+            "UPDATE actions SET updated_at = updated_at WHERE id = ? AND kind = 'extract_metrics'
+             AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             RETURNING attempt_id",
+        )
+        .bind(claim.record_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("validate artifact staging claim", source))?
+        .ok_or(PersistenceError::Conflict {
+            entity: "artifact staging claim",
+        })?;
+        if claimed.get::<Option<String>, _>("attempt_id").as_deref()
+            != Some(&attempt_id.to_string())
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact staging claim",
+            });
+        }
+        let row = sqlx::query("SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json FROM artifacts WHERE id = ? AND attempt_id = ?")
+            .bind(artifact_id.to_string()).bind(attempt_id.to_string())
+            .fetch_optional(&mut *transaction).await
+            .map_err(|source| db("read artifact staging state", source))?
+            .ok_or(PersistenceError::NotFound { entity: "artifact" })?;
+        let mut current = decode_artifact(row)?;
+        if current.path != artifact.path
+            || current.role != artifact.role
+            || current.size_bytes != artifact.size_bytes
+            || current.sha256 != artifact.sha256
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact registration",
+            });
+        }
+        let staged = staged_path
+            .to_str()
+            .ok_or_else(|| PersistenceError::InvalidValue {
+                entity: "artifact staging path",
+                value: "must be UTF-8".into(),
+            })?;
+        if matches!(
+            current.state,
+            ArtifactPublicationState::Staged | ArtifactPublicationState::Published
+        ) {
+            if current.metadata.get("staged_path").and_then(Value::as_str) != Some(staged) {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact staging path",
+                });
+            }
+            if current.state == ArtifactPublicationState::Published
+                && current
+                    .metadata
+                    .get("published_path")
+                    .and_then(Value::as_str)
+                    .is_none()
+            {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact publication path",
+                });
+            }
+            return Ok(current);
+        }
+        if current.state != ArtifactPublicationState::Registered || !current.metadata.is_object() {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact registration",
+            });
+        }
+        current.metadata["staged_path"] = Value::String(staged.into());
+        let updated = sqlx::query("UPDATE artifacts SET state = 'staged', metadata_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND attempt_id = ? AND state = 'registered'")
+            .bind(json(&current.metadata, "artifact staging metadata")?)
+            .bind(artifact_id.to_string()).bind(attempt_id.to_string())
+            .execute(&mut *transaction).await.map_err(|source| db("stage artifact record", source))?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact registration",
+            });
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit artifact staging", source))?;
+        current.state = ArtifactPublicationState::Staged;
+        Ok(current)
+    }
+
+    pub async fn register_claimed(
+        &self,
+        claim: &Claim<ActionId>,
+        attempt_id: AttemptId,
+        attempt_dir: &Path,
+        declaration: &Value,
+    ) -> PersistenceResult<ArtifactRecord> {
+        let sample = serde_json::json!({
+            "schema_version": 1,
+            "status": "success",
+            "metrics": {},
+            "artifacts": [declaration],
+        });
+        crate::validate_metric_document(&sample).map_err(|error| {
+            PersistenceError::InvalidValue {
+                entity: "artifact declaration",
+                value: error.to_string(),
+            }
+        })?;
+        let path = declaration["path"]
+            .as_str()
+            .ok_or_else(|| PersistenceError::InvalidValue {
+                entity: "artifact path",
+                value: "expected attempt-relative path".into(),
+            })?;
+        let relative = Path::new(path);
+        if !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return Err(PersistenceError::InvalidValue {
+                entity: "artifact path",
+                value: "must consist only of attempt-relative path components".into(),
+            });
+        }
+        let role = decode_artifact_role(
+            declaration["role"]
+                .as_str()
+                .ok_or_else(|| PersistenceError::InvalidValue {
+                    entity: "artifact role",
+                    value: "missing role".into(),
+                })?,
+            declaration
+                .get("role_detail")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )?;
+        let logs = self.database.jobs().logs_for_attempt(attempt_id).await?;
+        if logs.stdout != attempt_dir.join("stdout.log")
+            || logs.stderr != attempt_dir.join("stderr.log")
+            || !std::fs::symlink_metadata(attempt_dir)
+                .is_ok_and(|metadata| metadata.file_type().is_dir())
+        {
+            return Err(PersistenceError::InvalidValue {
+                entity: "artifact attempt directory",
+                value: "does not match persisted attempt log directory".into(),
+            });
+        }
+        let root = attempt_dir.to_path_buf();
+        let relative = relative.to_path_buf();
+        let mut hashing = tokio::task::spawn_blocking(move || hash_artifact_file(&root, &relative));
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let (size_bytes, digest) = loop {
+            tokio::select! {
+                result = &mut hashing => break result??,
+                _ = heartbeat.tick() => {
+                    self.database.actions().heartbeat(claim, Duration::from_secs(30)).await?;
+                }
+            }
+        };
+        if let Some(claimed_digest) = declaration.get("sha256").and_then(Value::as_str)
+            && claimed_digest != digest
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact digest",
+            });
+        }
+        let size = i64::try_from(size_bytes).map_err(|_| PersistenceError::InvalidValue {
+            entity: "artifact size",
+            value: "exceeds SQLite integer range".into(),
+        })?;
+        let metadata = serde_json::json!({
+            "declared_sha256": declaration.get("sha256"),
+        });
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin artifact registration", source))?;
+        let claimed = sqlx::query(
+            "UPDATE actions SET updated_at = updated_at WHERE id = ? AND kind = 'extract_metrics'
+             AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             RETURNING project_id, job_id, attempt_id",
+        )
+        .bind(claim.record_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|source| db("validate artifact action claim", source))?
+        .ok_or(PersistenceError::Conflict {
+            entity: "artifact action claim",
+        })?;
+        if claimed.get::<Option<String>, _>("attempt_id").as_deref()
+            != Some(&attempt_id.to_string())
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact attempt",
+            });
+        }
+        let project_id: ProjectId = parse_id(claimed.get("project_id"), "artifact project")?;
+        let job_id: JobId = parse_id(claimed.get("job_id"), "artifact job")?;
+        let succeeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attempts WHERE id = ? AND job_id = ? AND project_id = ? AND state = 'succeeded'")
+            .bind(attempt_id.to_string()).bind(job_id.to_string()).bind(project_id.to_string())
+            .fetch_one(&mut *transaction).await.map_err(|source| db("validate artifact attempt", source))?;
+        if succeeded != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact attempt",
+            });
+        }
+        let existing = sqlx::query(
+            "SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json
+             FROM artifacts WHERE attempt_id = ? AND path = ?",
+        ).bind(attempt_id.to_string()).bind(path).fetch_optional(&mut *transaction).await
+            .map_err(|source| db("read registered artifact", source))?;
+        if let Some(existing) = existing {
+            let existing = decode_artifact(existing)?;
+            if existing.role != role
+                || existing.size_bytes != Some(size_bytes)
+                || existing.sha256.as_deref() != Some(&digest)
+            {
+                return Err(PersistenceError::Conflict {
+                    entity: "artifact registration",
+                });
+            }
+            return Ok(existing);
+        }
+        let artifact = ArtifactRecord {
+            id: Uuid::new_v4(),
+            attempt_id,
+            path: path.into(),
+            role,
+            sha256: Some(digest),
+            size_bytes: Some(size_bytes),
+            state: ArtifactPublicationState::Registered,
+            metadata,
+        };
+        let (role, role_detail) = encode_artifact_role(&artifact.role);
+        sqlx::query("INSERT INTO artifacts (id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, 'registered', ?)")
+            .bind(artifact.id.to_string()).bind(attempt_id.to_string()).bind(&artifact.path)
+            .bind(role).bind(role_detail).bind(&artifact.sha256).bind(size)
+            .bind(json(&artifact.metadata, "artifact metadata")?)
+            .execute(&mut *transaction).await.map_err(|source| db("register attempt artifact", source))?;
+        let event = Event::new(
+            EventId::new(),
+            EventKind::ArtifactRegistered,
+            EventPayload::new(
+                EventKind::ArtifactRegistered,
+                1,
+                serde_json::json!({
+                    "artifact_id": artifact.id, "attempt_id": attempt_id, "path": artifact.path,
+                    "role": role, "size_bytes": size_bytes, "sha256": artifact.sha256,
+                    "state": "registered"
+                }),
+            )?,
+        )?;
+        insert_event(
+            &mut transaction,
+            project_id,
+            Some(job_id),
+            Some(attempt_id),
+            &event,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| db("commit artifact registration", source))?;
+        Ok(artifact)
+    }
+
     pub async fn insert(&self, artifact: &ArtifactRecord) -> PersistenceResult<()> {
         let (role, role_detail) = encode_artifact_role(&artifact.role);
+        let size_bytes = artifact
+            .size_bytes
+            .map(|bytes| {
+                i64::try_from(bytes).map_err(|_| PersistenceError::InvalidValue {
+                    entity: "artifact size",
+                    value: "size exceeds SQLite integer range".into(),
+                })
+            })
+            .transpose()?;
         sqlx::query(
             "INSERT INTO artifacts
-                 (id, attempt_id, path, role, role_detail, sha256, metadata_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(artifact.id.to_string())
         .bind(artifact.attempt_id.to_string())
@@ -5163,6 +6308,8 @@ impl ArtifactRepository<'_> {
         .bind(role)
         .bind(role_detail)
         .bind(&artifact.sha256)
+        .bind(size_bytes)
+        .bind(artifact.state.as_str())
         .bind(json(&artifact.metadata, "artifact metadata")?)
         .execute(&self.database.pool)
         .await
@@ -5172,25 +6319,347 @@ impl ArtifactRepository<'_> {
 
     pub async fn get(&self, id: Uuid) -> PersistenceResult<Option<ArtifactRecord>> {
         let row = sqlx::query(
-            "SELECT id, attempt_id, path, role, role_detail, sha256, metadata_json
+            "SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json
              FROM artifacts WHERE id = ?",
         )
         .bind(id.to_string())
         .fetch_optional(&self.database.pool)
         .await
         .map_err(|source| db("get artifact", source))?;
-        row.map(|row| {
-            Ok(ArtifactRecord {
-                id: parse_id(row.get("id"), "artifact")?,
-                attempt_id: parse_id(row.get("attempt_id"), "artifact attempt")?,
-                path: row.get("path"),
-                role: decode_artifact_role(row.get("role"), row.get("role_detail"))?,
-                sha256: row.get("sha256"),
-                metadata: from_json(row.get("metadata_json"), "artifact metadata")?,
+        row.map(decode_artifact).transpose()
+    }
+}
+
+fn decode_artifact(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<ArtifactRecord> {
+    let size_bytes: Option<i64> = row.get("size_bytes");
+    let size_bytes = size_bytes
+        .map(|value| {
+            u64::try_from(value).map_err(|_| PersistenceError::InvalidValue {
+                entity: "artifact size",
+                value: "negative persisted size".into(),
             })
         })
-        .transpose()
+        .transpose()?;
+    let state: &str = row.get("state");
+    let state = match state {
+        "registered" => ArtifactPublicationState::Registered,
+        "staged" => ArtifactPublicationState::Staged,
+        "published" => ArtifactPublicationState::Published,
+        "removed" => ArtifactPublicationState::Removed,
+        _ => {
+            return Err(PersistenceError::InvalidValue {
+                entity: "artifact state",
+                value: state.into(),
+            });
+        }
+    };
+    Ok(ArtifactRecord {
+        id: parse_id(row.get("id"), "artifact")?,
+        attempt_id: parse_id(row.get("attempt_id"), "artifact attempt")?,
+        path: row.get("path"),
+        role: decode_artifact_role(row.get("role"), row.get("role_detail"))?,
+        sha256: row.get("sha256"),
+        size_bytes,
+        state,
+        metadata: from_json(row.get("metadata_json"), "artifact metadata")?,
+    })
+}
+
+fn hash_artifact_file(root: &Path, relative: &Path) -> PersistenceResult<(u64, String)> {
+    let (mut file, before) = open_artifact_source(root, relative)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
     }
+    let after = file.metadata()?;
+    if !same_artifact_file(&before, &after) {
+        return Err(PersistenceError::Conflict {
+            entity: "artifact file",
+        });
+    }
+    Ok((after.len(), format!("sha256:{:x}", digest.finalize())))
+}
+
+fn open_artifact_source(root: &Path, relative: &Path) -> PersistenceResult<(File, Metadata)> {
+    if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
+        return Err(PersistenceError::InvalidValue {
+            entity: "artifact root",
+            value: "must be a real directory".into(),
+        });
+    }
+    let mut candidate = root.to_path_buf();
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            return Err(PersistenceError::InvalidValue {
+                entity: "artifact path",
+                value: "must be attempt-relative".into(),
+            });
+        };
+        candidate.push(part);
+        let metadata = std::fs::symlink_metadata(&candidate)?;
+        if index + 1 != components.len() && !metadata.file_type().is_dir() {
+            return Err(PersistenceError::InvalidValue {
+                entity: "artifact directory",
+                value: "must not be a symbolic link or non-directory".into(),
+            });
+        }
+        if index + 1 == components.len() && !metadata.file_type().is_file() {
+            return Err(PersistenceError::InvalidValue {
+                entity: "artifact file",
+                value: "must be a regular file without a symbolic link".into(),
+            });
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&candidate)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(PersistenceError::InvalidValue {
+            entity: "artifact file",
+            value: "opened descriptor is not regular".into(),
+        });
+    }
+    Ok((file, before))
+}
+
+fn same_artifact_file(before: &Metadata, after: &Metadata) -> bool {
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+fn private_staging_dir(path: &Path) -> PersistenceResult<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.mode() & 0o077 != 0 {
+        return Err(PersistenceError::InvalidValue {
+            entity: "artifact staging directory",
+            value: "must be a private real directory".into(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_artifact_publication_root(
+    project_root: &Path,
+    publication_root: &Path,
+) -> PersistenceResult<()> {
+    if !std::fs::symlink_metadata(project_root)?
+        .file_type()
+        .is_dir()
+    {
+        return Err(PersistenceError::Conflict {
+            entity: "artifact publication project",
+        });
+    }
+    let relative =
+        publication_root
+            .strip_prefix(project_root)
+            .map_err(|_| PersistenceError::Conflict {
+                entity: "artifact publication root",
+            })?;
+    let mut current = project_root.to_path_buf();
+    let mut has_component = false;
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication root",
+            });
+        };
+        has_component = true;
+        current.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        if !std::fs::symlink_metadata(&current)?.file_type().is_dir() {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication directory",
+            });
+        }
+    }
+    if !has_component {
+        return Err(PersistenceError::Conflict {
+            entity: "artifact publication root",
+        });
+    }
+    Ok(())
+}
+
+fn verify_publication_files(
+    directory: &Path,
+    expected: &BTreeMap<String, (u64, String)>,
+    hidden: bool,
+) -> PersistenceResult<()> {
+    if !std::fs::symlink_metadata(directory)?.file_type().is_dir() {
+        return Err(PersistenceError::Conflict {
+            entity: "artifact publication directory",
+        });
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(PersistenceError::Conflict {
+            entity: "artifact publication filename",
+        })?;
+        if expected.contains_key(name) {
+            continue;
+        }
+        let temporary = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".tmp"))
+            .and_then(|name| name.split_once('.'));
+        if hidden
+            && temporary.is_some_and(|(artifact, suffix)| {
+                expected.contains_key(artifact) && suffix.parse::<Uuid>().is_ok()
+            })
+            && entry.file_type()?.is_file()
+        {
+            std::fs::remove_file(entry.path())?;
+        } else {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication contents",
+            });
+        }
+    }
+    for (id, (size, digest)) in expected {
+        let (actual_size, actual_digest) = hash_artifact_file(directory, Path::new(id))?;
+        if actual_size != *size || actual_digest != *digest {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact publication identity",
+            });
+        }
+    }
+    if hidden {
+        File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+struct ArtifactCopy<'a> {
+    source_root: &'a Path,
+    relative: &'a Path,
+    destination_root: &'a Path,
+    attempt_id: AttemptId,
+    artifact_id: Uuid,
+    expected_size: u64,
+    expected_digest: &'a str,
+}
+
+fn stage_artifact_file(copy: ArtifactCopy<'_>) -> PersistenceResult<(PathBuf, u64, String)> {
+    let ArtifactCopy {
+        source_root,
+        relative,
+        destination_root: staging_root,
+        attempt_id,
+        artifact_id,
+        expected_size,
+        expected_digest,
+    } = copy;
+    let parent = staging_root
+        .parent()
+        .ok_or_else(|| PersistenceError::InvalidValue {
+            entity: "artifact staging root",
+            value: "missing state directory".into(),
+        })?;
+    if !std::fs::symlink_metadata(parent)?.file_type().is_dir() {
+        return Err(PersistenceError::InvalidValue {
+            entity: "artifact staging root",
+            value: "state directory must be real".into(),
+        });
+    }
+    private_staging_dir(staging_root)?;
+    let attempt_staging = staging_root.join(attempt_id.to_string());
+    private_staging_dir(&attempt_staging)?;
+    let name = artifact_id.to_string();
+    let target = attempt_staging.join(&name);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let (size, digest) = hash_artifact_file(&attempt_staging, Path::new(&name))?;
+            if size != expected_size || digest != expected_digest {
+                return Err(PersistenceError::Conflict {
+                    entity: "staged artifact identity",
+                });
+            }
+            return Ok((target, size, digest));
+        }
+        Ok(_) => {
+            return Err(PersistenceError::Conflict {
+                entity: "staged artifact path",
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let (mut source, before) = open_artifact_source(source_root, relative)?;
+    let temporary = attempt_staging.join(format!(".{name}.{}.tmp", Uuid::new_v4()));
+    let copied = (|| -> PersistenceResult<(u64, String)> {
+        let mut staged = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut size = 0_u64;
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            size = size
+                .checked_add(read as u64)
+                .ok_or(PersistenceError::InvalidValue {
+                    entity: "artifact size",
+                    value: "overflow while staging".into(),
+                })?;
+            staged.write_all(&buffer[..read])?;
+            digest.update(&buffer[..read]);
+        }
+        let after = source.metadata()?;
+        let computed = format!("sha256:{:x}", digest.finalize());
+        if !same_artifact_file(&before, &after)
+            || size != expected_size
+            || computed != expected_digest
+        {
+            return Err(PersistenceError::Conflict {
+                entity: "artifact identity changed before staging",
+            });
+        }
+        staged.sync_all()?;
+        Ok((size, computed))
+    })();
+    let (size, digest) = match copied {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    };
+    if let Err(error) = std::fs::rename(&temporary, &target) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    File::open(&attempt_staging)?.sync_all()?;
+    Ok((target, size, digest))
 }
 
 fn encode_artifact_role(role: &ArtifactRole) -> (&'static str, Option<&str>) {

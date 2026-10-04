@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use igor_core::JobId;
+use igor_core::{AttemptId, AttemptMetrics, JobId};
 use igor_daemon::{
     DaemonRole, PROTOCOL_VERSION, ProtocolError, ProtocolErrorKind, Request, RequestEnvelope,
     Response, ResponseEnvelope, Version,
@@ -107,6 +107,42 @@ fn milestone_seven_resource_request_round_trips() -> Result<(), Box<dyn Error>> 
     assert_eq!(
         serde_json::from_slice::<RequestEnvelope>(&encoded)?,
         envelope
+    );
+    Ok(())
+}
+
+#[test]
+fn metrics_protocol_carries_attempt_identity_and_extraction_state() -> Result<(), Box<dyn Error>> {
+    let job_id = JobId::new();
+    let attempt_id = AttemptId::new();
+    let request = RequestEnvelope::new(Request::JobMetrics { job_id });
+    let encoded = serde_json::to_value(&request)?;
+    assert_eq!(encoded["protocol_version"], PROTOCOL_VERSION);
+    assert_eq!(encoded["request"]["type"], "job_metrics");
+    assert_eq!(serde_json::from_value::<RequestEnvelope>(encoded)?, request);
+
+    let response = ResponseEnvelope::success(Response::Metrics {
+        job_id,
+        attempts: vec![AttemptMetrics {
+            attempt_id,
+            action_state: Some("failed".into()),
+            last_error: Some("invalid_extractor_json".into()),
+            document: None,
+            selection: None,
+            metrics: Vec::new(),
+        }],
+    });
+    let encoded = serde_json::to_value(&response)?;
+    assert_eq!(encoded["response"]["type"], "metrics");
+    assert_eq!(encoded["response"]["job_id"], job_id.to_string());
+    assert_eq!(
+        encoded["response"]["attempts"][0]["attempt_id"],
+        attempt_id.to_string()
+    );
+    assert_eq!(encoded["response"]["attempts"][0]["action_state"], "failed");
+    assert_eq!(
+        serde_json::from_value::<ResponseEnvelope>(encoded)?,
+        response
     );
     Ok(())
 }

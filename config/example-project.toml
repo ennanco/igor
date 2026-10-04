@@ -24,3 +24,8 @@ output = "RESULTS.md"
 mode = "replace-generated-file"
 generator = "opencode"
 prompt_file = ".igor/report-prompt.md"
+
+# Optional direct metric extractor; argv is literal and no shell is used.
+# [results]
+# extractor = ["./scripts/export_igor_metrics.py"]
+# working_directory = "attempt"

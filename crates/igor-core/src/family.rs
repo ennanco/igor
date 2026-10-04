@@ -198,6 +198,7 @@ impl PreparedFamily {
                 || attempt.job_id() != job.id
                 || attempt.command() != &job.command
                 || attempt.configuration().project_digest != *project_digest
+                || attempt.result() != first.attempt.result()
                 || attempt.configuration().job_digest != digest_json(job, "family member job")?
             {
                 return Err(invalid_family(format!(

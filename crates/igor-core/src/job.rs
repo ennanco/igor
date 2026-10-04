@@ -162,6 +162,8 @@ pub struct ResultContract {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extractor: Option<CommandSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_root: Option<PathBuf>,
 }
 
 impl ResultContract {
@@ -175,6 +177,33 @@ impl ResultContract {
         }
         if let Some(extractor) = &self.extractor {
             extractor.validate()?;
+        }
+        if let Some(root) = &self.publication_root {
+            if !root.is_absolute()
+                || root
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(DomainError::validation(
+                    ErrorCode::InvalidAttempt,
+                    "attempt.result.publication_root",
+                    "must be absolute and must not contain parent-directory components",
+                ));
+            }
+            let Some(extractor) = self.extractor.as_ref() else {
+                return Err(DomainError::validation(
+                    ErrorCode::InvalidAttempt,
+                    "attempt.result.publication_root",
+                    "requires a configured extractor",
+                ));
+            };
+            if !extractor.cwd.is_absolute() || !root.starts_with(&extractor.cwd) {
+                return Err(DomainError::validation(
+                    ErrorCode::InvalidAttempt,
+                    "attempt.result.publication_root",
+                    "must be contained by the project root",
+                ));
+            }
         }
         Ok(())
     }

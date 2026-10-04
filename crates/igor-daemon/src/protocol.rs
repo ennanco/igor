@@ -6,7 +6,7 @@ use igor_core::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +95,9 @@ pub enum Request {
     JobShow {
         job_id: JobId,
     },
+    JobMetrics {
+        job_id: JobId,
+    },
     JobEvents {
         job_id: JobId,
     },
@@ -110,7 +113,7 @@ pub enum Request {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseEnvelope {
     pub protocol_version: u32,
@@ -140,7 +143,7 @@ impl ResponseEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Health(Health),
@@ -173,6 +176,10 @@ pub enum Response {
         jobs: Vec<StoredJob>,
     },
     Job(JobDetail),
+    Metrics {
+        job_id: JobId,
+        attempts: Vec<igor_core::AttemptMetrics>,
+    },
     Events {
         events: Vec<StoredEvent>,
     },

@@ -17,6 +17,7 @@ use nix::{
     unistd::Pid,
 };
 use serde_json::{Value, json};
+use sha2::Digest;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -811,6 +812,1356 @@ async fn run_fake_docker_case(
     Ok(())
 }
 
+fn configure_metric_extractor(fixture: &Fixture, script: &str) -> TestResult {
+    let extractor = fixture.project.join("extract.sh");
+    fs::write(&extractor, script)?;
+    fs::set_permissions(&extractor, fs::Permissions::from_mode(0o700))?;
+    git(&fixture.project, &["add", "extract.sh"])?;
+    git(&fixture.project, &["commit", "-qm", "add metric extractor"])?;
+    let config = fixture.project.join(".igor/project.toml");
+    fs::write(
+        &config,
+        "schema_version = 1\n[results]\nextractor = ['./extract.sh']\nworking_directory = 'attempt'\n",
+    )?;
+    git(&fixture.project, &["add", ".igor/project.toml"])?;
+    git(
+        &fixture.project,
+        &["commit", "-qm", "configure metric extractor"],
+    )?;
+    Ok(())
+}
+
+fn submit_metric_extractor_job(fixture: &Fixture) -> Result<JobId, Box<dyn Error>> {
+    let job_file = fixture._temporary.path().join("metric-extractor-job.toml");
+    fs::write(
+        &job_file,
+        "schema_version = 1\nname = 'metric extractor'\n[execution]\nprogram = '/bin/sh'\nargs = ['-c', 'printf training-output']\n[resources]\nmode = 'shared'\n",
+    )?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--json",
+                "--file",
+                job_file.to_str().ok_or("non-UTF-8 job file")?,
+            ])
+            .output()?,
+    )?;
+    Ok(submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing job id")?
+        .parse()?)
+}
+
+fn spawn_metric_supervisor(fixture: &Fixture) -> Result<Worker, Box<dyn Error>> {
+    Ok(Worker(
+        command(&fixture.home, &fixture.project)
+            .env("TELEGRAM_BOT_TOKEN", "must-not-leak")
+            .env("OPENCODE_TEST_SECRET", "must-not-leak")
+            .arg("supervisor")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    ))
+}
+
+#[tokio::test]
+async fn metric_extractor_runs_in_isolated_attempt_and_persists_document() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let document = r#"{"schema_version":1,"status":"success","metrics":{"accuracy":0.75},"selection":{"split":"validation","metric":"accuracy","value":0.75,"epoch":3,"trained_epochs":5,"checkpoint":"checkpoints/best.bin"}}"#;
+    configure_metric_extractor(
+        &fixture,
+        &format!(
+            "#!/bin/sh\nset -eu\n[ -z \"${{TELEGRAM_BOT_TOKEN-}}\" ]\n[ -z \"${{OPENCODE_TEST_SECRET-}}\" ]\ncat > extractor-input.json\npwd > extractor-cwd\nprintf '%s\\n' '{}'\n",
+            document
+        ),
+    )?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    let completed = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let completed: Value = serde_json::from_slice(&completed.stdout)?;
+    assert_eq!(completed["job"]["state"], "succeeded");
+
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let detail = database.jobs().detail(job_id).await?.ok_or("missing job")?;
+    assert_eq!(detail.job.state, JobState::Succeeded);
+    let attempt = detail.attempts.last().ok_or("missing attempt")?;
+    let attempt_id = attempt.spec.id();
+    let expected: Value = serde_json::from_str(document)?;
+    let completion = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if database.actions().document_for_attempt(attempt_id).await? == Some(expected.clone())
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if completion.is_err() {
+        let action: Option<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT state, last_error, attempts FROM actions WHERE attempt_id = ? AND kind = 'extract_metrics'",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(database.pool())
+        .await?;
+        return Err(format!("metric extraction did not complete; action {action:?}").into());
+    }
+    completion??;
+    let log_dir = fixture
+        .home
+        .join("state/igor/logs")
+        .join(attempt_id.to_string());
+    let observed = log_dir.join("extractor-input.json");
+    let cwd = log_dir.join("extractor-cwd");
+    let input: Value = serde_json::from_slice(&fs::read(observed)?)?;
+    assert_eq!(
+        input
+            .as_object()
+            .ok_or("extractor input is not an object")?
+            .len(),
+        9
+    );
+    assert_eq!(input["schema_version"], 1);
+    assert_eq!(input["project_id"], detail.job.spec.project_id.to_string());
+    assert_eq!(input["job_id"], job_id.to_string());
+    assert_eq!(input["attempt_id"], attempt_id.to_string());
+    assert_eq!(input["family_id"], Value::Null);
+    assert_eq!(input["generation_id"], Value::Null);
+    assert_eq!(input["seed"], Value::Null);
+    assert_eq!(
+        input["stdout_path"],
+        log_dir
+            .join("stdout.log")
+            .to_str()
+            .ok_or("non-UTF-8 stdout path")?
+    );
+    assert_eq!(
+        input["stderr_path"],
+        log_dir
+            .join("stderr.log")
+            .to_str()
+            .ok_or("non-UTF-8 stderr path")?
+    );
+    assert_eq!(
+        fs::read_to_string(cwd)?.trim(),
+        log_dir.to_str().ok_or("non-UTF-8 attempt path")?
+    );
+
+    assert_eq!(
+        database.actions().document_for_attempt(attempt_id).await?,
+        Some(expected.clone())
+    );
+    assert_eq!(
+        database.actions().selection_for_attempt(attempt_id).await?,
+        Some(expected["selection"].clone())
+    );
+    assert_eq!(
+        database.deliveries().available_metrics(attempt_id).await?,
+        [("accuracy".into(), 0.75)]
+    );
+    let (state, last_error): (String, Option<String>) = sqlx::query_as(
+        "SELECT state, last_error FROM actions WHERE job_id = ? AND kind = 'extract_metrics'",
+    )
+    .bind(job_id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(state, "succeeded");
+    assert_eq!(last_error, None);
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metric_extractor_publishes_verified_artifacts() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_extractor(
+        &fixture,
+        "#!/bin/sh\nset -eu\ncat > extractor-input.json\nprintf result > output.bin\nprintf '%s\n' '{\"schema_version\":1,\"status\":\"success\",\"metrics\":{\"score\":1},\"artifacts\":[{\"path\":\"output.bin\",\"role\":\"other\",\"role_detail\":\"raw\"}]}'\n",
+    )?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let attempt_id = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing job")?
+        .attempts
+        .last()
+        .ok_or("missing attempt")?
+        .spec
+        .id();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if database
+                .actions()
+                .document_for_attempt(attempt_id)
+                .await?
+                .is_some()
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let id: String =
+        sqlx::query_scalar("SELECT id FROM artifacts WHERE attempt_id = ? AND path = 'output.bin'")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    let artifact = database
+        .artifacts()
+        .get(id.parse()?)
+        .await?
+        .ok_or("artifact not registered")?;
+    assert_eq!(artifact.role, igor_core::ArtifactRole::Other("raw".into()));
+    assert_eq!(artifact.size_bytes, Some(6));
+    assert_eq!(
+        artifact.sha256,
+        Some(format!("sha256:{:x}", sha2::Sha256::digest(b"result")))
+    );
+    assert_eq!(
+        artifact.state,
+        igor_core::ArtifactPublicationState::Published
+    );
+    let staged = fixture
+        .home
+        .join("state/igor/artifact-staging")
+        .join(attempt_id.to_string())
+        .join(&id);
+    assert_eq!(
+        artifact.metadata["staged_path"],
+        staged.to_str().ok_or("non-UTF-8 staged path")?
+    );
+    assert_eq!(fs::read(&staged)?, b"result");
+    assert_eq!(fs::metadata(&staged)?.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(staged.parent().ok_or("missing staged parent")?)?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let published = fixture
+        .project
+        .join("artifacts")
+        .join(attempt_id.to_string())
+        .join(&id);
+    assert_eq!(
+        artifact.metadata["published_path"],
+        published.to_str().ok_or("non-UTF-8 published path")?
+    );
+    assert_eq!(fs::read(&published)?, b"result");
+    assert_eq!(
+        fs::metadata(&published)?.permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!fixture.project.join("artifacts/output.bin").exists());
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(job_id)
+            .await?
+            .ok_or("missing job")?
+            .state,
+        JobState::Succeeded
+    );
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeating_successful_extraction_preserves_document_indexes_and_published_artifact()
+-> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_extractor(
+        &fixture,
+        "#!/bin/sh\nset -eu\ncat > /dev/null\nif [ -f extractor-runs ]; then runs=$(cat extractor-runs); else runs=0; fi\nprintf '%s\n' \"$((runs+1))\" > extractor-runs\nprintf same-data > repeat.bin\nprintf '%s\n' '{\"schema_version\":1,\"status\":\"success\",\"metrics\":{\"score\":0.75},\"selection\":{\"split\":\"validation\",\"metric\":\"score\",\"value\":0.75},\"artifacts\":[{\"path\":\"repeat.bin\",\"role\":\"metrics\"}]}'\n",
+    )?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let attempt_id = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing job")?
+        .attempts[0]
+        .spec
+        .id();
+    let action_id: String = sqlx::query_scalar(
+        "SELECT id FROM actions WHERE attempt_id = ? AND kind = 'extract_metrics'",
+    )
+    .bind(attempt_id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state: String = sqlx::query_scalar("SELECT state FROM actions WHERE id = ?")
+                .bind(&action_id)
+                .fetch_one(database.pool())
+                .await?;
+            if state == "succeeded" {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let before = output_json(
+        fixture
+            .run()
+            .args(["metrics", &job_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(before["attempts"][0]["document"]["metrics"]["score"], 0.75);
+    let artifact_id: String =
+        sqlx::query_scalar("SELECT id FROM artifacts WHERE attempt_id = ? AND path = 'repeat.bin'")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    let published = fixture
+        .project
+        .join("artifacts")
+        .join(attempt_id.to_string())
+        .join(&artifact_id);
+    assert_eq!(fs::read(&published)?, b"same-data");
+    let counts_before = (
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM metric_documents WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM metrics WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM metric_selections WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM events WHERE kind = 'artifact_registered' AND attempt_id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_one(database.pool())
+        .await?,
+    );
+    assert_eq!(counts_before, (1, 1, 1, 1, 1));
+
+    supervisor.stop()?;
+    let updated = sqlx::query("UPDATE actions SET state = 'pending', available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ? AND state = 'succeeded'")
+        .bind(&action_id).execute(database.pool()).await?;
+    assert_eq!(updated.rows_affected(), 1);
+    supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let (state, attempts, last_error) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row: (String, i64, Option<String>) =
+                sqlx::query_as("SELECT state, attempts, last_error FROM actions WHERE id = ?")
+                    .bind(&action_id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if row.0 == "succeeded" && row.1 == 2 {
+                return Ok::<_, Box<dyn Error>>(row);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(state, "succeeded");
+    assert_eq!(attempts, 2);
+    assert_eq!(last_error, None);
+    assert_eq!(
+        fs::read_to_string(
+            fixture
+                .home
+                .join("state/igor/logs")
+                .join(attempt_id.to_string())
+                .join("extractor-runs")
+        )?,
+        "2\n"
+    );
+    assert_eq!(fs::read(&published)?, b"same-data");
+    let after = output_json(
+        fixture
+            .run()
+            .args(["metrics", &job_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(before, after);
+    let counts_after = (
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM metric_documents WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM metrics WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM metric_selections WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM artifacts WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?,
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM events WHERE kind = 'artifact_registered' AND attempt_id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_one(database.pool())
+        .await?,
+    );
+    assert_eq!(counts_after, counts_before);
+    assert_eq!(
+        database
+            .artifacts()
+            .get(artifact_id.parse()?)
+            .await?
+            .ok_or("missing artifact")?
+            .state,
+        igor_core::ArtifactPublicationState::Published
+    );
+    let detail = database.jobs().detail(job_id).await?.ok_or("missing job")?;
+    assert_eq!(detail.job.state, JobState::Succeeded);
+    assert_eq!(detail.attempts.len(), 1);
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metric_extractor_partial_result_keeps_artifacts_unpublished() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_extractor(
+        &fixture,
+        "#!/bin/sh\nset -eu\ncat > extractor-input.json\nprintf partial > partial.bin\nprintf '%s\n' '{\"schema_version\":1,\"status\":\"partial\",\"metrics\":{},\"artifacts\":[{\"path\":\"partial.bin\",\"role\":\"other\",\"role_detail\":\"partial\"}]}'\n",
+    )?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let attempt_id = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing job")?
+        .attempts
+        .last()
+        .ok_or("missing attempt")?
+        .spec
+        .id();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if database
+                .actions()
+                .document_for_attempt(attempt_id)
+                .await?
+                .is_some()
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let id: String = sqlx::query_scalar(
+        "SELECT id FROM artifacts WHERE attempt_id = ? AND path = 'partial.bin'",
+    )
+    .bind(attempt_id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let artifact = database
+        .artifacts()
+        .get(id.parse()?)
+        .await?
+        .ok_or("missing partial artifact")?;
+    assert_eq!(artifact.state, igor_core::ArtifactPublicationState::Staged);
+    assert!(artifact.metadata.get("published_path").is_none());
+    assert!(
+        !fixture
+            .project
+            .join("artifacts")
+            .join(attempt_id.to_string())
+            .exists()
+    );
+    assert_eq!(
+        fs::read(
+            fixture
+                .home
+                .join("state/igor/artifact-staging")
+                .join(attempt_id.to_string())
+                .join(&id)
+        )?,
+        b"partial"
+    );
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metric_extractor_malformed_json_retries_without_changing_job_outcome() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_extractor(&fixture, "#!/bin/sh\nprintf '{not json'\n")?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    let completed = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let completed: Value = serde_json::from_slice(&completed.stdout)?;
+    assert_eq!(completed["job"]["state"], "succeeded");
+
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let detail = database.jobs().detail(job_id).await?.ok_or("missing job")?;
+    assert_eq!(detail.job.state, JobState::Succeeded);
+    let attempt_id = detail.attempts.last().ok_or("missing attempt")?.spec.id();
+    assert_eq!(
+        database.actions().document_for_attempt(attempt_id).await?,
+        None
+    );
+    let (state, last_error) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row: (String, Option<String>) = sqlx::query_as(
+                "SELECT state, last_error FROM actions WHERE job_id = ? AND kind = 'extract_metrics'",
+            )
+            .bind(job_id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            if row.1.as_deref() == Some("invalid_extractor_json") {
+                return Ok::<_, Box<dyn Error>>(row);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await??;
+    assert!(
+        state == "pending" || state == "failed",
+        "unexpected action state {state}"
+    );
+    assert!(
+        last_error
+            .as_deref()
+            .is_some_and(|error| error == "invalid_extractor_json")
+    );
+    assert_eq!(
+        database.actions().document_for_attempt(attempt_id).await?,
+        None
+    );
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metric_extractor_restarts_from_an_expired_claim_without_losing_the_document() -> TestResult
+{
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_extractor(
+        &fixture,
+        "#!/bin/sh\nset -eu\ncat > extractor-input.json\ntouch extractor-started\ni=0\nwhile [ ! -f extractor-release ] && [ \"$i\" -lt 100 ]; do i=$((i+1)); sleep 0.1; done\n[ -f extractor-release ]\nprintf '%s\n' '{\"schema_version\":1,\"status\":\"success\",\"metrics\":{\"score\":0.75}}'\n",
+    )?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let attempt_id = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing extraction job")?
+        .attempts
+        .last()
+        .ok_or("missing extraction attempt")?
+        .spec
+        .id();
+    let attempt_dir = fixture
+        .home
+        .join("state/igor/logs")
+        .join(attempt_id.to_string());
+    wait_for_marker(&attempt_dir.join("extractor-started"))?;
+    assert!(
+        database
+            .actions()
+            .document_for_attempt(attempt_id)
+            .await?
+            .is_none()
+    );
+    supervisor.stop()?;
+    let action_id: String = sqlx::query_scalar(
+        "SELECT id FROM actions WHERE attempt_id = ? AND kind = 'extract_metrics'",
+    )
+    .bind(attempt_id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE actions SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
+        .bind(&action_id).execute(database.pool()).await?;
+    fs::write(attempt_dir.join("extractor-release"), b"ready")?;
+    supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let expected: Value =
+        serde_json::json!({"schema_version":1,"status":"success","metrics":{"score":0.75}});
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if database.actions().document_for_attempt(attempt_id).await? == Some(expected.clone())
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let (state, attempts): (String, i64) =
+        sqlx::query_as("SELECT state, attempts FROM actions WHERE id = ?")
+            .bind(&action_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(state, "succeeded");
+    assert_eq!(attempts, 2);
+    let documents: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metric_documents WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(documents, 1);
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(job_id)
+            .await?
+            .ok_or("missing job")?
+            .state,
+        JobState::Succeeded
+    );
+    supervisor.stop()?;
+    Ok(())
+}
+
+async fn assert_metric_extractor_failure_reaches_terminal_state(
+    script: &str,
+    expected_error: &str,
+) -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_extractor(&fixture, script)?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    let completed = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    let completed: Value = serde_json::from_slice(&completed.stdout)?;
+    assert_eq!(completed["job"]["state"], "succeeded");
+
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let detail = database.jobs().detail(job_id).await?.ok_or("missing job")?;
+    assert_eq!(detail.job.state, JobState::Succeeded);
+    assert_eq!(detail.attempts.len(), 1);
+    let attempt = detail.attempts.last().ok_or("missing attempt")?;
+    assert_eq!(attempt.state, AttemptState::Succeeded);
+    let attempt_id = attempt.spec.id();
+
+    // Claim the pending action on its last allowed attempt without waiting for backoff.
+    let armed = sqlx::query(
+        "UPDATE actions SET attempts = 2, available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second')
+         WHERE attempt_id = ? AND kind = 'extract_metrics' AND state = 'pending'",
+    )
+    .bind(attempt_id.to_string())
+    .execute(database.pool())
+    .await?;
+    assert_eq!(armed.rows_affected(), 1);
+
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let (state, last_error, attempts): (String, Option<String>, i64) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row: (String, Option<String>, i64) = sqlx::query_as(
+                    "SELECT state, last_error, attempts FROM actions WHERE attempt_id = ? AND kind = 'extract_metrics'",
+                )
+                .bind(attempt_id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+                if row.0 == "failed" {
+                    return Ok::<_, Box<dyn Error>>(row);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+    assert_eq!(state, "failed");
+    assert_eq!(last_error.as_deref(), Some(expected_error));
+    assert_eq!(attempts, 3);
+    assert_eq!(
+        database.actions().document_for_attempt(attempt_id).await?,
+        None
+    );
+    let documents: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metric_documents WHERE attempt_id = ?")
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(documents, 0);
+    let artifacts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE attempt_id = ?")
+        .bind(attempt_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(artifacts, 0);
+    assert!(
+        !fixture
+            .project
+            .join("artifacts")
+            .join(attempt_id.to_string())
+            .exists()
+    );
+
+    let detail = database.jobs().detail(job_id).await?.ok_or("missing job")?;
+    assert_eq!(detail.job.state, JobState::Succeeded);
+    assert_eq!(detail.attempts.len(), 1);
+    assert_eq!(detail.attempts[0].state, AttemptState::Succeeded);
+    let metrics = output_json(
+        fixture
+            .run()
+            .args(["metrics", &job_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(metrics["job_id"], job_id.to_string());
+    assert_eq!(metrics["attempts"][0]["attempt_id"], attempt_id.to_string());
+    assert_eq!(metrics["attempts"][0]["action_state"], "failed");
+    assert_eq!(metrics["attempts"][0]["last_error"], expected_error);
+    assert_eq!(metrics["attempts"][0]["document"], Value::Null);
+    assert_eq!(metrics["attempts"][0]["metrics"], json!([]));
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metric_extractor_failure_nonzero_exit_reaches_terminal_state() -> TestResult {
+    assert_metric_extractor_failure_reaches_terminal_state(
+        "#!/bin/sh\ncat > /dev/null\nexit 17\n",
+        "extractor_exited_nonzero",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn metric_extractor_failure_invalid_json_reaches_terminal_state() -> TestResult {
+    assert_metric_extractor_failure_reaches_terminal_state(
+        "#!/bin/sh\ncat > /dev/null\nprintf '{not json'\n",
+        "invalid_extractor_json",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn metric_extractor_failure_artifact_registration_reaches_terminal_state() -> TestResult {
+    assert_metric_extractor_failure_reaches_terminal_state(
+        "#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{\"schema_version\":1,\"status\":\"success\",\"metrics\":{\"score\":1},\"artifacts\":[{\"path\":\"missing.bin\",\"role\":\"other\",\"role_detail\":\"raw\"}]}'\n",
+        "artifact_registration_failed",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn metric_extractor_rejects_invalid_result_fixtures_without_publishing() -> TestResult {
+    for (case, document, error) in [
+        ("malformed", "{broken", "invalid_extractor_json"),
+        (
+            "missing status",
+            r#"{"schema_version":1,"metrics":{}}"#,
+            "invalid_extractor_schema",
+        ),
+        (
+            "missing metrics",
+            r#"{"schema_version":1,"status":"success"}"#,
+            "invalid_extractor_schema",
+        ),
+        (
+            "duplicate top-level key",
+            r#"{"schema_version":1,"status":"failed","status":"success","metrics":{}}"#,
+            "invalid_extractor_json",
+        ),
+        (
+            "duplicate nested key",
+            r#"{"schema_version":1,"status":"success","metrics":{"score":0.5,"score":0.75}}"#,
+            "invalid_extractor_json",
+        ),
+        (
+            "duplicate artifact property",
+            r#"{"schema_version":1,"status":"success","metrics":{},"artifacts":[{"path":"bad","path":"other","role":"metrics"}]}"#,
+            "invalid_extractor_json",
+        ),
+        (
+            "nonfinite token",
+            r#"{"schema_version":1,"status":"success","metrics":{"score":NaN}}"#,
+            "invalid_extractor_json",
+        ),
+        (
+            "overflowing number",
+            r#"{"schema_version":1,"status":"success","metrics":{"score":1e999}}"#,
+            "invalid_extractor_json",
+        ),
+        (
+            "unsupported version",
+            r#"{"schema_version":2,"status":"success","metrics":{}}"#,
+            "invalid_extractor_schema",
+        ),
+    ] {
+        let script = format!("#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{document}'\n");
+        if let Err(failure) =
+            assert_metric_extractor_failure_reaches_terminal_state(&script, error).await
+        {
+            return Err(format!("{case}: {failure}").into());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_cli_shows_pending_and_published_attempt_without_losing_names() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let document = r#"{"schema_version":1,"status":"success","metrics":{"score one":0.75,"other":-2.5},"selection":{"split":"validation","metric":"score one","value":0.75}}"#;
+    configure_metric_extractor(
+        &fixture,
+        &format!("#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{document}'\n"),
+    )?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let pending = output_json(
+        fixture
+            .run()
+            .args(["metrics", &job_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(pending["job_id"], job_id.to_string());
+    assert_eq!(
+        pending["attempts"]
+            .as_array()
+            .ok_or("missing attempts")?
+            .len(),
+        1
+    );
+    assert_eq!(pending["attempts"][0]["action_state"], "pending");
+    assert_eq!(pending["attempts"][0]["document"], Value::Null);
+    let attempt_id = pending["attempts"][0]["attempt_id"]
+        .as_str()
+        .ok_or("missing attempt id")?;
+    let attempt_id: igor_core::AttemptId = attempt_id.parse()?;
+
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let published = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let output = output_json(
+                fixture
+                    .run()
+                    .args(["metrics", &job_id.to_string(), "--json"])
+                    .output()?,
+            )?;
+            if output["attempts"][0]["action_state"] == "succeeded" {
+                return Ok::<_, Box<dyn Error>>(output);
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        published["attempts"][0]["attempt_id"],
+        attempt_id.to_string()
+    );
+    assert_eq!(
+        published["attempts"][0]["document"],
+        serde_json::from_str::<Value>(document)?
+    );
+    assert_eq!(published["attempts"][0]["selection"]["split"], "validation");
+    assert_eq!(
+        published["attempts"][0]["metrics"],
+        json!([["other", -2.5], ["score one", 0.75]])
+    );
+    let human = fixture
+        .run()
+        .args(["metrics", &job_id.to_string()])
+        .output()?;
+    assert!(human.status.success());
+    assert!(String::from_utf8(human.stdout)?.contains("score one: 0.75"));
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_cli_distinguishes_unconfigured_job_and_missing_job() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let result = output_json(
+        fixture
+            .run()
+            .args(["metrics", &job_id.to_string(), "--json"])
+            .output()?,
+    )?;
+    assert_eq!(result["attempts"][0]["action_state"], Value::Null);
+    assert_eq!(result["attempts"][0]["document"], Value::Null);
+    let missing = fixture
+        .run()
+        .args(["metrics", &JobId::new().to_string(), "--json"])
+        .output()?;
+    assert_eq!(missing.status.code(), Some(8));
+    Ok(())
+}
+
+#[tokio::test]
+async fn metrics_cli_reads_large_document_beyond_request_frame_limit() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let mut metrics = serde_json::Map::new();
+    for index in 0..2_000 {
+        metrics.insert(format!("{index:04}-{}", "x".repeat(250)), json!(0.5));
+    }
+    let document = serde_json::to_string(&json!({
+        "schema_version": 1,
+        "status": "success",
+        "metrics": metrics,
+    }))?;
+    assert!(document.len() < 1024 * 1024);
+    configure_metric_extractor(
+        &fixture,
+        &format!("#!/bin/sh\ncat > /dev/null\nprintf '%s\\n' '{document}'\n"),
+    )?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let output = output_json(
+                fixture
+                    .run()
+                    .args(["metrics", &job_id.to_string(), "--json"])
+                    .output()?,
+            )?;
+            if output["attempts"][0]["action_state"] == "succeeded" {
+                return Ok::<_, Box<dyn Error>>(output);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    let encoded = serde_json::to_vec(&result)?;
+    assert!(encoded.len() > 1024 * 1024);
+    assert_eq!(
+        result["attempts"][0]["metrics"]
+            .as_array()
+            .ok_or("missing indexed metrics")?
+            .len(),
+        2_000
+    );
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn telegram_includes_indexed_metrics_when_extraction_finishes_before_delivery() -> TestResult
+{
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    const TOKEN: &str = "123456:abcdefghijklmnopqrstuvwxyzABCDEFG";
+    let _guard = worker_test_guard()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let config = format!(
+        "schema_version = 1\n[telegram]\nbot_token = '{TOKEN}'\nchat_id = '12345'\napi_base = 'http://{}'\n",
+        listener.local_addr()?
+    );
+    let fixture = Fixture::with_global_config(Some(&config))?;
+    configure_metric_extractor(
+        &fixture,
+        "#!/bin/sh\nset -eu\ncat > /dev/null\nprintf '%s\n' '{\"schema_version\":1,\"status\":\"success\",\"metrics\":{\"alpha\":0.7,\"f1 score\":0.9}}'\n",
+    )?;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let boundary = loop {
+            let count = stream.read(&mut chunk).await?;
+            if count == 0 || received.len() + count > 64 * 1024 {
+                return Err(std::io::Error::other("invalid Telegram request"));
+            }
+            received.extend_from_slice(&chunk[..count]);
+            if let Some(offset) = received.windows(4).position(|part| part == b"\r\n\r\n") {
+                break offset + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&received[..boundary]);
+        if !headers.contains("/sendMessage") {
+            return Err(std::io::Error::other("unexpected Telegram endpoint"));
+        }
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+            })
+            .ok_or_else(|| std::io::Error::other("missing Telegram Content-Length"))?;
+        if content_length > 64 * 1024 {
+            return Err(std::io::Error::other("oversized Telegram request"));
+        }
+        while received.len() - boundary < content_length {
+            let count = stream.read(&mut chunk).await?;
+            if count == 0 {
+                return Err(std::io::Error::other("truncated Telegram body"));
+            }
+            received.extend_from_slice(&chunk[..count]);
+        }
+        let payload: Value = serde_json::from_slice(&received[boundary..boundary + content_length])
+            .map_err(std::io::Error::other)?;
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await?;
+        Ok::<_, std::io::Error>(payload)
+    });
+
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    let waited = fixture.run().args(["wait", &job_id.to_string()]).output()?;
+    assert!(
+        waited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let detail = database.jobs().detail(job_id).await?.ok_or("missing job")?;
+    let attempt_id = detail.attempts[0].spec.id();
+    let held = sqlx::query(
+        "UPDATE actions SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+120 seconds')
+         WHERE job_id = ? AND kind = 'send_notification' AND state = 'pending'",
+    )
+    .bind(job_id.to_string())
+    .execute(database.pool())
+    .await?;
+    assert_eq!(held.rows_affected(), 1);
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if database
+                .actions()
+                .document_for_attempt(attempt_id)
+                .await?
+                .is_some()
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        database.deliveries().available_metrics(attempt_id).await?,
+        [("alpha".into(), 0.7), ("f1 score".into(), 0.9)]
+    );
+    let released = sqlx::query(
+        "UPDATE actions SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second')
+         WHERE job_id = ? AND kind = 'send_notification' AND state = 'pending'",
+    )
+    .bind(job_id.to_string())
+    .execute(database.pool())
+    .await?;
+    assert_eq!(released.rows_affected(), 1);
+    let payload = tokio::time::timeout(Duration::from_secs(10), server).await???;
+    assert_eq!(payload["chat_id"], "12345");
+    let text = payload["text"].as_str().ok_or("missing Telegram message")?;
+    assert!(text.contains("alpha: 0.7"), "{text}");
+    assert!(text.contains("f1 score: 0.9"), "{text}");
+    assert!(text.contains(&job_id.to_string()), "{text}");
+    assert!(
+        text.find("f1 score").ok_or("missing metric")?
+            < text.find("Job:").ok_or("missing job identity")?
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state: Option<String> = sqlx::query_scalar("SELECT state FROM deliveries WHERE idempotency_key IN (SELECT 'telegram:action:' || id FROM actions WHERE job_id = ? AND kind = 'send_notification')")
+                .bind(job_id.to_string()).fetch_optional(database.pool()).await?;
+            if state.as_deref() == Some("delivered") {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await??;
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(job_id)
+            .await?
+            .ok_or("missing job")?
+            .state,
+        JobState::Succeeded
+    );
+    supervisor.stop()?;
+    Ok(())
+}
+
+fn configure_metric_fixture(fixture: &Fixture, name: &str) -> TestResult {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/metrics")
+        .join(name);
+    let executable = fixture.project.join("fixture-extractor");
+    if name == "native.rs" {
+        let compiled = Command::new("rustc")
+            .args(["--edition=2024", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()?;
+        assert!(
+            compiled.status.success(),
+            "native fixture failed to compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+    } else {
+        fs::copy(&source, &executable)?;
+    }
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
+    fs::write(
+        fixture.project.join(".igor/project.toml"),
+        "schema_version = 1\n[results]\nextractor = ['./fixture-extractor']\nworking_directory = 'attempt'\n",
+    )?;
+    git(
+        &fixture.project,
+        &["add", "fixture-extractor", ".igor/project.toml"],
+    )?;
+    git(
+        &fixture.project,
+        &["commit", "-qm", "add extractor fixture"],
+    )?;
+    Ok(())
+}
+
+async fn run_metric_fixture(
+    name: &str,
+    expected_metrics: Value,
+    expected_selection: Value,
+    artifact_path: &str,
+    artifact_contents: &str,
+) -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_fixture(&fixture, name)?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    let waited = fixture.run().args(["wait", &job_id.to_string()]).output()?;
+    assert!(
+        waited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
+    );
+
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let detail = database.jobs().detail(job_id).await?.ok_or("missing job")?;
+    assert_eq!(detail.job.state, JobState::Succeeded);
+    assert_eq!(detail.attempts.len(), 1);
+    assert_eq!(detail.attempts[0].state, AttemptState::Succeeded);
+    let attempt_id = detail.attempts[0].spec.id();
+    let reported = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let result = output_json(
+                fixture
+                    .run()
+                    .args(["metrics", &job_id.to_string(), "--json"])
+                    .output()?,
+            )?;
+            if result["attempts"][0]["action_state"] == "succeeded" {
+                return Ok::<_, Box<dyn Error>>(result);
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await??;
+    let reported = &reported["attempts"][0];
+    assert_eq!(reported["attempt_id"], attempt_id.to_string());
+    assert_eq!(reported["last_error"], Value::Null);
+    assert_eq!(reported["document"]["status"], "success");
+    assert_eq!(reported["document"]["metrics"], expected_metrics);
+    assert_eq!(reported["selection"], expected_selection);
+    assert_eq!(
+        reported["document"]["artifacts"],
+        json!([{
+            "path": artifact_path,
+            "role": "metrics"
+        }])
+    );
+    let mut indexed = expected_metrics
+        .as_object()
+        .ok_or("expected scalar metrics")?
+        .iter()
+        .map(|(key, value)| Ok(json!([key, value.as_f64().ok_or("non-numeric metric")?])))
+        .collect::<Result<Vec<Value>, Box<dyn Error>>>()?;
+    indexed.sort_by(|a, b| a[0].as_str().cmp(&b[0].as_str()));
+    assert_eq!(reported["metrics"], json!(indexed));
+
+    let artifact_id: String =
+        sqlx::query_scalar("SELECT id FROM artifacts WHERE attempt_id = ? AND path = ?")
+            .bind(attempt_id.to_string())
+            .bind(artifact_path)
+            .fetch_one(database.pool())
+            .await?;
+    let artifact = database
+        .artifacts()
+        .get(artifact_id.parse()?)
+        .await?
+        .ok_or("missing artifact")?;
+    assert_eq!(
+        artifact.state,
+        igor_core::ArtifactPublicationState::Published
+    );
+    let source = fixture
+        .home
+        .join("state/igor/logs")
+        .join(attempt_id.to_string())
+        .join(artifact_path);
+    let published = fixture
+        .project
+        .join("artifacts")
+        .join(attempt_id.to_string())
+        .join(artifact_id);
+    let bytes = fs::read(&published)?;
+    assert_eq!(fs::read(source)?, bytes);
+    let contents = String::from_utf8(bytes.clone())?;
+    assert_eq!(contents, artifact_contents);
+    assert_eq!(artifact.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(
+        artifact.sha256,
+        Some(format!("sha256:{:x}", sha2::Sha256::digest(&bytes)))
+    );
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn python_fixture_extracts_metrics_from_attempt_log() -> TestResult {
+    run_metric_fixture(
+        "python.py",
+        json!({"python bytes": 15, "python score": 0.625}),
+        json!({"split": "validation", "metric": "python score", "value": 0.625}),
+        "python-summary.txt",
+        "training-output",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn julia_compatible_shell_fixture_publishes_json_and_artifact() -> TestResult {
+    run_metric_fixture(
+        "julia-output.sh",
+        json!({"Julia score": 0.875, "loss_final": 0.125}),
+        json!({"split": "validation", "metric": "Julia score", "value": 0.875}),
+        "julia-metrics.txt",
+        "julia score: 0.875\n",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn native_binary_fixture_publishes_json_and_artifact() -> TestResult {
+    run_metric_fixture(
+        "native.rs",
+        json!({"native bytes": 15, "native score": 0.9375}),
+        Value::Null,
+        "native-metrics.txt",
+        "stdout bytes: 15\n",
+    )
+    .await
+}
+
 fn process_fixture(name: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/process")
@@ -1457,7 +2808,11 @@ async fn fake_docker_cancellation_stops_and_finalizes_before_cleanup() -> TestRe
         .run()
         .args(["cancel", &job_id.to_string(), "--grace-seconds", "2"])
         .output()?;
-    assert!(cancelled.status.success());
+    assert!(
+        cancelled.status.success(),
+        "cancel failed: {}",
+        String::from_utf8_lossy(&cancelled.stderr)
+    );
     let waited = fixture
         .run()
         .args(["wait", &job_id.to_string(), "--json"])
@@ -1578,11 +2933,7 @@ async fn fake_docker_timeout_kills_and_persists_failure() -> TestResult {
         .ok_or("missing timed-out Docker job")?;
     assert_eq!(detail.job.state, JobState::Failed);
     assert_eq!(detail.attempts[0].state, AttemptState::Failed);
-    let container = database
-        .jobs()
-        .container_for_attempt(running.attempt_id)
-        .await?
-        .ok_or("missing timed-out Docker container")?;
+    let container = wait_for_removed_container(&database, running.attempt_id).await?;
     assert_eq!(container.state, DockerContainerState::Removed);
     assert_eq!(container.exit_code, Some(137));
     assert_eq!(
@@ -4094,7 +5445,8 @@ async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_wo
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await??;
+    .await
+    .map_err(|_| "Telegram delivery did not record rate limiting within 10 seconds")??;
     // A rate-limited notification endpoint cannot hold the worker queue.
     let next_job = submit("/usr/bin/env")?;
     let next = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4107,7 +5459,8 @@ async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_wo
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await?;
+    .await
+    .map_err(|_| "next worker job did not finish during Telegram retry")?;
     next?;
     let logs = database.jobs().logs_for_job(next_job).await?;
     let stdout = logs.stdout_path.ok_or("missing environment job log")?;
@@ -4116,7 +5469,7 @@ async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_wo
     sqlx::query("UPDATE deliveries SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
         .bind(&delivery_id).execute(database.pool()).await?;
     supervisor = spawn_supervisor()?;
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let recovered = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let state: String = sqlx::query_scalar("SELECT state FROM deliveries WHERE id = ?")
                 .bind(&delivery_id)
@@ -4128,7 +5481,20 @@ async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_wo
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await??;
+    .await;
+    if recovered.is_err() {
+        let row: (String, i64, String, Option<String>) = sqlx::query_as(
+            "SELECT state, attempts, available_at, claim_id FROM deliveries WHERE id = ?",
+        )
+        .bind(&delivery_id)
+        .fetch_one(database.pool())
+        .await?;
+        return Err(format!(
+            "Telegram delivery not recovered: state={}, attempts={}, available_at={}, claimed={}, supervisor_exit={:?}, server_finished={}",
+            row.0, row.1, row.2, row.3.is_some(), supervisor.0.try_wait()?, server.is_finished()
+        ).into());
+    }
+    recovered??;
     let error: Option<String> =
         sqlx::query_scalar("SELECT last_error FROM deliveries WHERE id = ?")
             .bind(&delivery_id)

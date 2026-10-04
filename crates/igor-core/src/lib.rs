@@ -10,6 +10,7 @@ mod family;
 mod id;
 mod inventory;
 mod job;
+mod metric;
 pub mod persistence;
 mod project;
 mod resource;
@@ -18,7 +19,7 @@ mod state;
 mod submission;
 pub mod telemetry;
 
-pub use artifact::{ArtifactRole, RetentionDecision};
+pub use artifact::{ArtifactPublicationState, ArtifactRole, RetentionDecision};
 pub use command::{
     CommandSpec, EnvironmentInheritance, EnvironmentPolicy, ShellPolicy,
     environment_variable_is_sensitive,
@@ -55,19 +56,21 @@ pub use job::{
     AttemptSpec, ConfigurationIdentity, ContentIdentity, ContentRole, FamilyMembership,
     GenerationIdentity, GitIdentity, JobSpec, ResultContract, Seed, SourceIdentity,
 };
+pub use metric::{MetricDocumentError, parse_metric_document_json, validate_metric_document};
 pub use persistence::{
-    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, Claim, ClaimedAction,
-    ClaimedDelivery, ComparableGeneration, ContainerCreate, ContainerFinish, ContainerRecord,
-    Database, DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim,
-    ExecutionOutcome, Family, FamilyDetail, FamilyGenerationDetail, FamilyGenerationRepository,
-    Generation, GenerationStatus, IntegrityCheck, JobAttemptRepository, JobDetail, JobLogs,
-    PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, RecoveredExecution, Resource,
-    ResourceLease, ResourceRepository, ResourceStatus, StoredAttempt, StoredEvent, StoredJob,
-    UnitRecord, UnitReservation,
+    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, AttemptLogPaths,
+    AttemptMetrics, Claim, ClaimedAction, ClaimedDelivery, ComparableGeneration, ContainerCreate,
+    ContainerFinish, ContainerRecord, Database, DatabaseOptions, DeliveryRecord,
+    DeliveryRepository, EventRepository, ExecutionClaim, ExecutionOutcome, Family, FamilyDetail,
+    FamilyGenerationDetail, FamilyGenerationRepository, Generation, GenerationStatus,
+    IntegrityCheck, JobAttemptRepository, JobDetail, JobLogs, PersistenceError, ProcessRecord,
+    ProcessStart, ProjectRepository, RecoveredExecution, Resource, ResourceLease,
+    ResourceRepository, ResourceStatus, StoredAttempt, StoredEvent, StoredJob, UnitRecord,
+    UnitReservation,
 };
 pub use project::{
     PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,
-    ReportGenerator, ReportMode, ReportTrigger,
+    ReportGenerator, ReportMode, ReportTrigger, ResultsConfig,
 };
 pub use resource::{
     GpuRequest, NamedResourceMode, NamedResourceRequest, ResourceMode, ResourceRequest,

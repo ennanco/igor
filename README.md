@@ -318,6 +318,65 @@ Five-seed partial, failed, retried and repaired generations are covered by
 disposable-repository tests. The current-generation aggregate and its exclusion
 of old attempts will be verified when metrics and reports are available.
 
+## Metric Result Contract
+
+Project metric extractors will emit one JSON document per attempt, following the
+versioned [metric-result v1 JSON Schema](schemas/metric-result-v1.schema.json).
+See the [example output](config/example-metric-result-v1.json). Metric names and
+class names are project-defined; selection metadata and declared artifacts are
+optional. A project can freeze an extractor in `.igor/project.toml`:
+
+```toml
+[results]
+extractor = ["./scripts/export_igor_metrics.py"]
+working_directory = "attempt"
+```
+
+The program runs directly, without a shell; a project-relative executable is
+resolved inside the registered project. Arguments remain literal and will be
+interpreted relative to the attempt directory when executed. A successful
+attempt enqueues an independent supervisor action. The extractor receives one
+JSON line on stdin with only that attempt's IDs and verified stdout/stderr log
+paths, and runs with a cleared environment apart from `PATH`. Its JSON output
+is validated as v1 and stored durably before the action succeeds; if extraction
+exhausts its retries, its action fails while the job and attempt remain
+successful. Duplicate JSON keys (even when escaped), malformed or non-finite
+numbers, missing required fields and unsupported versions are rejected before
+publication. Igor indexes the top-level scalar metrics by their project-defined
+names and stores the optional selection split, metric, value, epochs and
+checkpoint declaration alongside the original document. Igor registers declared
+attempt files with their role, actual byte size and verified SHA-256, then copies
+them to a private per-attempt staging directory with state `staged`. For a
+successful extractor result, Igor verifies the complete set, atomically renames
+its attempt directory under the frozen project `artifact_root`, and marks every
+artifact `published` with the metric document in one database transaction. A
+partial or failed extractor result keeps declared outputs staged. After an
+interruption, consult the database state rather than directory presence to
+determine what has been published.
+
+Repeating an identical extraction verifies existing published bytes without
+duplicating its document, scalar metrics, selection or registered artifact.
+When Telegram delivery occurs after extraction, its message can include up to
+ten indexed metrics for that attempt; earlier deliveries do not wait for
+extraction.
+
+Run `igor metrics JOB_ID` to see the extraction state, indexed scalar values
+and selection for each attempt. `igor metrics JOB_ID --json` returns `job_id`
+and an `attempts` array in attempt order. Every entry includes `attempt_id`,
+`action_state`, `last_error`, the original `document`, `selection`, and all
+indexed scalar `metrics` as `[name, value]` pairs sorted by name. A missing
+extraction action has `action_state: null`; a pending or failed action can have
+`document: null`. Results remain associated with their own attempt, including
+after a job is retried. A nonexistent job returns exit code `8`.
+
+The [extractor fixtures](crates/igor-cli/tests/fixtures/metrics) demonstrate
+Python standard-library parsing of the attempt's stdout, a POSIX shell
+emitting Julia-compatible JSON without a Julia installation, and a native Rust
+binary reading the attempt log. Integration tests compile the native source,
+copy the scripts as executables, run each in an isolated attempt and verify
+its scalar metrics and published artifact. The shell fixture uses a fixed
+sample result for the `training-output` test log.
+
 ## Database Integrity
 
 Check an existing Igor database without starting a daemon or applying migrations:
@@ -366,11 +425,11 @@ report failures to stderr with a nonzero exit status.
 
 | Contract | Version in this build | Compatibility behavior |
 | --- | --- | --- |
-| Worker/supervisor Unix-socket protocol | `9` | CLI and daemon must use the same version; mismatches are rejected (exit `4`). |
+| Worker/supervisor Unix-socket protocol | `11` | CLI and daemon must use the same version; mismatches are rejected (exit `4`). |
 | Global and project TOML | `1` each | The reader rejects unsupported `schema_version` values; it does not rewrite these files on read. |
 | Job and family TOML | `1` each | Submission rejects unsupported versions before creating jobs. |
 | Event payloads | `1` | Unsupported versions are rejected when decoded. |
-| SQLite schema | `9` | Numbered, checksummed SQLx migrations run on writable worker startup or explicit `igor db migrate`. |
+| SQLite schema | `12` | Numbered, checksummed SQLx migrations run on writable worker startup or explicit `igor db migrate`. |
 
 Upgrade the CLI and both user services together; restart the services so they
 run the new binary (`igor service restart` if installed). Before a database

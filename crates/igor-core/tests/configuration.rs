@@ -148,6 +148,52 @@ fn minimal_project_has_unrestricted_exclusive_defaults() -> Result<(), Box<dyn E
 }
 
 #[test]
+fn results_configuration_is_optional_and_strict() -> Result<(), Box<dyn Error>> {
+    let temporary = TempDir::new()?;
+    let config = temporary.path().join(".igor/project.toml");
+    write(&config, "schema_version = 1\n")?;
+    let omitted = load_project_config(&config)?;
+    assert!(omitted.config.results.is_none());
+    let serialized = serde_json::to_value(&omitted.config)?;
+    assert!(serialized.get("results").is_none());
+
+    write(
+        &config,
+        "schema_version = 1\n[results]\nextractor = ['python3', 'script.py']\nworking_directory = 'attempt'\n",
+    )?;
+    let loaded = load_project_config(&config)?;
+    assert_eq!(
+        loaded
+            .config
+            .results
+            .as_ref()
+            .ok_or("results missing")?
+            .extractor,
+        ["python3", "script.py"]
+    );
+    for results in [
+        "extractor = []",
+        "extractor = ['', 'arg']",
+        "extractor = ['   ']",
+        "extractor = ['python3']\nworking_directory = 'project'",
+        "extractor = ['python3']\nunknown = true",
+    ] {
+        write(
+            &config,
+            &format!("schema_version = 1\n[results]\n{results}\n"),
+        )?;
+        assert!(
+            load_project_config(&config).is_err(),
+            "accepted results config: {results}"
+        );
+    }
+    let mut configured = loaded.config.results.ok_or("results missing")?;
+    configured.extractor.push("bad\0arg".into());
+    assert!(configured.validate().is_err());
+    Ok(())
+}
+
+#[test]
 fn relative_paths_are_normalized_and_cannot_escape() -> Result<(), Box<dyn Error>> {
     let temporary = TempDir::new()?;
     let config = temporary.path().join(".igor/project.toml");

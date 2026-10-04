@@ -474,7 +474,7 @@ and current member states in one SQLite read transaction. It returns members
 ordered by submission and generations ordered by number. State counts include
 every job state, with zero-valued entries for absent states, both per
 generation and across the family. These are current **job** counts, not the
-number of attempts. In protocol v9, `family_show`, `family_supersede` and their
+number of attempts. In protocol v11, `family_show`, `family_supersede` and their
 responses require matching CLI/daemon versions.
 
 Each generation exposes a status assessed from the immutable required seed
@@ -519,6 +519,9 @@ states and history remain untouched. A stale or concurrent supersession cannot
 publish a second successor; failure at any insertion rolls the whole change
 back. This command does not apply an agent repair or implicitly cancel work;
 the approval-controlled repair workflow remains in M16.
+The SQLite transaction reserves a write on the family row before inspecting
+the current generation so competing worker writes cannot invalidate a deferred
+read snapshot before publication.
 
 M11.13 exercises a five-seed family against a disposable Git repository and
 real local worker. A held first seed demonstrates `incomplete` while the other
@@ -655,9 +658,125 @@ split. A project-specific command translates artifacts into versioned JSON:
 
 ```toml
 [results]
-extractor = ["python", "scripts/export_igor_metrics.py"]
+extractor = ["./scripts/export_igor_metrics.py"]
 working_directory = "attempt"
 ```
+
+`[results]` is optional in project configuration v1. Its extractor is a
+non-empty direct program-and-arguments vector; no shell or argument rewriting
+is implicit. Bare program names use `PATH`, absolute programs are explicit,
+and a relative program containing `/` is resolved within the registered
+project root before submission. The arguments remain literal; relative
+argument paths are resolved from the future attempt working directory, so a
+project script should normally be the executable itself with a shebang.
+Submission freezes the resolved command in every attempt's result contract
+with no inherited environment, and all members of one family must have the
+same frozen extractor. On successful execution, finalizing an attempt also
+enqueues a uniquely keyed `extract_metrics` action in the same SQLite
+transaction. The supervisor processes extraction independently from Telegram
+and worker scheduling: it runs the frozen direct command in the private attempt
+log directory with a cleared environment (only `PATH` is provided). Standard
+input is one JSON line with `schema_version`, project/job/attempt IDs, optional
+family/generation/seed identity, and only the persisted `stdout.log` and
+`stderr.log` paths for that attempt. These paths are checked against the
+attempt directory before invocation; this context is not a process sandbox.
+The extractor has no default timeout, heartbeats its fenced action lease, and
+limits captured stdout to 1 MiB and stderr to 64 KiB. Shutdown terminates the
+owned child, leaving the durable action to be reclaimed on restart.
+
+The supervisor parses and validates result JSON against the v1 structural
+contract. Schema errors and child failures retry the action without changing
+the successful job/attempt outcome. After the third claim fails, only the
+independent `extract_metrics` action becomes `failed`; the job and attempt
+remain `succeeded`. End-to-end tests cover nonzero exit, malformed JSON and a
+missing declared artifact at the terminal retry boundary. Migration `0010`
+stores the original structured result in `metric_documents` keyed by attempt
+ID. In one fenced transaction Igor stores the validated document, marks the
+action succeeded, and appends its event; an existing different document cannot
+be overwritten.
+The completion transaction reserves the claimed action row before reading or
+indexing results, avoiding a read-to-write upgrade against a stale WAL snapshot.
+M12.07 indexes arbitrary top-level scalar names and finite values in `metrics`;
+per-class structures remain in the original document. M12.08 records the
+optional selection split, criterion, value, epoch counters and checkpoint
+declaration in `metric_selections` (migration `0011`), retaining the original
+selection JSON for exact replay comparisons. Both indexes publish in the same
+fenced transaction as the original document and action outcome. A conflicting
+existing scalar or selection rolls back the whole operation; equal values can
+be replayed without duplicate rows. Selection checkpoint paths are only
+declarations until M12.10–M12.11 stage and publish artifacts. M12.15 parses
+extractor stdout with a recursive JSON visitor before v1 validation: duplicate
+object keys, including escaped aliases at any depth, are rejected rather than
+silently replaced by the last occurrence. Malformed JSON and non-finite number
+tokens fail parsing; missing fields and unsupported schema versions fail v1
+validation. These failures retry only `extract_metrics`, without publishing a
+document or changing the successful experiment outcome.
+
+M12.09 registers each declared artifact before completing its extraction
+action. The declaration is an attempt-relative path and role (with optional
+claimed SHA-256). Igor accepts only a regular file inside the attempt's
+persisted log directory: parent symlinks and `..`/absolute paths are rejected,
+the file is opened without following a final symlink, and size and SHA-256 are
+computed by streaming its bytes. A claimed digest must match Igor's hash.
+Registration is fenced by the active extractor claim, records an
+`artifact_registered` event and is idempotent for the same path/role/bytes;
+a changed file or role conflicts. The result document cannot complete its
+action until all declared paths are registered. Migration `0012` adds
+`size_bytes` and distinct `registered`, `staged`, `published`, `removed`
+states while preserving legacy published rows with unknown size. Registration
+does **not** mean publication. M12.10 copies each registered output to
+`STATE_DIR/artifact-staging/ATTEMPT_ID/ARTIFACT_ID` before completing the
+extractor action. The copy is created privately through a temporary file,
+stream-verified against the registered size/digest, synced and renamed in its
+own attempt directory before the artifact state becomes `staged`. A restart
+between rename and state update adopts only a matching staged file; a changed
+source, mismatched copy, symlinked staging root or expired action claim is
+rejected without marking it published. `staged_path` is kept in artifact
+metadata for recovery. M12.11 rechecks the complete staged set before reports
+or retention rely on it.
+
+M12.11 freezes the configured project `artifact_root` into the successful
+attempt's result contract (protocol v10; absent on older attempts). The
+supervisor copies staged bytes to a private sibling directory beneath this
+root, verifies every declared artifact by size and digest, removes only
+Igor-named partial copy temps, and atomically renames the **whole attempt
+directory** to `ARTIFACT_ROOT/ATTEMPT_ID`. It then commits the original metric
+document, indexes and all `published` artifact states/paths in one SQLite
+transaction with the successful action event. A crash after the directory
+rename but before SQLite commit leaves the completed files visible but their
+database state `staged`; recovery adopts only a complete matching directory.
+No partial directory appears at the final path. Only a document with
+`status = "success"` publishes artifacts; partial/failed extractor documents
+keep their outputs staged. Filesystem rename and SQLite commit cannot form one
+kernel transaction: consumers use the durable database publication state, not
+directory presence, as the publication authority.
+
+Repeating a successful extraction rechecks staged and already published files
+against their registered size, digest, frozen root and recorded paths. An
+identical replay publishes no second document, scalar, selection or artifact;
+a changed file or mismatched publication path remains a conflict. The action
+claim still fences the repeated operation.
+
+Telegram deliveries select up to ten indexed scalars for their own attempt at
+send time. If extraction completes before the delivery is claimed, the
+notification includes the available project-defined metrics before the job ID.
+Extraction and delivery run independently, so an earlier delivery may omit
+metrics; it does not wait for extraction.
+
+M12.13 adds `igor metrics JOB_ID [--json]` via worker protocol v11. The
+response lists every attempt separately, preserving each extraction action's
+state and last error, original validated document, selection and uncapped
+indexed scalar names/values. Each attempt's rows use one read transaction;
+`null` action state means extraction was never queued, while `null` document
+means no result was published yet. The response frame limit is 32 MiB (requests
+remain limited to 1 MiB); oversized responses return a protocol error.
+
+M12.14 exercises three source fixtures in disposable registered projects:
+Python reads the declared `stdout_path`, a POSIX shell emits Julia-compatible
+JSON for a checked sample log without requiring Julia, and a compiled Rust
+binary reads `stdout.log` from the attempt directory. Each extracts
+project-defined scalar names and declares an artifact; integration tests check
+the indexed values, durable document and published file size/digest.
 
 Example output:
 
@@ -685,10 +804,25 @@ Example output:
     "REM": {"f1": 0.865937}
   },
   "artifacts": [
-    {"path": "metrics.json", "role": "metrics", "sha256": "..."}
+    {"path": "metrics.json", "role": "metrics"}
   ]
 }
 ```
+
+The published Draft 2020-12 contract is
+[`schemas/metric-result-v1.schema.json`](schemas/metric-result-v1.schema.json),
+with a complete example in
+[`config/example-metric-result-v1.json`](config/example-metric-result-v1.json).
+`schema_version = 1` is required; unknown top-level fields and unsupported
+versions are rejected. Metric and class names are project-defined, `selection`
+and `artifacts` are optional, and no accuracy metric, split or checkpoint is
+mandatory. `selection.value` may differ from the final metric value when the
+selected checkpoint was evaluated at an earlier epoch. The result's `status`
+describes extraction, independently of the job's execution outcome. Paths are
+attempt-relative declarations: schema validation alone does not establish
+filesystem containment, file existence or a trustworthy checksum. Igor
+checks these properties before publication; a supplied digest never replaces
+Igor's own file hash.
 
 Igor stores the original document and indexes selected scalar values without
 changing their scientific meaning.
@@ -1096,7 +1230,7 @@ The local CLI/worker/supervisor wire protocol requires an exact version match
 and project TOML, job and family TOML, and event payloads each have their own
 explicit version (`1` in the current implementation). Readers reject an
 unsupported version rather than silently interpreting it as the current schema.
-SQLite uses numbered, checksummed SQLx migrations (currently through `0009`).
+SQLite uses numbered, checksummed SQLx migrations (currently through `0012`).
 Writable worker startup applies available migrations; `igor db check` only
 reads, and `igor db migrate` explicitly upgrades an existing database after
 integrity and foreign-key checks. Back up before upgrades. Database migration
@@ -1136,10 +1270,11 @@ Current production subprocess entry points and environment boundaries:
 | Docker experiment | `executor.rs` planner and `worker.rs` Docker lifecycle | The trusted host `docker` CLI inherits the worker environment for local daemon and user configuration. Container creation passes only explicit, name-validated `--env` values and assigned GPUs; it does not copy the worker's ambient environment into the container. Image defaults remain in force. Explicit values appear in Docker CLI arguments. |
 | Local metadata helpers | `submission.rs` Git, `inventory.rs` `nvidia-smi`, `executor.rs` Docker probes | Inherit the worker's environment as trusted local tools. Git's configured helpers/filters and executable resolution therefore remain within the trusted-user boundary; their environment is not used as a job's environment. |
 | Service administration | CLI `systemctl` and `journalctl`; worker `systemctl`/`systemd-run` | Inherit the invoking CLI/worker environment to contact the user manager and display service state. They do not receive Telegram credentials from project job specifications or pass the inherited environment as the experiment unit environment. |
+| Metric extractor | `extract.rs` supervisor action | Starts with `env_clear`, passes only `PATH`, runs the frozen direct command from the private attempt directory, and supplies verified attempt log paths and IDs on stdin. Its stdout/stderr are bounded; extractor code remains trusted same-user code, not a sandbox. |
 
 Telegram delivery uses an in-process HTTP client, not a shell child. Hooks,
-metrics extractors and coding-agent subprocesses are not implemented yet and
-must receive their own environment review when introduced. This audit does not
+coding-agent subprocesses are not implemented yet and must receive their own
+environment review when introduced. This audit does not
 claim that trusted administrative helpers are isolated from the invoking
 account or that a non-sensitive variable name cannot hold a secret. Existing
 process, Docker and systemd tests exercise the experiment/container boundary;

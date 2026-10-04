@@ -247,6 +247,60 @@ pub(crate) fn build_submission_with_source(
     job.validate()?;
     let job_digest = digest_json(&job, "effective job")?;
     let attempt_id = AttemptId::new();
+    let extractor = config
+        .results
+        .as_ref()
+        .map(|results| {
+            let program = resolve_extractor_program(&project.root, &results.extractor[0])?;
+            let cwd = resolve_cwd(&project.root, Some(Path::new(".")))?;
+            Ok::<_, SubmissionError>(CommandSpec {
+                program,
+                args: results.extractor[1..].to_vec(),
+                cwd,
+                shell: ShellPolicy::Direct,
+                environment: crate::EnvironmentPolicy {
+                    inherit: crate::EnvironmentInheritance::None,
+                    ..crate::EnvironmentPolicy::default()
+                },
+            })
+        })
+        .transpose()?;
+    let publication_root = if config.results.is_some() {
+        if config
+            .paths
+            .artifact_root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(SubmissionError::Content {
+                kind: "artifact publication root",
+                path: config.paths.artifact_root.clone(),
+                reason: "must not include parent-directory components".into(),
+            });
+        }
+        let project_root = project
+            .root
+            .canonicalize()
+            .map_err(|source| SubmissionError::Io {
+                path: project.root.clone(),
+                source,
+            })?;
+        let root = if config.paths.artifact_root.is_absolute() {
+            config.paths.artifact_root.clone()
+        } else {
+            project_root.join(&config.paths.artifact_root)
+        };
+        if !root.starts_with(&project_root) {
+            return Err(SubmissionError::Content {
+                kind: "artifact publication root",
+                path: root,
+                reason: "must be contained by the project root".into(),
+            });
+        }
+        Some(root)
+    } else {
+        None
+    };
     let attempt = AttemptSpec::from_job(
         attempt_id,
         1,
@@ -259,7 +313,8 @@ pub(crate) fn build_submission_with_source(
         },
         ResultContract {
             schema_version: 1,
-            extractor: None,
+            extractor,
+            publication_root,
         },
     )?;
     let job_event = event(
@@ -277,6 +332,32 @@ pub(crate) fn build_submission_with_source(
         job_event,
         attempt_event,
     })
+}
+
+fn resolve_extractor_program(root: &Path, program: &str) -> Result<String, SubmissionError> {
+    let path = Path::new(program);
+    if path.is_absolute() || !program.contains('/') {
+        return Ok(program.to_owned());
+    }
+    let root = root.canonicalize().map_err(|source| SubmissionError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let candidate = root.join(path);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|source| SubmissionError::Io {
+            path: candidate.clone(),
+            source,
+        })?;
+    if !canonical.starts_with(&root) {
+        return Err(SubmissionError::Content {
+            kind: "results extractor",
+            path: canonical,
+            reason: "escapes the project root".into(),
+        });
+    }
+    Ok(canonical.to_string_lossy().into_owned())
 }
 
 pub(crate) fn changed_worktree(root: &Path) -> SubmissionError {

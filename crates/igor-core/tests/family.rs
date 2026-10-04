@@ -180,6 +180,44 @@ fn generation_freezes_one_revision_and_protocol_for_all_seeds() -> Result<(), Bo
 }
 
 #[test]
+fn generation_freezes_one_extractor_contract_for_every_seed() -> Result<(), Box<dyn Error>> {
+    let (_temporary, project, mut config, file) = repository()?;
+    config.results = Some(igor_core::ResultsConfig {
+        extractor: vec!["python3".into(), "-I".into()],
+        working_directory: "attempt".into(),
+    });
+    let prepared = build_family_generation(&project, &config, file)?;
+    let expected = prepared.submissions[0].attempt.result().clone();
+    assert_eq!(
+        expected.extractor.as_ref().ok_or("missing extractor")?.args,
+        ["-I"]
+    );
+    assert!(
+        prepared
+            .submissions
+            .iter()
+            .all(|member| member.attempt.result() == &expected)
+    );
+
+    let mut mixed = prepared.clone();
+    let member = &mut mixed.submissions[1];
+    member.attempt = igor_core::AttemptSpec::from_job(
+        member.attempt.id(),
+        member.attempt.sequence(),
+        &member.job,
+        member.attempt.source().clone(),
+        member.attempt.configuration().clone(),
+        igor_core::ResultContract {
+            schema_version: 1,
+            extractor: None,
+            publication_root: None,
+        },
+    )?;
+    assert!(mixed.validate().is_err());
+    Ok(())
+}
+
+#[test]
 fn five_seed_generation_freezes_identity_revision_and_distinct_seeds() -> Result<(), Box<dyn Error>>
 {
     let (_temporary, project, config, file) = repository()?;
