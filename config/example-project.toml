@@ -18,14 +18,30 @@ scientific_configurations = []
 immutable_inputs = []
 
 [report]
-enabled = true
+# Optional reports; execution and metric extraction do not require them.
+enabled = false
 trigger = "family-completed"
 output = "RESULTS.md"
 mode = "replace-generated-file"
-generator = "opencode"
+generator = "deterministic"
 prompt_file = ".igor/report-prompt.md"
 
 # Optional direct metric extractor; argv is literal and no shell is used.
 # [results]
 # extractor = ["./scripts/export_igor_metrics.py"]
 # working_directory = "attempt"
+
+# Optional retention overrides. Omitted fields use the defaults shown here.
+# [retention]
+# failed_artifacts = "delete-after-diagnosis"
+# failed_full_logs = "delete-after-diagnosis"
+# failed_log_tail_kb = 512
+# Per-stream limit: 0–16384 KiB.
+# compress_success_logs = true
+# delete_repair_worktrees = true
+# superseded_artifacts = "delete-after-replacement"
+
+# Optional attempt-relative artifact exceptions.
+# [artifacts]
+# keep_on_success = ["metrics.json", "model.weights", "figures/**"]
+# keep_on_failure = ["crash-dump.json"]

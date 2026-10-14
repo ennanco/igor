@@ -208,9 +208,15 @@ fn generation_freezes_one_extractor_contract_for_every_seed() -> Result<(), Box<
         member.attempt.source().clone(),
         member.attempt.configuration().clone(),
         igor_core::ResultContract {
+            owned_namespace: None,
+            failed_full_logs: None,
+            compress_success_logs: None,
+            failed_artifact_retention: None,
+            superseded_artifact_retention: None,
             schema_version: 1,
             extractor: None,
             publication_root: None,
+            failed_log_tail_kb: None,
         },
     )?;
     assert!(mixed.validate().is_err());

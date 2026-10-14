@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::project::{DEFAULT_FAILED_LOG_TAIL_KB, MAX_FAILED_LOG_TAIL_KB};
 use crate::{
     AttemptId, AttemptRetryPolicy, CommandSpec, DomainError, ErrorCode, ExecutorSpec, FamilyId,
     GenerationId, JobId, ProjectId, ResourceRequest, Result,
@@ -158,16 +159,94 @@ impl ConfigurationIdentity {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedArtifactRetention {
+    pub policy: crate::FailedRetention,
+    pub keep_on_failure: Vec<String>,
+}
+
+impl FailedArtifactRetention {
+    pub fn validate(&self) -> Result<()> {
+        crate::ArtifactRetentionConfig {
+            keep_on_failure: self.keep_on_failure.clone(),
+            ..Default::default()
+        }
+        .validate()?;
+        for pattern in &self.keep_on_failure {
+            globset::Glob::new(pattern).map_err(|error| {
+                DomainError::validation(
+                    ErrorCode::InvalidAttempt,
+                    "attempt.result.failed_artifact_retention.keep_on_failure",
+                    &error.to_string(),
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupersededArtifactRetention {
+    pub policy: crate::SupersededRetention,
+    pub keep_on_success: Vec<String>,
+}
+
+impl SupersededArtifactRetention {
+    pub fn validate(&self) -> Result<()> {
+        crate::ArtifactRetentionConfig {
+            keep_on_success: self.keep_on_success.clone(),
+            ..Default::default()
+        }
+        .validate()?;
+        for pattern in &self.keep_on_success {
+            globset::Glob::new(pattern).map_err(|error| {
+                DomainError::validation(
+                    ErrorCode::InvalidAttempt,
+                    "attempt.result.superseded_artifact_retention.keep_on_success",
+                    &error.to_string(),
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ResultContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_namespace: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_full_logs: Option<crate::FailedRetention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compress_success_logs: Option<bool>,
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extractor: Option<CommandSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_log_tail_kb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_artifact_retention: Option<FailedArtifactRetention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_artifact_retention: Option<SupersededArtifactRetention>,
 }
 
 impl ResultContract {
+    #[must_use]
+    pub fn failed_log_tail_kb(&self) -> u32 {
+        self.failed_log_tail_kb
+            .unwrap_or(DEFAULT_FAILED_LOG_TAIL_KB)
+    }
+
     fn validate(&self) -> Result<()> {
+        if let Some(retention) = &self.superseded_artifact_retention {
+            retention.validate()?;
+        }
+        if let Some(retention) = &self.failed_artifact_retention {
+            retention.validate()?;
+        }
         if self.schema_version == 0 {
             return Err(DomainError::validation(
                 ErrorCode::InvalidAttempt,
@@ -177,6 +256,16 @@ impl ResultContract {
         }
         if let Some(extractor) = &self.extractor {
             extractor.validate()?;
+        }
+        if self
+            .failed_log_tail_kb
+            .is_some_and(|value| value > MAX_FAILED_LOG_TAIL_KB)
+        {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidAttempt,
+                "attempt.result.failed_log_tail_kb",
+                "must not exceed 16384 KiB",
+            ));
         }
         if let Some(root) = &self.publication_root {
             if !root.is_absolute()

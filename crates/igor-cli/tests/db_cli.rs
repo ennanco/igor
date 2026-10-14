@@ -213,6 +213,26 @@ async fn db_migrate_existing_older_and_current_databases() -> TestResult {
         .filename(&database)
         .create_if_missing(false);
     let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
+    sqlx::raw_sql(
+        "DROP TABLE owned_output_discovery; DROP TABLE owned_output_manifest; DROP TABLE owned_output_namespaces; DELETE FROM _sqlx_migrations WHERE version = 22; DROP TABLE failed_log_retirements; DELETE FROM _sqlx_migrations WHERE version = 21;",
+    )
+    .execute(&mut connection)
+    .await?;
+    sqlx::query("DROP TABLE failed_log_tails")
+        .execute(&mut connection)
+        .await?;
+    for trigger in [
+        "artifacts_diagnosis_insert",
+        "artifacts_diagnosis_update",
+        "artifacts_diagnosis_delete",
+    ] {
+        sqlx::query(&format!("DROP TRIGGER {trigger}"))
+            .execute(&mut connection)
+            .await?;
+    }
+    sqlx::query("DROP VIEW diagnosed_attempts")
+        .execute(&mut connection)
+        .await?;
     sqlx::query("DROP TABLE metric_selections")
         .execute(&mut connection)
         .await?;
@@ -222,9 +242,33 @@ async fn db_migrate_existing_older_and_current_databases() -> TestResult {
     sqlx::query("DROP TABLE attempt_units")
         .execute(&mut connection)
         .await?;
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (9, 10, 11, 12)")
-        .execute(&mut connection)
-        .await?;
+    sqlx::raw_sql(
+        "DROP TABLE cleanup_tombstones; DROP TABLE failed_cleanup_intents;
+         DROP TABLE success_log_archive_preparations;
+         DROP TRIGGER success_log_archive_identity_update;
+         DROP TRIGGER success_log_archive_identity_delete;
+         DROP TABLE success_log_archives;
+         DROP TRIGGER superseded_cleanup_insert_guard;
+        DROP TRIGGER superseded_cleanup_identity_update;
+        DROP TRIGGER superseded_cleanup_identity_delete;
+        DROP TABLE superseded_cleanup_intents;
+        DROP TRIGGER artifacts_replacement_update;
+        DROP TRIGGER artifacts_replacement_delete;
+        DROP VIEW successful_current_generations;
+        DROP TRIGGER repair_worktrees_recovery_guard;
+        DROP TRIGGER repair_worktrees_action_insert_guard;
+        DROP TRIGGER repair_worktrees_action_update_guard;
+        DROP TRIGGER repair_worktrees_session_insert_guard;
+        DROP TRIGGER repair_worktrees_session_update_guard;
+        DROP TABLE repair_worktrees;",
+    )
+    .execute(&mut connection)
+    .await?;
+    sqlx::query(
+        "DELETE FROM _sqlx_migrations WHERE version IN (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)",
+    )
+    .execute(&mut connection)
+    .await?;
     connection.close().await?;
 
     let preview = command(&home, temporary.path())

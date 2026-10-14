@@ -8,13 +8,16 @@
 **Integrated General-purpose Orchestrator for Research**
 
 Igor is a resource-aware experiment runner and recovery orchestrator for Linux.
-It will execute arbitrary process and Docker workloads, coordinate exclusive
-compute resources, persist execution history, extract structured results, and
-generate project reports.
+It executes process and Docker workloads, coordinates exclusive compute
+resources, persists execution history, and extracts structured results. Project
+reports are planned.
 
-The project includes local process and Docker queues, resource scheduling,
-recoverable supervisor notifications, and atomic submission of a family's
-first generation. It remains under active development and is not ready for
+The `v0.2` roadmap scope is complete (milestones 0–10). Work on the planned
+`v0.3` scope (11–14) is underway: milestones 12 and 13 have passed acceptance, and
+milestone 11's remaining acceptance check awaits the current-generation
+aggregate; deterministic Markdown reports remain in milestone 14. No
+packaged release has been published, and the current Cargo/binary version is
+still `0.1.0`. Igor remains under active development and is not ready for
 production experiment management. See
 [`DESIGN.md`](DESIGN.md) for the agreed architecture and [`TASKS.md`](TASKS.md)
 for the ordered implementation backlog.
@@ -28,6 +31,21 @@ for the ordered implementation backlog.
 Docker is optional. Direct-process installations do not need the Docker CLI,
 daemon, socket, or Rust Docker client dependency. Docker jobs require a locally
 reachable Docker daemon and permission for the worker user to use it.
+
+## Optional Results And Notifications
+
+Jobs can run with the worker alone. Metric extraction, Markdown reports,
+coding-agent integrations and Telegram are optional and configured independently:
+
+- Omit `[results]` to run without a metric extractor.
+- Reports are disabled by default (`[report] enabled = false`). Reporting is
+  planned for Milestone 14; its default generator is deterministic. OpenCode
+  or Pi are needed only when explicitly selected as optional report generators.
+- Omit Telegram credentials to run without Telegram delivery.
+
+A minimal project configuration is simply `schema_version = 1`. `igor init`
+includes optional configuration examples, with reports disabled. The supervisor
+is used for enabled background services; it is not required to execute jobs.
 
 ## Install From Source
 
@@ -377,6 +395,206 @@ copy the scripts as executables, run each in an isolated attempt and verify
 its scalar metrics and published artifact. The shell fixture uses a fixed
 sample result for the `training-output` test log.
 
+## Retention Policy Configuration
+
+Project TOML can specify the retention defaults from
+[`DESIGN.md`](DESIGN.md#18-retention-and-garbage-collection) in an optional
+`[retention]` section and attempt-relative exceptions in `[artifacts]`. For
+example:
+
+```toml
+[retention]
+failed_artifacts = "keep"
+failed_log_tail_kb = 256
+
+[artifacts]
+keep_on_success = ["metrics.json", "figures/**"]
+keep_on_failure = ["crash-dump.json"]
+```
+
+Missing fields use the documented defaults. New submissions freeze
+`failed_artifacts` and `keep_on_failure` per attempt. After a durable diagnosis,
+the supervisor removes registered failed artifact copies from the attempt and
+private staging directories by default. `keep` or matching `keep_on_failure`
+patterns retain them. Older attempts without a frozen cleanup policy are
+preserved.
+Artifact records track physical publication (`registered`, `staged`,
+`published`, `removed`) separately from their retention lifecycle (`running`,
+`failed`, `published`, `retained`, `superseded`, `removed`). The lifecycle is
+durable; failed-artifact and supersession cleanup both use it.
+Failed artifacts carry a durable diagnosis requirement: Igor refuses to mark
+them removed until the attempt has a completed, stored diagnosis. A pending
+diagnosis keeps the files protected, even if a retention rule selects them.
+For a failed, lost or cancelled attempt, Igor stores only the last
+`failed_log_tail_kb` KiB of each stdout/stderr file as binary data in SQLite.
+The default is 512 KiB per stream, zero disables capture, and the maximum is
+16384 KiB. Missing or unreadable files yield an incomplete record, so
+cleanup preserves full logs while capture remains incomplete. The
+per-attempt limit is frozen when the job is submitted.
+
+Failed-artifact cleanup checks paths, size and SHA-256 before removing any file
+in a batch and preserves a database tombstone with a cleanup event. It waits
+for active extraction to finish and for complete log tails on failed, lost or
+cancelled attempts. Hidden or final publication copies defer this artifact
+cleanup. Full logs and owned private outputs use their separate verified
+retirement operations described below.
+
+Registered repair worktrees have a separate cleanup lifecycle. The supervisor
+can remove an explicitly released worktree only after its recovery is terminal,
+its patch and versioned diagnosis/validation records are durable in SQLite,
+and no repair action or agent session still needs it. Candidate commits are
+preserved under `refs/igor/repairs/RECOVERY_ID` before removal. The frozen
+`delete_repair_worktrees = false` policy keeps the registered worktree instead.
+Worktree creation and repair-agent execution remain planned for Milestone 16.
+
+Supersession preserves existing published bytes and marks their lifecycle
+`superseded`. Extraction finishing after supersession uses that same marker.
+Retirement of artifacts from superseded jobs is blocked while the family's
+current replacement generation is incomplete, failed or non-comparable; an
+older successful replacement cannot bypass a newer pending generation. Failed
+artifact cleanup applies this barrier before touching files. New submissions
+also freeze `superseded_artifacts` and `keep_on_success`. After the current
+replacement is comparable, the supervisor removes superseded published files
+and their verified source/staging copies by default. `keep` or matching
+`keep_on_success` patterns retain them; legacy attempts without this snapshot
+are preserved. Cleanup records durable intent before removing files and keeps
+the artifact identity and history in a tombstone. If a newer replacement becomes
+incomplete during recovery, remaining copies are preserved; an already completed
+physical removal can still finish its tombstone without further deletion.
+
+Successful logs are compressed to gzip when the frozen per-attempt
+`compress_success_logs` policy is true. The supervisor waits for extraction
+and active diagnosis/repair consumers, and for live process-group writers to
+finish. It publishes a verified archive and durable metadata before removing
+the raw file. `igor logs` and `igor logs --follow` continue to emit the original
+bytes, transparently reading gzip when needed. Explicit `false` and older
+attempts without the policy snapshot preserve raw logs. Failed logs are not
+compressed by this operation.
+
+Cleanup checks the complete absolute directory chain, including ancestors above
+configured roots, and refuses symlinks or traversal spellings. Artifact paths
+must be unambiguous relative paths; interior `.` and repeated/trailing
+separators are rejected before retention matching. Failed-artifact cleanup also
+requires a registered project and a publication root inside it. These checks
+apply to publication-temporary housekeeping as well as artifact and log cleanup.
+
+Failed-artifact cleanup runs through a durable action outbox with leases,
+retries and a stable per-attempt idempotency key. Waiting for diagnosis,
+extraction or replacement does not consume the operational retry budget.
+Removal first commits immutable copy identities; missing files are accepted on
+replay only with that prior intent. Cleanup operations publish versioned,
+immutable tombstones alongside their terminal state and event, preserving
+identity, outcome and completion time across restart or acknowledgement retries.
+
+## Storage Inventory
+
+```bash
+igor storage status
+igor storage status --json
+```
+
+This read-only command needs only the worker. Inside a registered project it
+reports that project's records; outside a project it reports globally, including
+history from unregistered projects. `--project` selects a project explicitly.
+
+The inventory groups artifacts by publication/lifecycle state, with known
+logical bytes and unknown-size counts; removed artifacts are separate history.
+It also reports log archive identities, pending compression reservations,
+failed-log BLOB payloads, repair-worktree states/patch payloads, failed-cleanup
+actions, intents and tombstones. Each artifact is counted once regardless of
+the number of copy paths in metadata. It neither claims cleanup work nor scans
+directories: actual disk footprint and unfinished temporary sizes are not
+measured and appear as `null` in JSON.
+
+## Garbage Collection
+
+```bash
+igor gc --dry-run
+igor gc --dry-run --json
+igor gc
+igor gc --failed
+igor gc --failed --yes --json
+```
+
+The worker-only preview follows the same project/global scope as storage status.
+It shows verified target paths and effects for failed/superseded artifacts,
+released repair worktrees, failed-log retirement, owned private failed outputs
+and successful-log compression. Entries distinguish
+ready, retained, deferred, unsafe and metadata-only operations with reasons.
+
+Dry-run uses a read-only database snapshot and filesystem observations. It
+does not enqueue actions, claim leases, prepare intents, create/reclaim temporary
+files, compress logs or remove anything. The bounded preview covers up to
+32 subjects per operation and 64 artifact rows or actionable private output
+files per attempt, explicitly reporting
+truncation and continuation markers. Known copy bytes are deduplicated by path;
+gzip savings and worktree size remain unknown. The result is advisory: execution
+must revalidate eligibility and bytes.
+
+When eligibility and file identities remain unchanged, executing the saved
+worklist produces the advertised effects. Metadata-only completion does not
+remove bytes. Successful-log compression publishes the verified `.log.gz`
+counterpart and retires the raw log; private temporary names and final gzip
+size are determined during execution. Known copy bytes describe observed or
+recorded targets, not predicted space savings.
+
+Without `--dry-run`, Igor displays the bounded selected work and asks for
+confirmation, defaulting to no. `--yes` approves noninteractively. Decline or
+EOF sends no execution request, and dry-run never prompts. Execution processes
+one fixed worklist: newly discovered or newly ready items are not added while
+waiting for confirmation, and every selected item is revalidated under the
+executor's writer reservation. `--failed` selects registered failed-artifact
+retention, failed full-log retirement and owned private failed outputs.
+
+Full failed logs use the retention policy frozen at submission. With
+`failed_full_logs = "delete-after-diagnosis"`, retirement waits for durable
+diagnosis, complete verified binary tails, quiescent writers and all extraction,
+repair and replacement-generation barriers. `keep` and legacy attempts without
+a frozen policy retain their full logs. The supervisor periodically retries
+eligible retirement; worker-only installations can invoke `igor gc --failed`.
+After retirement, `igor logs` reads the stored tail in bounded chunks, reports
+the omitted prefix on stderr and preserves original offsets with `--follow`.
+
+Private disposable outputs use frozen `failed_artifacts` and `keep_on_failure`
+policies. Only a fresh, empty worker-created `logs/ATTEMPT_UUID` directory with
+durably recorded ownership before launch is eligible. Discovery considers only
+immediate regular-file children, excluding registered artifacts, exact log/archive
+names, durably reserved compression temporary paths and `.git` boundaries.
+Dotfiles and general `.tmp`/`.gz` outputs remain eligible. It never scans the checkout or external data and
+never removes the directory itself. Preexisting directories and legacy attempts
+without frozen ownership remain preserved. Diagnosis, complete tails, consumers,
+writer quiescence and current comparable replacement barriers apply to both
+executor phases. Exact root/file device, inode, path and digest identities bind
+consent and crash replay; symlinks, hardlinks and special files are unsafe.
+The supervisor retries bounded passes; explicit GC keeps a fixed per-file
+worklist. Storage status reports immutable manifest bytes and intent/history
+states, with physical file sizes left unmeasured.
+Directory inventory reads at most 4097 entries; more than 4096 children defer the
+namespace explicitly. Protected files and preserved directories do not consume
+the 64-file actionable page. Once only protected entries remain, a separate
+metadata-only GC selection binds the exact namespace snapshot and durably closes
+discovery. Completed discovery is excluded from future candidate pages, including
+namespaces containing only kept files; new files are not swept after closure.
+
+With `--json`, stdout contains only the structured result; prompts and summaries
+go to stderr. Completed, already-done, deferred, unsafe and error counts describe
+partial outcomes. Errors or unsafe entries return exit code `1` after emitting
+the result. Verified retain decisions can count as completed without deleting
+files or creating a lifecycle record. Entries rejected as unsafe in the preview
+are reported but never selected for execution; an unsafe-only plan reports them
+without prompting or sending an execution request. Explicitly declining a
+nonempty worklist leaves an empty, unconfirmed result. Truncated work is not
+drained automatically; later invocations can
+preview another bounded pass.
+
+Interrupted cleanup resumes from durable intents. Recovery revalidates the
+selected identities and current barriers, completes metadata for already-retired
+copies only when prior evidence matches, and preserves unselected files and
+protected Git refs. Retirement keeps one tombstone and cleanup event per subject;
+metadata-only namespace closure creates no removal evidence. Expired maintenance
+claims are recovered with a new lease; stale claims
+cannot resume the work.
+
 ## Database Integrity
 
 Check an existing Igor database without starting a daemon or applying migrations:
@@ -425,11 +643,11 @@ report failures to stderr with a nonzero exit status.
 
 | Contract | Version in this build | Compatibility behavior |
 | --- | --- | --- |
-| Worker/supervisor Unix-socket protocol | `11` | CLI and daemon must use the same version; mismatches are rejected (exit `4`). |
+| Worker/supervisor Unix-socket protocol | `19` | CLI and daemon must use the same version; mismatches are rejected (exit `4`). |
 | Global and project TOML | `1` each | The reader rejects unsupported `schema_version` values; it does not rewrite these files on read. |
 | Job and family TOML | `1` each | Submission rejects unsupported versions before creating jobs. |
 | Event payloads | `1` | Unsupported versions are rejected when decoded. |
-| SQLite schema | `12` | Numbered, checksummed SQLx migrations run on writable worker startup or explicit `igor db migrate`. |
+| SQLite schema | `21` | Numbered, checksummed SQLx migrations run on writable worker startup or explicit `igor db migrate`. |
 
 Upgrade the CLI and both user services together; restart the services so they
 run the new binary (`igor service restart` if installed). Before a database

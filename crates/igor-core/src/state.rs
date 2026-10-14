@@ -144,3 +144,18 @@ state_machine!(
         Succeeded => [], Failed => [Pending], Cancelled => []
     }
 );
+
+state_machine!(
+    ArtifactLifecycleState {
+        Running => "running", Failed => "failed", Published => "published",
+        Retained => "retained", Superseded => "superseded", Removed => "removed"
+    }
+    transitions {
+        Running => [Failed, Published],
+        Failed => [Retained, Removed],
+        Published => [Retained, Superseded, Removed],
+        Retained => [Removed],
+        Superseded => [Retained, Removed],
+        Removed => []
+    }
+);

@@ -1,9 +1,10 @@
 use std::{error::Error, ffi::OsString, fs, os::unix::fs::PermissionsExt, path::Path};
 
 use igor_core::{
-    ConfigOverrides, Environment, HostConfigUpdate, REDACTED, ResourceMode, ResourceRequest,
-    discover_project_config, initialize_project, load_effective_config, load_global_config,
-    load_project_config, update_global_host_config,
+    ArtifactRetentionConfig, ConfigOverrides, Environment, FailedRetention, HostConfigUpdate,
+    REDACTED, ReportConfig, ReportGenerator, ResourceMode, ResourceRequest, RetentionConfig,
+    SupersededRetention, discover_project_config, initialize_project, load_effective_config,
+    load_global_config, load_project_config, update_global_host_config,
 };
 use tempfile::TempDir;
 
@@ -144,6 +145,38 @@ fn minimal_project_has_unrestricted_exclusive_defaults() -> Result<(), Box<dyn E
     assert_eq!(loaded.config.resources.memory_bytes, None);
     assert_eq!(loaded.config.resources.timeout_seconds, None);
     assert!(loaded.config.resources.gpu_exclusive);
+    assert!(!loaded.config.report.enabled);
+    assert_eq!(
+        loaded.config.report.generator,
+        ReportGenerator::Deterministic
+    );
+    assert!(loaded.config.results.is_none());
+    Ok(())
+}
+
+#[test]
+fn optional_report_configuration_retains_explicit_values_and_defaults_to_deterministic()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TempDir::new()?;
+    let config = temporary.path().join(".igor/project.toml");
+    write(
+        &config,
+        "schema_version = 1\n[report]\nenabled = true\ngenerator = 'opencode'\n",
+    )?;
+    let legacy = load_project_config(&config)?.config;
+    assert!(legacy.report.enabled);
+    assert_eq!(legacy.report.generator, ReportGenerator::Opencode);
+
+    write(&config, "schema_version = 1\n[report]\nenabled = false\n")?;
+    let disabled = load_project_config(&config)?.config;
+    assert!(!disabled.report.enabled);
+    assert_eq!(disabled.report.generator, ReportGenerator::Deterministic);
+    let expected = ReportConfig {
+        output: temporary.path().join("RESULTS.md"),
+        prompt_file: temporary.path().join(".igor/report-prompt.md"),
+        ..ReportConfig::default()
+    };
+    assert_eq!(disabled.report, expected);
     Ok(())
 }
 
@@ -190,6 +223,138 @@ fn results_configuration_is_optional_and_strict() -> Result<(), Box<dyn Error>> 
     let mut configured = loaded.config.results.ok_or("results missing")?;
     configured.extractor.push("bad\0arg".into());
     assert!(configured.validate().is_err());
+    Ok(())
+}
+
+#[test]
+fn retention_defaults_and_project_exceptions_are_effective_and_backward_compatible()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TempDir::new()?;
+    let path = temporary.path().join(".igor/project.toml");
+    write(&path, "schema_version = 1\n")?;
+    let omitted = load_project_config(&path)?.config;
+    assert_eq!(omitted.retention, RetentionConfig::default());
+    assert_eq!(omitted.artifacts, ArtifactRetentionConfig::default());
+    let legacy: serde_json::Value = serde_json::to_value(&omitted)?;
+    assert!(legacy.get("retention").is_none());
+    assert!(legacy.get("artifacts").is_none());
+
+    write(
+        &path,
+        concat!(
+            "schema_version = 1\n[retention]\n",
+            "failed_artifacts = 'delete-after-diagnosis'\n",
+            "failed_full_logs = 'delete-after-diagnosis'\n",
+            "failed_log_tail_kb = 512\ncompress_success_logs = true\n",
+            "delete_repair_worktrees = true\n",
+            "superseded_artifacts = 'delete-after-replacement'\n",
+            "[artifacts]\nkeep_on_success = []\nkeep_on_failure = []\n",
+        ),
+    )?;
+    let explicit_defaults = load_project_config(&path)?.config;
+    assert_eq!(omitted, explicit_defaults);
+    assert_eq!(serde_json::to_value(&explicit_defaults)?, legacy);
+
+    write(
+        &path,
+        concat!(
+            "schema_version = 1\n[retention]\n",
+            "failed_artifacts = 'keep'\nfailed_log_tail_kb = 0\n",
+            "compress_success_logs = false\n",
+            "superseded_artifacts = 'keep'\n",
+            "[artifacts]\n",
+            "keep_on_success = ['metrics.json', 'figures/**']\n",
+            "keep_on_failure = ['crash-dump.json']\n",
+        ),
+    )?;
+    let configured = load_project_config(&path)?.config;
+    assert_eq!(configured.retention.failed_artifacts, FailedRetention::Keep);
+    assert_eq!(
+        configured.retention.failed_full_logs,
+        FailedRetention::DeleteAfterDiagnosis
+    );
+    assert_eq!(configured.retention.failed_log_tail_kb, 0);
+    assert!(!configured.retention.compress_success_logs);
+    assert!(configured.retention.delete_repair_worktrees);
+    assert_eq!(
+        configured.retention.superseded_artifacts,
+        SupersededRetention::Keep
+    );
+    assert_eq!(
+        configured.artifacts.keep_on_success,
+        ["metrics.json", "figures/**"]
+    );
+    assert_eq!(configured.artifacts.keep_on_failure, ["crash-dump.json"]);
+    let serialized = serde_json::to_value(&configured)?;
+    assert_eq!(serialized["retention"]["failed_artifacts"], "keep");
+    assert_eq!(
+        serialized["artifacts"]["keep_on_failure"][0],
+        "crash-dump.json"
+    );
+    let restored: igor_core::ProjectConfig = serde_json::from_value(serialized)?;
+    assert_eq!(restored, configured);
+    Ok(())
+}
+
+#[test]
+fn retention_rejects_unknown_values_and_escaping_or_duplicate_patterns()
+-> Result<(), Box<dyn Error>> {
+    let temporary = TempDir::new()?;
+    let path = temporary.path().join(".igor/project.toml");
+    for (body, field) in [
+        (
+            "[retention]\nfailed_artifacts = 'delete-now'",
+            "retention.failed_artifacts",
+        ),
+        (
+            "[retention]\nfailed_full_logs = 'delete-after-replacement'",
+            "retention.failed_full_logs",
+        ),
+        (
+            "[retention]\nsuperseded_artifacts = 'delete-after-diagnosis'",
+            "retention.superseded_artifacts",
+        ),
+        (
+            "[retention]\nfailed_log_tail_kb = -1",
+            "retention.failed_log_tail_kb",
+        ),
+        (
+            "[retention]\nfailed_log_tail_kb = 1.5",
+            "retention.failed_log_tail_kb",
+        ),
+        (
+            "[retention]\nfailed_log_tail_kb = 16385",
+            "retention.failed_log_tail_kb",
+        ),
+        ("[retention]\nunknown = true", "retention.unknown"),
+        (
+            "[artifacts]\nkeep_on_success = 'file'",
+            "artifacts.keep_on_success",
+        ),
+        ("[artifacts]\nunknown = true", "artifacts.unknown"),
+        (
+            "[artifacts]\nkeep_on_success = ['../outside']",
+            "artifacts.keep_on_success[0]",
+        ),
+        (
+            "[artifacts]\nkeep_on_failure = ['/absolute']",
+            "artifacts.keep_on_failure[0]",
+        ),
+        (
+            "[artifacts]\nkeep_on_failure = ['figures//**']",
+            "artifacts.keep_on_failure[0]",
+        ),
+        (
+            "[artifacts]\nkeep_on_success = ['x', 'x']",
+            "artifacts.keep_on_success[1]",
+        ),
+    ] {
+        write(&path, &format!("schema_version = 1\n{body}\n"))?;
+        let error = load_project_config(&path)
+            .err()
+            .ok_or("invalid retention accepted")?;
+        assert!(error.to_string().contains(field), "{body}: {error}");
+    }
     Ok(())
 }
 
@@ -309,6 +474,15 @@ fn init_preflights_overwrites_and_creates_only_portable_files() -> Result<(), Bo
     assert!(generated.contains("cpu_threads = \"unlimited\""));
     assert!(generated.contains("memory = \"unlimited\""));
     assert!(generated.contains("timeout = \"none\""));
+    let initialized = load_project_config(&project.join(".igor/project.toml"))?.config;
+    assert!(!initialized.report.enabled);
+    assert_eq!(initialized.report.generator, ReportGenerator::Deterministic);
+    let expected_report = ReportConfig {
+        output: project.join("RESULTS.md"),
+        prompt_file: project.join(".igor/report-prompt.md"),
+        ..ReportConfig::default()
+    };
+    assert_eq!(initialized.report, expected_report);
     assert!(!project.join("igor.sqlite3").exists());
     assert!(!project.join("logs").exists());
     assert!(initialize_project(&project, false).is_err());

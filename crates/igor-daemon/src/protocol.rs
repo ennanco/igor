@@ -1,12 +1,13 @@
 use std::{fmt, path::Path};
 
 use igor_core::{
-    FamilyDetail, FamilyFile, FamilyId, GenerationId, JobDetail, JobId, JobLogs, Project,
-    ProjectId, ResourceStatus, RuntimePaths, StoredEvent, StoredJob, SubmissionInput,
+    FamilyDetail, FamilyFile, FamilyId, GcPlan, GenerationId, JobDetail, JobId, JobLogs, Project,
+    ProjectId, ResourceStatus, RuntimePaths, StorageStatus, StoredEvent, StoredJob,
+    SubmissionInput,
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 20;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +64,19 @@ pub enum Request {
     Version,
     DatabaseStatus,
     Resources,
+    StorageStatus {
+        project_id: Option<ProjectId>,
+    },
+    GcPlan {
+        project_id: Option<ProjectId>,
+        #[serde(default)]
+        failed_only: bool,
+    },
+    GcExecute {
+        project_id: Option<ProjectId>,
+        failed_only: bool,
+        worklist: igor_core::GcWorklist,
+    },
     ProjectRegister {
         project: Project,
     },
@@ -111,6 +125,15 @@ pub enum Request {
     JobLogs {
         job_id: JobId,
     },
+    AttemptLogs {
+        job_id: JobId,
+        attempt_id: igor_core::AttemptId,
+    },
+    RetiredLogChunk {
+        identity: igor_core::RetiredLogTail,
+        offset: u64,
+        limit: u32,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -149,6 +172,9 @@ pub enum Response {
     Health(Health),
     Version(Version),
     DatabaseStatus(DatabaseStatus),
+    StorageStatus(StorageStatus),
+    GcPlan(GcPlan),
+    GcExecution(igor_core::GcExecution),
     Resources {
         resources: Vec<ResourceStatus>,
     },
@@ -186,6 +212,7 @@ pub enum Response {
     Cancelled(JobDetail),
     Retried(JobDetail),
     Logs(JobLogs),
+    LogTailChunk(igor_core::LogTailChunk),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

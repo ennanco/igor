@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, error::Error, path::PathBuf};
 
 use igor_core::{
-    ActionId, ActionRetryPolicy, ActionState, AgentSessionId, ArtifactRole, AttemptId,
-    AttemptRetryPolicy, AttemptSpec, AttemptState, CleanupState, CommandSpec,
+    ActionId, ActionRetryPolicy, ActionState, AgentSessionId, ArtifactLifecycleState, ArtifactRole,
+    AttemptId, AttemptRetryPolicy, AttemptSpec, AttemptState, CleanupState, CommandSpec,
     ConfigurationIdentity, DeliveryId, DeliveryRetryPolicy, DeliveryState, DockerExecutorSpec,
     DockerMount, DomainError, EnvironmentInheritance, EnvironmentPolicy, ErrorCategory, ErrorCode,
     Event, EventId, EventKind, EventPayload, ExecutorSpec, FamilyId, FamilyMembership,
@@ -139,9 +139,15 @@ fn persisted_models_round_trip_without_losing_arguments() -> Result<(), Box<dyn 
             contents: Vec::new(),
         },
         ResultContract {
+            owned_namespace: None,
+            failed_full_logs: None,
+            compress_success_logs: None,
+            failed_artifact_retention: None,
+            superseded_artifact_retention: None,
             schema_version: 1,
             extractor: Some(command()),
             publication_root: None,
+            failed_log_tail_kb: None,
         },
     )?;
     round_trip(&attempt)?;
@@ -325,6 +331,11 @@ transition_matrix_test!(cleanup_transition_matrix, CleanupState, [
     Pending => [Running, Cancelled], Running => [Succeeded, Failed, Pending, Cancelled],
     Succeeded => [], Failed => [Pending], Cancelled => []
 ]);
+transition_matrix_test!(artifact_lifecycle_transition_matrix, ArtifactLifecycleState, [
+    Running => [Failed, Published], Failed => [Retained, Removed],
+    Published => [Retained, Superseded, Removed], Retained => [Removed],
+    Superseded => [Retained, Removed], Removed => []
+]);
 
 #[test]
 fn every_state_contract_round_trips() -> Result<(), Box<dyn Error>> {
@@ -347,6 +358,9 @@ fn every_state_contract_round_trips() -> Result<(), Box<dyn Error>> {
         round_trip(state)?;
     }
     for state in CleanupState::ALL {
+        round_trip(state)?;
+    }
+    for state in ArtifactLifecycleState::ALL {
         round_trip(state)?;
     }
     Ok(())

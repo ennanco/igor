@@ -37,3 +37,15 @@ max_attempts = 8
 initial_delay_seconds = 10
 max_delay_seconds = 3600
 multiplier = 2
+
+[retention]
+failed_artifacts = "keep"
+failed_full_logs = "delete-after-diagnosis"
+failed_log_tail_kb = 256
+compress_success_logs = false
+delete_repair_worktrees = true
+superseded_artifacts = "delete-after-replacement"
+
+[artifacts]
+keep_on_success = ["metrics.json", "figures/**"]
+keep_on_failure = ["crash-dump.json"]

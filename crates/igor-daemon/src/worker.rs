@@ -1,12 +1,12 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, DirBuilder, OpenOptions},
+    fs::{self, OpenOptions},
     io,
     os::unix::{
-        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+        fs::OpenOptionsExt,
         process::{CommandExt, ExitStatusExt},
     },
-    path::{Path, PathBuf},
+    path::Path,
     process::Stdio,
     time::Duration,
 };
@@ -428,14 +428,17 @@ async fn recover_container_identity(
         return None;
     }
     let recovered = matches.pop()?;
-    let (stdout_path, stderr_path) =
-        match prepare_logs(&paths.log_dir, &claim.attempt.spec.id().to_string()) {
-            Ok(paths) => paths,
-            Err(error) => {
-                tracing::error!(%error, "cannot prepare recovered Docker logs");
-                return None;
-            }
-        };
+    let (stdout_path, stderr_path) = match database
+        .jobs()
+        .prepare_attempt_logs(claim.attempt.spec.id(), paths)
+        .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::error!(%error, "cannot prepare recovered Docker logs");
+            return None;
+        }
+    };
     let create = ContainerCreate {
         container_id: recovered.id,
         container_name: format!("igor-{}", claim.attempt.spec.id()),
@@ -815,19 +818,22 @@ async fn execute_unit(
     shutdown: &mut watch::Receiver<bool>,
 ) {
     let command = claim.attempt.spec.command();
-    let (stdout_path, stderr_path) =
-        match prepare_logs(&paths.log_dir, &claim.attempt.spec.id().to_string()) {
-            Ok(paths) => paths,
-            Err(error) => {
-                finish_launch_failure(
-                    database,
-                    claim,
-                    &format!("cannot prepare unit logs: {error}"),
-                )
-                .await;
-                return;
-            }
-        };
+    let (stdout_path, stderr_path) = match database
+        .jobs()
+        .prepare_attempt_logs(claim.attempt.spec.id(), paths)
+        .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            finish_launch_failure(
+                database,
+                claim,
+                &format!("cannot prepare unit logs: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
     for path in [&stdout_path, &stderr_path] {
         if let Err(error) = open_log(path) {
             finish_launch_failure(database, claim, &format!("cannot create unit log: {error}"))
@@ -1228,15 +1234,17 @@ async fn execute_process(
         return;
     }
     let command = claim.attempt.spec.command();
-    let (stdout_path, stderr_path) =
-        match prepare_logs(&paths.log_dir, &claim.attempt.spec.id().to_string()) {
-            Ok(paths) => paths,
-            Err(error) => {
-                finish_launch_failure(database, claim, &format!("cannot prepare logs: {error}"))
-                    .await;
-                return;
-            }
-        };
+    let (stdout_path, stderr_path) = match database
+        .jobs()
+        .prepare_attempt_logs(claim.attempt.spec.id(), paths)
+        .await
+    {
+        Ok(paths) => paths,
+        Err(error) => {
+            finish_launch_failure(database, claim, &format!("cannot prepare logs: {error}")).await;
+            return;
+        }
+    };
     let stdout = match open_log(&stdout_path) {
         Ok(file) => file,
         Err(error) => {
@@ -1943,14 +1951,17 @@ async fn execute_docker(
         fail(database, claim, "docker_image_missing_or_invalid", error).await;
         return;
     }
-    let (stdout_path, stderr_path) =
-        match prepare_logs(&paths.log_dir, &claim.attempt.spec.id().to_string()) {
-            Ok(p) => p,
-            Err(e) => {
-                fail(database, claim, "docker_create_failed", e).await;
-                return;
-            }
-        };
+    let (stdout_path, stderr_path) = match database
+        .jobs()
+        .prepare_attempt_logs(claim.attempt.spec.id(), paths)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            fail(database, claim, "docker_create_failed", e).await;
+            return;
+        }
+    };
     let stdout = match open_log(&stdout_path) {
         Ok(file) => file,
         Err(error) => {
@@ -2464,39 +2475,6 @@ async fn finish_launch_failure(database: &Database, claim: &ExecutionClaim, reas
     if let Err(error) = database.jobs().finish_execution(claim, &outcome).await {
         tracing::error!(%error, job_id = %claim.job.spec.id, "cannot persist launch failure");
     }
-}
-
-fn prepare_logs(log_dir: &Path, attempt_id: &str) -> io::Result<(PathBuf, PathBuf)> {
-    let mut builder = DirBuilder::new();
-    builder.recursive(true).mode(0o700).create(log_dir)?;
-    ensure_real_directory(log_dir)?;
-    fs::set_permissions(log_dir, fs::Permissions::from_mode(0o700))?;
-    let attempt_dir = log_dir.join(attempt_id);
-    match DirBuilder::new().mode(0o700).create(&attempt_dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error),
-    }
-    ensure_real_directory(&attempt_dir)?;
-    fs::set_permissions(&attempt_dir, fs::Permissions::from_mode(0o700))?;
-    Ok((
-        attempt_dir.join("stdout.log"),
-        attempt_dir.join("stderr.log"),
-    ))
-}
-
-fn ensure_real_directory(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "{} must be a directory and not a symbolic link",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
 }
 
 fn open_log(path: &Path) -> io::Result<fs::File> {

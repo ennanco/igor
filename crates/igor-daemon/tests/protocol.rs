@@ -6,6 +6,102 @@ use igor_daemon::{
     Response, ResponseEnvelope, Version,
 };
 
+#[tokio::test]
+async fn storage_inventory_round_trips_with_explicit_unmeasured_bytes() -> Result<(), Box<dyn Error>>
+{
+    for project_id in [None, Some(igor_core::ProjectId::new())] {
+        let gc = RequestEnvelope::new(Request::GcPlan {
+            project_id,
+            failed_only: false,
+        });
+        assert_eq!(
+            serde_json::from_value::<RequestEnvelope>(serde_json::to_value(&gc)?)?,
+            gc
+        );
+        let request = RequestEnvelope::new(Request::StorageStatus { project_id });
+        assert_eq!(
+            serde_json::from_value::<RequestEnvelope>(serde_json::to_value(&request)?)?,
+            request
+        );
+    }
+    let temporary = tempfile::tempdir()?;
+    let database = igor_core::Database::open(temporary.path().join("storage.db")).await?;
+    let root = temporary.path();
+    let paths = igor_core::RuntimePaths {
+        config_file: root.join("config"),
+        state_dir: root.join("state"),
+        runtime_dir: root.join("runtime"),
+        database: root.join("storage.db"),
+        log_dir: root.join("logs"),
+        worktree_dir: root.join("worktrees"),
+        report_dir: root.join("reports"),
+        worker_socket: root.join("worker.sock"),
+        supervisor_socket: root.join("supervisor.sock"),
+        resource_dir: root.join("resources"),
+    };
+    let gc = ResponseEnvelope::success(Response::GcPlan(database.gc_plan(None, &paths).await?));
+    let encoded = serde_json::to_value(&gc)?;
+    assert_eq!(encoded["response"]["type"], "gc_plan");
+    assert_eq!(encoded["protocol_version"], 20);
+    assert_eq!(serde_json::from_value::<ResponseEnvelope>(encoded)?, gc);
+    let response = ResponseEnvelope::success(Response::StorageStatus(
+        database.storage_status(None).await?,
+    ));
+    let encoded = serde_json::to_value(&response)?;
+    assert_eq!(encoded["protocol_version"], 20);
+    assert_eq!(encoded["response"]["type"], "storage_status");
+    assert!(encoded["response"]["actual_disk_footprint"].is_null());
+    assert_eq!(encoded["response"]["pending_log_preparations"]["count"], 0);
+    assert_eq!(
+        encoded["response"]["pending_log_preparations"]["temporary_bytes"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        serde_json::from_value::<ResponseEnvelope>(encoded)?,
+        response
+    );
+    Ok(())
+}
+
+#[test]
+fn gc_execution_wire_contract_round_trips_with_structured_outcomes() -> Result<(), Box<dyn Error>> {
+    assert_eq!(PROTOCOL_VERSION, 20);
+    let request = RequestEnvelope::new(Request::GcExecute {
+        project_id: None,
+        failed_only: true,
+        worklist: igor_core::GcWorklist::default(),
+    });
+    assert_eq!(
+        serde_json::from_value::<RequestEnvelope>(serde_json::to_value(&request)?)?,
+        request
+    );
+    for status in [
+        igor_core::GcExecutionStatus::Completed,
+        igor_core::GcExecutionStatus::AlreadyDone,
+        igor_core::GcExecutionStatus::Deferred,
+        igor_core::GcExecutionStatus::Unsafe,
+        igor_core::GcExecutionStatus::Error,
+    ] {
+        let response = ResponseEnvelope::success(Response::GcExecution(igor_core::GcExecution {
+            confirmed: true,
+            entries: vec![igor_core::GcExecutionEntry {
+                operation: igor_core::GcOperation::FailedArtifacts,
+                subject_id: "fixture".into(),
+                status,
+                cause: Some(igor_core::GcExecutionCause::new(
+                    "barrier",
+                    "current eligibility",
+                )),
+            }],
+            ..Default::default()
+        }));
+        let value = serde_json::to_value(&response)?;
+        assert_eq!(value["response"]["type"], "gc_execution");
+        assert_eq!(serde_json::from_value::<ResponseEnvelope>(value)?, response);
+    }
+    Ok(())
+}
+
 #[test]
 fn requests_have_stable_versioned_json() -> Result<(), Box<dyn Error>> {
     let encoded = serde_json::to_string(&RequestEnvelope::new(Request::DatabaseStatus))?;

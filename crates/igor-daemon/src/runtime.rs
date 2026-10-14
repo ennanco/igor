@@ -33,6 +33,7 @@ use crate::protocol::{
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * MAX_FRAME_BYTES;
+const MAX_GC_REQUEST_BYTES: usize = MAX_RESPONSE_BYTES;
 const IO_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const MAX_DATABASE_CONNECTIONS: u32 = 32;
@@ -219,8 +220,9 @@ where
                 ))?;
                 if peer_is_current_user(&stream)? {
                     let database = database.clone();
+                    let request_paths = paths.clone();
                     requests.spawn(async move {
-                        match timeout(IO_TIMEOUT, serve_connection(stream, role, database)).await {
+                        match timeout(IO_TIMEOUT, serve_connection(stream, role, database, request_paths)).await {
                             Ok(Ok(())) => {}
                             Ok(Err(error)) => {
                                 tracing::warn!(%role, %error, "daemon request failed");
@@ -363,10 +365,11 @@ async fn serve_connection(
     mut stream: UnixStream,
     role: DaemonRole,
     database: Database,
+    paths: RuntimePaths,
 ) -> io::Result<()> {
-    let response = match read_frame(&mut stream, MAX_FRAME_BYTES).await {
+    let response = match read_frame(&mut stream, MAX_GC_REQUEST_BYTES).await {
         Ok(frame) => match decode_request(&frame) {
-            Ok(request) => handle_request(role, &database, request).await,
+            Ok(request) => handle_request(role, &database, request, &paths).await,
             Err(error) => ResponseEnvelope::failure(error),
         },
         Err(error) if error.kind() == io::ErrorKind::FileTooLarge => {
@@ -387,6 +390,7 @@ async fn handle_request(
     role: DaemonRole,
     database: &Database,
     request: Request,
+    paths: &RuntimePaths,
 ) -> ResponseEnvelope {
     match request {
         Request::Health => ResponseEnvelope::success(Response::Health(Health {
@@ -425,6 +429,31 @@ async fn handle_request(
         ),
         Request::Resources => match database.resources().status().await {
             Ok(resources) => ResponseEnvelope::success(Response::Resources { resources }),
+            Err(error) => persistence_response(error),
+        },
+        Request::StorageStatus { project_id } => match database.storage_status(project_id).await {
+            Ok(status) => ResponseEnvelope::success(Response::StorageStatus(status)),
+            Err(error) => persistence_response(error),
+        },
+        Request::GcPlan {
+            project_id,
+            failed_only,
+        } => match database
+            .gc_plan_filtered(project_id, paths, failed_only)
+            .await
+        {
+            Ok(plan) => ResponseEnvelope::success(Response::GcPlan(plan)),
+            Err(error) => persistence_response(error),
+        },
+        Request::GcExecute {
+            project_id,
+            failed_only,
+            worklist,
+        } => match database
+            .gc_execute(project_id, failed_only, worklist, paths)
+            .await
+        {
+            Ok(result) => ResponseEnvelope::success(Response::GcExecution(result)),
             Err(error) => persistence_response(error),
         },
         Request::ProjectRegister { project } => match normalize_project(project) {
@@ -640,6 +669,26 @@ async fn handle_request(
             Ok(logs) => ResponseEnvelope::success(Response::Logs(logs)),
             Err(error) => persistence_response(error),
         },
+        Request::AttemptLogs { job_id, attempt_id } => match database
+            .jobs()
+            .logs_for_job_attempt(job_id, Some(attempt_id))
+            .await
+        {
+            Ok(logs) => ResponseEnvelope::success(Response::Logs(logs)),
+            Err(error) => persistence_response(error),
+        },
+        Request::RetiredLogChunk {
+            identity,
+            offset,
+            limit,
+        } => match database
+            .jobs()
+            .retired_log_chunk(&identity, offset, limit)
+            .await
+        {
+            Ok(chunk) => ResponseEnvelope::success(Response::LogTailChunk(chunk)),
+            Err(error) => persistence_response(error),
+        },
     }
 }
 
@@ -703,6 +752,15 @@ fn decode_request(frame: &[u8]) -> Result<Request, ProtocolError> {
         })?;
     if version != PROTOCOL_VERSION {
         return Err(ProtocolError::incompatible(version));
+    }
+    if frame.len() > MAX_FRAME_BYTES
+        && value
+            .get("request")
+            .and_then(|request| request.get("type"))
+            .and_then(Value::as_str)
+            != Some("gc_execute")
+    {
+        return Err(ProtocolError::frame_too_large());
     }
     let envelope: RequestEnvelope = serde_json::from_value(value)
         .map_err(|error| ProtocolError::invalid_request(error.to_string()))?;
@@ -775,6 +833,85 @@ fn validate_response(
         (Request::Version, Response::Version(value)) => value.role == role,
         (Request::DatabaseStatus, Response::DatabaseStatus(value)) => value.role == role,
         (Request::Resources, Response::Resources { .. }) => role == DaemonRole::Worker,
+        (Request::StorageStatus { project_id }, Response::StorageStatus(status)) => {
+            role == DaemonRole::Worker && *project_id == status.project_id
+        }
+        (
+            Request::GcPlan {
+                project_id,
+                failed_only,
+            },
+            Response::GcPlan(plan),
+        ) => {
+            role == DaemonRole::Worker
+                && *project_id == plan.project_id
+                && (!failed_only
+                    || plan.entries.iter().all(|e| {
+                        matches!(
+                            e.operation,
+                            igor_core::GcOperation::FailedArtifacts
+                                | igor_core::GcOperation::FailedLogRetirement
+                                | igor_core::GcOperation::OwnedFailedOutputs
+                        )
+                    }) && plan.pages.iter().all(|p| {
+                        matches!(
+                            p.operation,
+                            igor_core::GcOperation::FailedArtifacts
+                                | igor_core::GcOperation::FailedLogRetirement
+                                | igor_core::GcOperation::OwnedFailedOutputs
+                        )
+                    }))
+        }
+        (
+            Request::GcExecute {
+                project_id,
+                failed_only,
+                worklist,
+            },
+            Response::GcExecution(result),
+        ) => {
+            use igor_core::GcExecutionStatus as S;
+            role == DaemonRole::Worker
+                && *project_id == result.project_id
+                && result.confirmed
+                && result.entries.len() == worklist.selections.len()
+                && result
+                    .entries
+                    .iter()
+                    .map(|e| (e.operation as u8, &e.subject_id))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    == result.entries.len()
+                && [
+                    (S::Completed, result.completed),
+                    (S::AlreadyDone, result.already_done),
+                    (S::Deferred, result.deferred),
+                    (S::Unsafe, result.unsafe_count),
+                    (S::Error, result.errors),
+                ]
+                .iter()
+                .all(|(status, count)| {
+                    result
+                        .entries
+                        .iter()
+                        .filter(|e| e.status == *status)
+                        .count()
+                        == *count
+                })
+                && result.entries.iter().all(|e| {
+                    (!failed_only
+                        || matches!(
+                            e.operation,
+                            igor_core::GcOperation::FailedArtifacts
+                                | igor_core::GcOperation::FailedLogRetirement
+                                | igor_core::GcOperation::OwnedFailedOutputs
+                        ))
+                        && worklist.selections.iter().any(|s| {
+                            s.expected.operation == e.operation
+                                && s.expected.subject_id == e.subject_id
+                        })
+                })
+        }
         (Request::ProjectRegister { .. }, Response::Project(_))
         | (Request::ProjectRemove { .. }, Response::Project(_))
         | (Request::ProjectList, Response::Projects { .. })
@@ -789,6 +926,26 @@ fn validate_response(
         | (Request::JobCancel { .. }, Response::Cancelled(_))
         | (Request::JobRetry { .. }, Response::Retried(_))
         | (Request::JobLogs { .. }, Response::Logs(_)) => role == DaemonRole::Worker,
+        (Request::AttemptLogs { job_id, attempt_id }, Response::Logs(logs)) => {
+            role == DaemonRole::Worker && *job_id == logs.job_id && *attempt_id == logs.attempt_id
+        }
+        (
+            Request::RetiredLogChunk {
+                identity,
+                offset,
+                limit,
+            },
+            Response::LogTailChunk(chunk),
+        ) => {
+            role == DaemonRole::Worker
+                && chunk.identity == *identity
+                && *limit <= 65536
+                && *limit > 0
+                && chunk.start == (*offset).max(identity.start)
+                && chunk.end <= identity.end
+                && chunk.end.checked_sub(chunk.start) == Some(chunk.bytes.len() as u64)
+                && chunk.bytes.len() <= *limit as usize
+        }
         (
             Request::JobMetrics { job_id },
             Response::Metrics {
@@ -1008,6 +1165,204 @@ mod tests {
     use igor_core::{Project, ProjectId, initialize_project};
 
     use super::*;
+
+    #[test]
+    fn gc_worklists_use_bounded_large_frames_without_expanding_other_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = Request::GcExecute {
+            project_id: None,
+            failed_only: true,
+            worklist: igor_core::GcWorklist::default(),
+        };
+        let mut frame = serde_json::to_vec(&RequestEnvelope::new(request.clone()))?;
+        frame.resize(MAX_FRAME_BYTES + 1, b' ');
+        assert_eq!(decode_request(&frame), Ok(request));
+        let mut other = serde_json::to_vec(&RequestEnvelope::new(Request::Health))?;
+        other.resize(MAX_FRAME_BYTES + 1, b' ');
+        assert_eq!(
+            decode_request(&other).err().map(|e| e.kind),
+            Some(ProtocolErrorKind::FrameTooLarge)
+        );
+        let old = serde_json::json!({"protocol_version":17,"request":{"type":"gc_execute","project_id":null,"failed_only":true,"worklist":{"selections":[]}}});
+        assert_eq!(
+            decode_request(&serde_json::to_vec(&old)?)
+                .err()
+                .map(|e| e.kind),
+            Some(ProtocolErrorKind::IncompatibleProtocol)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn storage_response_requires_worker_and_matching_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let database = Database::open(temporary.path().join("storage.db")).await?;
+        let status = database.storage_status(None).await?;
+        let root = temporary.path();
+        let paths = RuntimePaths {
+            config_file: root.join("config"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("runtime"),
+            database: root.join("storage.db"),
+            log_dir: root.join("logs"),
+            worktree_dir: root.join("worktrees"),
+            report_dir: root.join("reports"),
+            worker_socket: root.join("worker.sock"),
+            supervisor_socket: root.join("supervisor.sock"),
+            resource_dir: root.join("resources"),
+        };
+        let plan = database.gc_plan(None, &paths).await?;
+        let execution_request = Request::GcExecute {
+            project_id: None,
+            failed_only: true,
+            worklist: igor_core::GcWorklist::default(),
+        };
+        let execution = igor_core::GcExecution {
+            confirmed: true,
+            ..Default::default()
+        };
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                execution_request.clone(),
+                Response::GcExecution(execution.clone())
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Supervisor,
+                execution_request.clone(),
+                Response::GcExecution(execution.clone())
+            )
+            .is_err()
+        );
+        let wrong_scope = igor_core::GcExecution {
+            project_id: Some(ProjectId::new()),
+            ..execution
+        };
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                execution_request.clone(),
+                Response::GcExecution(wrong_scope)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            handle_request(DaemonRole::Supervisor, &database, execution_request, &paths)
+                .await
+                .error
+                .map(|e| e.kind),
+            Some(ProtocolErrorKind::InvalidRequest)
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                Request::GcPlan {
+                    project_id: None,
+                    failed_only: false
+                },
+                Response::GcPlan(plan.clone())
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Supervisor,
+                Request::GcPlan {
+                    project_id: None,
+                    failed_only: false
+                },
+                Response::GcPlan(plan.clone())
+            )
+            .is_err()
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                Request::GcPlan {
+                    project_id: Some(ProjectId::new()),
+                    failed_only: false
+                },
+                Response::GcPlan(plan)
+            )
+            .is_err()
+        );
+        let rejected_gc = handle_request(
+            DaemonRole::Supervisor,
+            &database,
+            Request::GcPlan {
+                project_id: None,
+                failed_only: false,
+            },
+            &paths,
+        )
+        .await;
+        assert_eq!(
+            rejected_gc.error.map(|e| e.kind),
+            Some(ProtocolErrorKind::InvalidRequest)
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                Request::StorageStatus { project_id: None },
+                Response::StorageStatus(status.clone())
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Supervisor,
+                Request::StorageStatus { project_id: None },
+                Response::StorageStatus(status.clone())
+            )
+            .is_err()
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                Request::StorageStatus {
+                    project_id: Some(ProjectId::new())
+                },
+                Response::StorageStatus(status.clone())
+            )
+            .is_err()
+        );
+        let mut wrong = status;
+        wrong.project_id = Some(ProjectId::new());
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                Request::StorageStatus { project_id: None },
+                Response::StorageStatus(wrong)
+            )
+            .is_err()
+        );
+        let rejected = handle_request(
+            DaemonRole::Supervisor,
+            &database,
+            Request::StorageStatus { project_id: None },
+            &paths,
+        )
+        .await;
+        assert_eq!(
+            rejected.error.map(|e| e.kind),
+            Some(crate::ProtocolErrorKind::InvalidRequest)
+        );
+        let missing = handle_request(
+            DaemonRole::Worker,
+            &database,
+            Request::StorageStatus {
+                project_id: Some(ProjectId::new()),
+            },
+            &paths,
+        )
+        .await;
+        assert_eq!(missing.error, Some(ProtocolError::not_found("project")));
+        Ok(())
+    }
 
     #[test]
     fn project_registration_rejects_symlinked_configuration()

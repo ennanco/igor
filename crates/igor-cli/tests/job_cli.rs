@@ -831,6 +831,269 @@ fn configure_metric_extractor(fixture: &Fixture, script: &str) -> TestResult {
     Ok(())
 }
 
+fn preserve_raw_success_logs(fixture: &Fixture) -> TestResult {
+    let path = fixture.project.join(".igor/project.toml");
+    let mut config: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+    let table = config.as_table_mut().ok_or("project config table")?;
+    let retention = table
+        .entry("retention")
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    retention
+        .as_table_mut()
+        .ok_or("retention table")?
+        .insert("compress_success_logs".into(), toml::Value::Boolean(false));
+    fs::write(path, toml::to_string(&config)?)?;
+    git(&fixture.project, &["add", ".igor/project.toml"])?;
+    git(
+        &fixture.project,
+        &["commit", "-qm", "preserve raw logs for fixture inspection"],
+    )?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_owned_outputs_and_full_logs_real_process_acceptance() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let config = fixture.project.join(".igor/project.toml");
+    fs::write(
+        &config,
+        "schema_version = 1\n[retention]\nfailed_full_logs = 'delete-after-diagnosis'\nfailed_artifacts = 'delete-after-diagnosis'\nfailed_log_tail_kb = 1\n[artifacts]\nkeep_on_failure = ['keep.bin']\n",
+    )?;
+    git(&fixture.project, &["add", ".igor/project.toml"])?;
+    git(
+        &fixture.project,
+        &["commit", "-qm", "freeze failed log retention"],
+    )?;
+    let file = fixture._temporary.path().join("failed-logs.toml");
+    let outside = fixture._temporary.path().join("external-output.bin");
+    fs::write(
+        &file,
+        format!(
+            "schema_version = 1\nname = 'failed binary logs'\n[execution]\nprogram = '/bin/sh'\nargs = ['-c', 'root=$(readlink /proc/$$/fd/1); root=${{root%/*}}; dd if=/dev/zero of=\"$root/disposable.bin\" bs=1024 count=256 2>/dev/null; for name in .scratch checkpoint.tmp results.gz config index; do printf disposable > \"$root/$name\"; done; printf keep > \"$root/keep.bin\"; printf project > checkout-output.bin; printf external > \"$1\"; i=0; while [ $i -lt 2000 ]; do printf \"\\000\\377x\"; printf \"\\000\\376y\" >&2; i=$((i+1)); done; exit 7', 'igor-fixture', '{}']\n[resources]\nmode = 'shared'\n",
+            outside.display()
+        ),
+    )?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args(["submit", "--json", "--file", file.to_str().ok_or("file")?])
+            .output()?,
+    )?;
+    let job: JobId = submitted["spec"]["id"].as_str().ok_or("job")?.parse()?;
+    let done = fixture
+        .run()
+        .args(["wait", &job.to_string(), "--json"])
+        .output()?;
+    let done: Value = serde_json::from_slice(&done.stdout)?;
+    assert_eq!(done["job"]["state"], "failed");
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let logs = database.jobs().logs_for_job(job).await?;
+    let stdout = logs.stdout_path.ok_or("stdout")?;
+    let stderr = logs.stderr_path.ok_or("stderr")?;
+    let original = fs::read(&stdout)?;
+    assert_eq!(original.len(), 6000);
+    let expected = &original[original.len() - 1024..];
+    let original_stderr = fs::read(&stderr)?;
+    assert_eq!(original_stderr.len(), 6000);
+    let expected_stderr = &original_stderr[4976..];
+    let root = stdout.parent().ok_or("private namespace")?;
+    let disposable = root.join("disposable.bin");
+    let keep = root.join("keep.bin");
+    assert_eq!(fs::metadata(&disposable)?.len(), 256 * 1024);
+    for name in [
+        ".scratch",
+        "checkpoint.tmp",
+        "results.gz",
+        "config",
+        "index",
+    ] {
+        assert!(root.join(name).is_file());
+    }
+    assert_eq!(fs::read(&keep)?, b"keep");
+    let artifacts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE attempt_id = ?")
+        .bind(logs.attempt_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(artifacts, 0);
+    let before = output_json(
+        fixture
+            .run()
+            .args(["gc", "--failed", "--dry-run", "--json"])
+            .output()?,
+    )?;
+    assert!(
+        before["entries"]
+            .as_array()
+            .ok_or("entries")?
+            .iter()
+            .any(|e| e["operation"] == "owned_failed_outputs" && e["status"] == "deferred")
+    );
+    assert_eq!(fs::read(&stdout)?, original);
+    assert_eq!(fs::read(&stderr)?, original_stderr);
+    assert!(disposable.exists());
+    let id = igor_core::RecoveryId::new().to_string();
+    sqlx::query("INSERT INTO recoveries(id,attempt_id,state,diagnosis_json,idempotency_key) VALUES (?,?,'proposed','{}',?)").bind(&id).bind(logs.attempt_id.to_string()).bind(&id).execute(database.pool()).await?;
+    let plan = output_json(
+        fixture
+            .run()
+            .args(["gc", "--failed", "--dry-run", "--json"])
+            .output()?,
+    )?;
+    let entries = plan["entries"].as_array().ok_or("GC entries")?;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e["operation"] == "failed_log_retirement" && e["status"] == "ready")
+            .count(),
+        2
+    );
+    assert_eq!(fs::read(&stdout)?, original);
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["operation"] == "owned_failed_outputs" && e["status"] == "ready")
+    );
+    let manifests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owned_output_manifest")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(manifests, 0, "preview must not discover durably");
+    let home = fixture.home.clone();
+    let paths = igor_core::RuntimePaths {
+        config_file: home.join("config/igor/config.toml"),
+        state_dir: home.join("state/igor"),
+        runtime_dir: home.join("runtime/igor"),
+        database: home.join("state/igor/igor.sqlite3"),
+        log_dir: home.join("state/igor/logs"),
+        worktree_dir: home.join("state/igor/worktrees"),
+        report_dir: home.join("state/igor/reports"),
+        worker_socket: home.join("runtime/igor/worker.sock"),
+        supervisor_socket: home.join("runtime/igor/supervisor.sock"),
+        resource_dir: home.join("state/igor/resources"),
+    };
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM failed_log_retirements WHERE attempt_id = ? AND state = 'completed'").bind(logs.attempt_id.to_string()).fetch_one(database.pool()).await?;
+            let outputs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM owned_output_manifest WHERE attempt_id = ? AND state = 'completed'").bind(logs.attempt_id.to_string()).fetch_one(database.pool()).await?;
+            if count == 2 && outputs == 6 { return Ok::<_,Box<dyn Error>>(()); }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await??;
+    supervisor.stop()?;
+    assert!(!stdout.exists() && !stderr.exists());
+    assert!(!disposable.exists());
+    for name in [
+        ".scratch",
+        "checkpoint.tmp",
+        "results.gz",
+        "config",
+        "index",
+    ] {
+        assert!(!root.join(name).exists());
+    }
+    assert_eq!(fs::read(&keep)?, b"keep");
+    assert_eq!(
+        fs::read(fixture.project.join("checkout-output.bin"))?,
+        b"project"
+    );
+    assert_eq!(fs::read(&outside)?, b"external");
+    assert!(root.is_dir());
+    let client = igor_daemon::Client::new(&paths);
+    let identity = database
+        .jobs()
+        .retired_log_tail(logs.attempt_id, "stdout")
+        .await?
+        .ok_or("tail identity")?;
+    assert!(
+        client
+            .request(
+                igor_daemon::DaemonRole::Worker,
+                igor_daemon::Request::RetiredLogChunk {
+                    identity: identity.clone(),
+                    offset: 0,
+                    limit: 65537
+                }
+            )
+            .await
+            .is_err()
+    );
+    let chunk = client
+        .request(
+            igor_daemon::DaemonRole::Worker,
+            igor_daemon::Request::RetiredLogChunk {
+                identity,
+                offset: 0,
+                limit: 65536,
+            },
+        )
+        .await?;
+    let igor_daemon::Response::LogTailChunk(chunk) = chunk else {
+        return Err("tail chunk response".into());
+    };
+    assert_eq!(chunk.bytes, expected);
+    assert_eq!(chunk.start, 4976);
+    assert_eq!(chunk.end, 6000);
+    let output = fixture.run().args(["logs", &job.to_string()]).output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, expected);
+    assert!(
+        output
+            .stderr
+            .windows(b"log prefix omitted".len())
+            .any(|w| w == b"log prefix omitted")
+    );
+    assert!(output.stderr.ends_with(expected_stderr));
+    let followed = fixture
+        .run()
+        .args(["logs", &job.to_string(), "--follow"])
+        .output()?;
+    assert!(followed.status.success());
+    assert_eq!(followed.stdout, expected);
+    Ok(())
+}
+
+async fn wait_for_successful_extraction(
+    database: &Database,
+    action_id: &str,
+    expected_attempts: i64,
+    phase: &str,
+) -> Result<(String, i64, Option<String>), Box<dyn Error>> {
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row: (String, i64, Option<String>) =
+                sqlx::query_as("SELECT state, attempts, last_error FROM actions WHERE id = ?")
+                    .bind(action_id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if row.0 == "succeeded" && row.1 == expected_attempts {
+                return Ok::<_, Box<dyn Error>>(row);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            // Extraction errors are fixed diagnostic codes, not subprocess output or context.
+            let (state, attempts, last_error): (String, i64, Option<String>) =
+                sqlx::query_as("SELECT state, attempts, last_error FROM actions WHERE id = ?")
+                    .bind(action_id)
+                    .fetch_one(database.pool())
+                    .await?;
+            Err(format!(
+                "{phase} extraction timed out: state={state}, attempts={attempts}, last_error={last_error:?}"
+            )
+            .into())
+        }
+    }
+}
+
 fn submit_metric_extractor_job(fixture: &Fixture) -> Result<JobId, Box<dyn Error>> {
     let job_file = fixture._temporary.path().join("metric-extractor-job.toml");
     fs::write(
@@ -1048,6 +1311,11 @@ async fn metric_extractor_publishes_verified_artifacts() -> TestResult {
         artifact.state,
         igor_core::ArtifactPublicationState::Published
     );
+    assert_eq!(
+        artifact.lifecycle,
+        igor_core::ArtifactLifecycleState::Published
+    );
+    assert!(!artifact.diagnosis_required);
     let staged = fixture
         .home
         .join("state/igor/artifact-staging")
@@ -1103,6 +1371,9 @@ async fn repeating_successful_extraction_preserves_document_indexes_and_publishe
         &fixture,
         "#!/bin/sh\nset -eu\ncat > /dev/null\nif [ -f extractor-runs ]; then runs=$(cat extractor-runs); else runs=0; fi\nprintf '%s\n' \"$((runs+1))\" > extractor-runs\nprintf same-data > repeat.bin\nprintf '%s\n' '{\"schema_version\":1,\"status\":\"success\",\"metrics\":{\"score\":0.75},\"selection\":{\"split\":\"validation\",\"metric\":\"score\",\"value\":0.75},\"artifacts\":[{\"path\":\"repeat.bin\",\"role\":\"metrics\"}]}'\n",
     )?;
+    // Intentional extractor replay requires raw source logs after the first success;
+    // otherwise the concurrent archive task may compress and retire them before replay.
+    preserve_raw_success_logs(&fixture)?;
     let mut supervisor = spawn_metric_supervisor(&fixture)?;
     wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
     let job_id = submit_metric_extractor_job(&fixture)?;
@@ -1129,19 +1400,7 @@ async fn repeating_successful_extraction_preserves_document_indexes_and_publishe
     .bind(attempt_id.to_string())
     .fetch_one(database.pool())
     .await?;
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let state: String = sqlx::query_scalar("SELECT state FROM actions WHERE id = ?")
-                .bind(&action_id)
-                .fetch_one(database.pool())
-                .await?;
-            if state == "succeeded" {
-                return Ok::<_, Box<dyn Error>>(());
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await??;
+    wait_for_successful_extraction(&database, &action_id, 1, "first").await?;
     let before = output_json(
         fixture
             .run()
@@ -1192,20 +1451,8 @@ async fn repeating_successful_extraction_preserves_document_indexes_and_publishe
     assert_eq!(updated.rows_affected(), 1);
     supervisor = spawn_metric_supervisor(&fixture)?;
     wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
-    let (state, attempts, last_error) = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let row: (String, i64, Option<String>) =
-                sqlx::query_as("SELECT state, attempts, last_error FROM actions WHERE id = ?")
-                    .bind(&action_id)
-                    .fetch_one(database.pool())
-                    .await?;
-            if row.0 == "succeeded" && row.1 == 2 {
-                return Ok::<_, Box<dyn Error>>(row);
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await??;
+    let (state, attempts, last_error) =
+        wait_for_successful_extraction(&database, &action_id, 2, "second (replay)").await?;
     assert_eq!(state, "succeeded");
     assert_eq!(attempts, 2);
     assert_eq!(last_error, None);
@@ -1324,6 +1571,11 @@ async fn metric_extractor_partial_result_keeps_artifacts_unpublished() -> TestRe
         .await?
         .ok_or("missing partial artifact")?;
     assert_eq!(artifact.state, igor_core::ArtifactPublicationState::Staged);
+    assert_eq!(
+        artifact.lifecycle,
+        igor_core::ArtifactLifecycleState::Failed
+    );
+    assert!(artifact.diagnosis_required);
     assert!(artifact.metadata.get("published_path").is_none());
     assert!(
         !fixture
@@ -1341,6 +1593,126 @@ async fn metric_extractor_partial_result_keeps_artifacts_unpublished() -> TestRe
                 .join(&id)
         )?,
         b"partial"
+    );
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn supervisor_cleans_failed_artifact_only_after_diagnosis() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_extractor(
+        &fixture,
+        "#!/bin/sh\nset -eu\ncat > /dev/null\nprintf partial > partial.bin\nprintf '%s\\n' '{\"schema_version\":1,\"status\":\"partial\",\"metrics\":{},\"artifacts\":[{\"path\":\"partial.bin\",\"role\":\"metrics\"}]}'\n",
+    )?;
+    preserve_raw_success_logs(&fixture)?;
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let attempt_id = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing job")?
+        .attempts[0]
+        .spec
+        .id();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if database
+                .actions()
+                .document_for_attempt(attempt_id)
+                .await?
+                .is_some()
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let id: String = sqlx::query_scalar("SELECT id FROM artifacts WHERE attempt_id = ?")
+        .bind(attempt_id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    let source = fixture
+        .home
+        .join("state/igor/logs")
+        .join(attempt_id.to_string())
+        .join("partial.bin");
+    let staged = fixture
+        .home
+        .join("state/igor/artifact-staging")
+        .join(attempt_id.to_string())
+        .join(&id);
+    assert_eq!(fs::read(&source)?, b"partial");
+    assert_eq!(fs::read(&staged)?, b"partial");
+    assert_eq!(
+        database
+            .artifacts()
+            .get(id.parse()?)
+            .await?
+            .ok_or("missing artifact")?
+            .lifecycle,
+        igor_core::ArtifactLifecycleState::Failed
+    );
+    let recovery = igor_core::RecoveryId::new().to_string();
+    sqlx::query("INSERT INTO recoveries (id, attempt_id, state, diagnosis_json, idempotency_key) VALUES (?, ?, 'proposed', '{}', ?)")
+        .bind(&recovery).bind(attempt_id.to_string()).bind(&recovery)
+        .execute(database.pool()).await?;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if database
+                .artifacts()
+                .get(id.parse()?)
+                .await?
+                .ok_or("missing artifact")?
+                .state
+                == igor_core::ArtifactPublicationState::Removed
+            {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+    assert!(!source.exists() && !staged.exists());
+    let cleanup_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: Option<(String, String)> = sqlx::query_as("SELECT id, state FROM actions WHERE attempt_id = ? AND job_id = ? AND kind = 'cleanup_failed_artifacts'")
+                .bind(attempt_id.to_string()).bind(job_id.to_string()).fetch_optional(database.pool()).await?;
+            if let Some((id, state)) = row && state == "succeeded" {
+                return Ok::<_, Box<dyn Error>>(id);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await??;
+    let tombstone = database
+        .cleanup_tombstone("failed_artifact_retention", &id)
+        .await?
+        .ok_or("missing cleanup tombstone")?;
+    assert_eq!(tombstone["action_id"], cleanup_id);
+    assert_eq!(tombstone["outcome"], "removed");
+    assert!(source.with_file_name("stdout.log").is_file());
+    assert!(source.with_file_name("stderr.log").is_file());
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(job_id)
+            .await?
+            .ok_or("missing job")?
+            .state,
+        JobState::Succeeded
     );
     supervisor.stop()?;
     Ok(())
@@ -1625,6 +1997,88 @@ async fn metric_extractor_failure_artifact_registration_reaches_terminal_state()
         "artifact_registration_failed",
     )
     .await
+}
+
+#[tokio::test]
+async fn terminal_extraction_failure_tracks_staged_artifact_as_failed() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    configure_metric_extractor(
+        &fixture,
+        "#!/bin/sh\nset -eu\ncat > /dev/null\nprintf partial-data > partial.bin\nprintf '%s\n' '{\"schema_version\":1,\"status\":\"success\",\"metrics\":{},\"artifacts\":[{\"path\":\"partial.bin\",\"role\":\"metrics\"}]}'\n",
+    )?;
+    let outside = fixture._temporary.path().join("outside-artifacts");
+    fs::create_dir_all(&outside)?;
+    let job_id = submit_metric_extractor_job(&fixture)?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &job_id.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    std::os::unix::fs::symlink(&outside, fixture.project.join("artifacts"))?;
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let attempt_id = database
+        .jobs()
+        .detail(job_id)
+        .await?
+        .ok_or("missing job")?
+        .attempts[0]
+        .spec
+        .id();
+    let armed = sqlx::query("UPDATE actions SET attempts = 2, available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE attempt_id = ? AND kind = 'extract_metrics' AND state = 'pending'")
+        .bind(attempt_id.to_string()).execute(database.pool()).await?;
+    assert_eq!(armed.rows_affected(), 1);
+    let mut supervisor = spawn_metric_supervisor(&fixture)?;
+    wait_for_marker(&fixture.home.join("runtime/igor/supervisor.sock"))?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM actions WHERE attempt_id = ? AND kind = 'extract_metrics'",
+            )
+            .bind(attempt_id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            if state == "failed" {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let (artifact_id, physical_state, lifecycle): (String, String, String) = sqlx::query_as(
+        "SELECT id, state, lifecycle_state FROM artifacts WHERE attempt_id = ? AND path = 'partial.bin'",
+    ).bind(attempt_id.to_string()).fetch_one(database.pool()).await?;
+    assert_eq!(physical_state, "staged");
+    assert_eq!(lifecycle, "failed");
+    assert!(
+        database
+            .artifacts()
+            .get(artifact_id.parse()?)
+            .await?
+            .ok_or("missing failed artifact")?
+            .diagnosis_required
+    );
+    let staged = fixture
+        .home
+        .join("state/igor/artifact-staging")
+        .join(attempt_id.to_string())
+        .join(artifact_id);
+    assert_eq!(fs::read(staged)?, b"partial-data");
+    assert_eq!(fs::read_dir(outside)?.count(), 0);
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(job_id)
+            .await?
+            .ok_or("missing job")?
+            .state,
+        JobState::Succeeded
+    );
+    supervisor.stop()?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -2870,13 +3324,14 @@ async fn fake_docker_cancellation_escalates_to_kill() -> TestResult {
     let job_id = submit_docker_job(&fixture, &job_file)?;
     let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
     let running = wait_for_container(&database, job_id).await?;
+    let cancelled = fixture
+        .run()
+        .args(["cancel", &job_id.to_string(), "--grace-seconds", "1"])
+        .output()?;
     assert!(
-        fixture
-            .run()
-            .args(["cancel", &job_id.to_string(), "--grace-seconds", "1"])
-            .output()?
-            .status
-            .success()
+        cancelled.status.success(),
+        "cancel failed: {}",
+        String::from_utf8_lossy(&cancelled.stderr)
     );
     let waited = fixture
         .run()
@@ -2940,6 +3395,15 @@ async fn fake_docker_timeout_kills_and_persists_failure() -> TestResult {
         container.error.as_deref(),
         Some("docker_timeout: configured execution timeout elapsed")
     );
+    let tails = database
+        .jobs()
+        .failed_log_tails(running.attempt_id)
+        .await?
+        .ok_or("missing failed Docker log tails")?;
+    assert_eq!(tails.stdout, b"fake stdout\n");
+    assert_eq!(tails.stderr, b"fake stderr\n");
+    assert_eq!(tails.limit_kb, 512);
+    assert!(tails.complete);
     let invocations = fs::read_to_string(invocation_log)?;
     assert!(invocations.contains("kill fake-container"));
     assert!(!invocations.contains("stop --time "));
@@ -5017,6 +5481,62 @@ fn logs_follow_and_preserve_large_and_binary_output() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logs_read_supervisor_published_binary_success_archives() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    let mut supervisor = Worker(
+        fixture
+            .run()
+            .arg("supervisor")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let binary_job = submit_process(&fixture, "binary-output.sh")?;
+    assert!(
+        fixture
+            .run()
+            .args(["wait", &binary_job.to_string()])
+            .output()?
+            .status
+            .success()
+    );
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let logs = database.jobs().logs_for_job(binary_job).await?;
+        if let (Some(stdout), Some(stderr)) = (logs.stdout_archive, logs.stderr_archive)
+            && !stdout.original_path.exists()
+            && !stderr.original_path.exists()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "supervisor did not retire raw binary logs"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let expected: Vec<u8> = [0, 1, 128, 255].into_iter().cycle().take(1024).collect();
+    for args in [
+        vec!["logs".to_owned(), binary_job.to_string()],
+        vec!["logs".into(), "--follow".into(), binary_job.to_string()],
+    ] {
+        let logs = fixture.run().args(args).output()?;
+        assert!(
+            logs.status.success(),
+            "{}",
+            String::from_utf8_lossy(&logs.stderr)
+        );
+        assert_eq!(logs.stdout, expected);
+        assert_eq!(logs.stderr, expected);
+    }
+    supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_transient_unit_completion_and_restart_are_opt_in() -> TestResult {
     if std::env::var("IGOR_RUN_SYSTEMD_TESTS").as_deref() != Ok("1") {
         return Ok(());
@@ -5386,18 +5906,87 @@ async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_wo
         listener.local_addr()?
     );
     let fixture = Fixture::with_global_config(Some(&config))?;
+    preserve_raw_success_logs(&fixture)?;
     let server = tokio::spawn(async move {
-        for response in [
-            "HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n{\"ok\":false,\"parameters\":{\"retry_after\":2}}",
-            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true}",
-        ] {
+        const MAX_HEADER_BYTES: usize = 64 * 1024;
+        const MAX_BODY_BYTES: usize = 64 * 1024;
+        let mut original_text: Option<String> = None;
+        loop {
             let (mut stream, _) = listener.accept().await?;
-            let mut buffer = [0u8; 2048];
-            let read = stream.read(&mut buffer).await?;
-            if !String::from_utf8_lossy(&buffer[..read]).contains("/sendMessage") {
+            // Accumulate the full request head before touching the body so a
+            // partial read can never masquerade as a complete Telegram call.
+            let mut request: Vec<u8> = Vec::new();
+            let header_end = loop {
+                if let Some(found) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    if found + 4 > MAX_HEADER_BYTES {
+                        return Err(std::io::Error::other("Telegram headers exceeded limit"));
+                    }
+                    break found + 4;
+                }
+                if request.len() >= MAX_HEADER_BYTES {
+                    return Err(std::io::Error::other("Telegram headers exceeded limit"));
+                }
+                let mut chunk = [0u8; 4096];
+                let read = stream.read(&mut chunk).await?;
+                if read == 0 {
+                    return Err(std::io::Error::other(
+                        "Telegram request ended before complete headers",
+                    ));
+                }
+                request.extend_from_slice(&chunk[..read]);
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            if !headers.contains("/sendmessage") {
                 return Err(std::io::Error::other("unexpected Telegram endpoint"));
             }
-            stream.write_all(response.as_bytes()).await?;
+            let content_length = headers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.trim() == "content-length")
+                .filter_map(|(_, value)| value.trim().parse::<usize>().ok())
+                .next()
+                .ok_or_else(|| std::io::Error::other("Telegram request missing Content-Length"))?;
+            if content_length > MAX_BODY_BYTES {
+                return Err(std::io::Error::other("Telegram body exceeded limit"));
+            }
+            let mut chunk = [0u8; 4096];
+            while request.len() - header_end < content_length {
+                let read = stream.read(&mut chunk).await?;
+                if read == 0 {
+                    return Err(std::io::Error::other(
+                        "Telegram request body ended before Content-Length",
+                    ));
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let payload: Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length])
+                    .map_err(|_| std::io::Error::other("invalid Telegram JSON body"))?;
+            let text = payload["text"]
+                .as_str()
+                .ok_or_else(|| std::io::Error::other("Telegram message missing text"))?;
+            let original_retry = original_text.as_deref() == Some(text);
+            let response = if original_text.is_none() {
+                original_text = Some(text.to_owned());
+                "HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n{\"ok\":false,\"parameters\":{\"retry_after\":2}}"
+            } else {
+                "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"ok\":true}"
+            };
+            // The fixture keeps the token out of every response: only an
+            // explicit JSON content type/length header pair is added.
+            let (head, body) = response
+                .split_once("\r\n\r\n")
+                .ok_or_else(|| std::io::Error::other("malformed Telegram fixture response"))?;
+            let reply = format!(
+                "{head}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await?;
+            // Unrelated notifications succeed without consuming the original
+            // message's retry response or closing its endpoint before restart.
+            if original_retry {
+                break;
+            }
         }
         Ok::<_, std::io::Error>(())
     });
@@ -5447,6 +6036,9 @@ async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_wo
     })
     .await
     .map_err(|_| "Telegram delivery did not record rate limiting within 10 seconds")??;
+    // Keep the original retry pending until the deliberate supervisor restart.
+    sqlx::query("UPDATE deliveries SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+60 seconds') WHERE id = ?")
+        .bind(&delivery_id).execute(database.pool()).await?;
     // A rate-limited notification endpoint cannot hold the worker queue.
     let next_job = submit("/usr/bin/env")?;
     let next = tokio::time::timeout(Duration::from_secs(5), async {
@@ -5465,6 +6057,33 @@ async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_wo
     let logs = database.jobs().logs_for_job(next_job).await?;
     let stdout = logs.stdout_path.ok_or("missing environment job log")?;
     assert!(!fs::read_to_string(stdout)?.contains(TOKEN));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let delivered: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM deliveries WHERE state = 'delivered'
+                 AND idempotency_key IN
+                 (SELECT 'telegram:action:' || id FROM actions WHERE job_id = ?))",
+            )
+            .bind(next_job.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            if delivered {
+                return Ok::<_, Box<dyn Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "next job notification was not delivered during the original retry")??;
+    let original_state: String = sqlx::query_scalar("SELECT state FROM deliveries WHERE id = ?")
+        .bind(&delivery_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(original_state, "pending");
+    assert!(
+        !server.is_finished(),
+        "Telegram mock closed after an unrelated job notification"
+    );
     supervisor.stop()?;
     sqlx::query("UPDATE deliveries SET available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
         .bind(&delivery_id).execute(database.pool()).await?;
@@ -5503,5 +6122,104 @@ async fn telegram_delivery_recovers_after_supervisor_restart_without_blocking_wo
     assert!(!error.unwrap_or_default().contains(TOKEN));
     server.await??;
     supervisor.stop()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_process_persists_bounded_binary_log_tails() -> TestResult {
+    let _guard = worker_test_guard()?;
+    let fixture = Fixture::new()?;
+    fs::write(
+        fixture.project.join(".igor/project.toml"),
+        "schema_version = 1\n[retention]\nfailed_log_tail_kb = 1\n",
+    )?;
+    git(&fixture.project, &["add", ".igor/project.toml"])?;
+    git(
+        &fixture.project,
+        &["commit", "-qm", "retain one kilobyte of failed logs"],
+    )?;
+
+    let payload = fixture._temporary.path().join("failed-tail-input.bin");
+    let mut payload_bytes: Vec<u8> = vec![b'A'; 1_600];
+    payload_bytes.extend_from_slice(b"\0\xfftail-of-failed-log");
+    fs::write(&payload, &payload_bytes)?;
+
+    let job_file = fixture._temporary.path().join("failed-tail-job.toml");
+    let script = format!(
+        "cat '{}'; cat '{}' >&2; exit 7",
+        payload.display(),
+        payload.display()
+    );
+    fs::write(
+        &job_file,
+        format!(
+            "schema_version = 1\nname = 'failed tail'\n[execution]\nprogram = '/bin/sh'\n\
+             args = ['-c', {}]\n[resources]\nmode = 'shared'\n",
+            serde_json::to_string(&script)?
+        ),
+    )?;
+    let submitted = output_json(
+        fixture
+            .run()
+            .args([
+                "submit",
+                "--json",
+                "--file",
+                job_file.to_str().ok_or("non-UTF-8 failed-tail job")?,
+            ])
+            .output()?,
+    )?;
+    let job_id: JobId = submitted["spec"]["id"]
+        .as_str()
+        .ok_or("missing failed-tail job id")?
+        .parse()?;
+
+    let waited = fixture
+        .run()
+        .args(["wait", &job_id.to_string(), "--json"])
+        .output()?;
+    assert_eq!(waited.status.code(), Some(1));
+    let waited: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited["job"]["state"], "failed");
+    let attempt_id: AttemptId = waited["attempts"][0]["spec"]["id"]
+        .as_str()
+        .ok_or("missing failed-tail attempt id")?
+        .parse()?;
+
+    let database = Database::open(fixture.home.join("state/igor/igor.sqlite3")).await?;
+    let tails = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row: Option<(Vec<u8>, Vec<u8>, i64, i64)> = sqlx::query_as(
+                "SELECT stdout, stderr, limit_kb, complete FROM failed_log_tails
+                 WHERE attempt_id = ?",
+            )
+            .bind(attempt_id.to_string())
+            .fetch_optional(database.pool())
+            .await?;
+            if row.is_some() {
+                return Ok::<_, Box<dyn Error>>(row);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "failed log tails were not persisted")??;
+    let (stdout, stderr, limit_kb, complete) = tails.ok_or("missing failed log tails row")?;
+
+    let expected: Vec<u8> = payload_bytes[payload_bytes.len() - 1024..].to_vec();
+    assert_eq!(limit_kb, 1);
+    assert_eq!(complete, 1);
+    assert_eq!(stdout, expected);
+    assert_eq!(stderr, expected);
+    assert!(stdout.contains(&0xff));
+
+    let process = database
+        .jobs()
+        .process_for_attempt(attempt_id)
+        .await?
+        .ok_or("missing durable process record")?;
+    assert_eq!(fs::read(&process.stdout_path)?, payload_bytes);
+    assert_eq!(fs::read(&process.stderr_path)?, payload_bytes);
+    assert!(fs::read(&process.stdout_path)?.len() > 1024);
     Ok(())
 }

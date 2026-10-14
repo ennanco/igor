@@ -7,7 +7,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+flate2.workspace = true
+globset.workspace = true
 libc.workspace = true
+nix.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

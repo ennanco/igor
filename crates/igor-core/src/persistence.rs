@@ -1,8 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, Metadata, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    io::{Read, Seek, SeekFrom, Write},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    },
     path::{Component, Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -20,14 +23,41 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    ActionId, ActionState, ArtifactPublicationState, ArtifactRole, AttemptId, AttemptSpec,
-    AttemptState, DeliveryId, DeliveryState, DockerContainerState, DockerExecutorSpec,
-    DockerImageIdentity, DomainError, Event, EventId, EventKind, EventPayload, ExecutorSpec,
-    FamilyFile, FamilyId, GenerationId, GenerationIdentity, GpuRequest, JobId, JobSpec, JobState,
-    PreparedFamily, Project, ProjectId, ResourceId, ResourceMode, ResourceRequest, TransitionState,
+    ActionId, ActionState, ArtifactLifecycleState, ArtifactPublicationState, ArtifactRole,
+    AttemptId, AttemptSpec, AttemptState, DeliveryId, DeliveryState, DockerContainerState,
+    DockerExecutorSpec, DockerImageIdentity, DomainError, Event, EventId, EventKind, EventPayload,
+    ExecutorSpec, FamilyFile, FamilyId, GenerationId, GenerationIdentity, GpuRequest, JobId,
+    JobSpec, JobState, PreparedFamily, Project, ProjectId, ResourceId, ResourceMode,
+    ResourceRequest, TransitionState,
 };
 
 static MIGRATOR: Migrator = sqlx::migrate!();
+#[path = "cleanup_evidence.rs"]
+mod cleanup_evidence;
+#[path = "failed_cleanup.rs"]
+mod failed_cleanup;
+#[path = "failed_cleanup_actions.rs"]
+mod failed_cleanup_actions;
+#[path = "failed_log_retirement.rs"]
+mod failed_log_retirement;
+#[path = "gc.rs"]
+mod gc;
+#[path = "owned_failed_outputs.rs"]
+mod owned_failed_outputs;
+#[path = "repair_worktrees.rs"]
+mod repair_worktrees;
+#[path = "storage.rs"]
+mod storage;
+#[path = "success_log_archives.rs"]
+mod success_log_archives;
+pub use failed_log_retirement::{LogTailChunk, RetiredLogTail};
+#[path = "superseded_cleanup.rs"]
+mod superseded_cleanup;
+pub use failed_cleanup::FailedCleanupOutcome;
+pub use gc::*;
+pub use repair_worktrees::{RepairWorktreeEvidence, RepairWorktreeRepository};
+pub use storage::*;
+pub use success_log_archives::{LogArchive, copy_log};
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_LEASE_SECONDS: u64 = 24 * 60 * 60;
 const PRIORITY_AGING_INTERVAL_SECONDS: i64 = 60 * 60;
@@ -89,6 +119,30 @@ pub enum PersistenceError {
 
 fn db(operation: &'static str, source: sqlx::Error) -> PersistenceError {
     PersistenceError::Database { operation, source }
+}
+
+fn read_log_tail(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("log path has no parent directory"))?;
+    if !std::fs::symlink_metadata(parent)?.file_type().is_dir() {
+        return Err(std::io::Error::other("log parent is not a real directory"));
+    }
+    // Avoid blocking on a replaced FIFO before verifying the descriptor is a regular file.
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("log path is not a regular file"));
+    }
+    let end = file.seek(SeekFrom::End(0))?;
+    let start = end.saturating_sub(u64::try_from(limit).unwrap_or(u64::MAX));
+    file.seek(SeekFrom::Start(start))?;
+    let length = usize::try_from(end - start).unwrap_or(0);
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn json<T: serde::Serialize>(value: &T, contract: &'static str) -> PersistenceResult<String> {
@@ -716,6 +770,10 @@ pub struct JobLogs {
     pub state: JobState,
     pub stdout_path: Option<PathBuf>,
     pub stderr_path: Option<PathBuf>,
+    pub stdout_archive: Option<LogArchive>,
+    pub stderr_archive: Option<LogArchive>,
+    pub stdout_tail: Option<RetiredLogTail>,
+    pub stderr_tail: Option<RetiredLogTail>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -748,6 +806,21 @@ pub struct AttemptMetrics {
 pub struct AttemptLogPaths {
     pub stdout: PathBuf,
     pub stderr: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailedLogTails {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub limit_kb: u32,
+    pub complete: bool,
+}
+
+struct CapturedLogTails {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    limit_kb: u32,
+    complete: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1295,6 +1368,8 @@ pub struct ArtifactRecord {
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
     pub state: ArtifactPublicationState,
+    pub lifecycle: ArtifactLifecycleState,
+    pub diagnosis_required: bool,
     pub metadata: Value,
 }
 
@@ -1782,6 +1857,10 @@ impl FamilyGenerationRepository<'_> {
                     entity: "family generation jobs",
                 });
             }
+            sqlx::query("UPDATE artifacts SET lifecycle_state = 'superseded', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE state = 'published' AND lifecycle_state = 'published' AND attempt_id IN (SELECT id FROM attempts WHERE job_id = ?)")
+                .bind(member.spec.id.to_string())
+                .execute(&mut *transaction).await
+                .map_err(|source| db("mark superseded artifacts", source))?;
             insert_event(
                 &mut transaction,
                 member.spec.project_id,
@@ -1981,6 +2060,75 @@ pub struct JobAttemptRepository<'a> {
 }
 
 impl JobAttemptRepository<'_> {
+    pub async fn failed_log_tails(
+        &self,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<Option<FailedLogTails>> {
+        let row = sqlx::query(
+            "SELECT stdout, stderr, limit_kb, complete FROM failed_log_tails WHERE attempt_id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(&self.database.pool)
+        .await
+        .map_err(|source| db("read failed log tails", source))?;
+        row.map(|row| {
+            let limit: i64 = row.get("limit_kb");
+            let limit_kb = u32::try_from(limit).map_err(|_| PersistenceError::InvalidValue {
+                entity: "failed log tail limit",
+                value: limit.to_string(),
+            })?;
+            Ok(FailedLogTails {
+                stdout: row.get("stdout"),
+                stderr: row.get("stderr"),
+                limit_kb,
+                complete: row.get::<i64, _>("complete") == 1,
+            })
+        })
+        .transpose()
+    }
+
+    async fn capture_failed_log_tails(
+        &self,
+        claim: &ExecutionClaim,
+        outcome: &ExecutionOutcome,
+    ) -> Option<CapturedLogTails> {
+        if outcome.state == AttemptState::Succeeded {
+            return None;
+        }
+        let limit_kb = claim.attempt.spec.result().failed_log_tail_kb();
+        let unavailable = || CapturedLogTails {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            limit_kb,
+            complete: false,
+        };
+        if limit_kb == 0 {
+            return Some(CapturedLogTails {
+                complete: true,
+                ..unavailable()
+            });
+        }
+        let paths = self.logs_for_attempt(claim.attempt.spec.id()).await;
+        let Ok(paths) = paths else {
+            return Some(unavailable());
+        };
+        tokio::task::spawn_blocking(move || {
+            let size = usize::try_from(limit_kb).unwrap_or(0).saturating_mul(1024);
+            let stdout = read_log_tail(&paths.stdout, size);
+            let stderr = read_log_tail(&paths.stderr, size);
+            let complete = stdout.is_ok() && stderr.is_ok();
+            CapturedLogTails {
+                stdout: stdout.unwrap_or_default(),
+                stderr: stderr.unwrap_or_default(),
+                limit_kb,
+                complete,
+            }
+        })
+        .await
+        .ok()
+        .or_else(|| Some(unavailable()))
+    }
+
     pub async fn logs_for_attempt(
         &self,
         attempt_id: AttemptId,
@@ -2259,6 +2407,7 @@ impl JobAttemptRepository<'_> {
             });
         }
         validate_execution_outcome(outcome)?;
+        let tails = self.capture_failed_log_tails(claim, outcome).await;
         let mut transaction = self
             .database
             .pool
@@ -2278,7 +2427,7 @@ impl JobAttemptRepository<'_> {
             });
         }
         let details = serde_json::json!({"exit_code": outcome.exit_code, "term_signal": outcome.term_signal, "error": outcome.error});
-        finish_execution_transaction(&mut transaction, claim, outcome, details).await?;
+        finish_execution_transaction(&mut transaction, claim, outcome, details, tails).await?;
         transaction
             .commit()
             .await
@@ -3493,6 +3642,7 @@ impl JobAttemptRepository<'_> {
         outcome: &ExecutionOutcome,
     ) -> PersistenceResult<()> {
         validate_execution_outcome(outcome)?;
+        let tails = self.capture_failed_log_tails(claim, outcome).await;
         let attempt_id = claim.attempt.spec.id();
         let mut transaction = self
             .database
@@ -3517,7 +3667,7 @@ impl JobAttemptRepository<'_> {
             "term_signal": outcome.term_signal,
             "error": outcome.error,
         });
-        finish_execution_transaction(&mut transaction, claim, outcome, details).await?;
+        finish_execution_transaction(&mut transaction, claim, outcome, details, tails).await?;
         transaction
             .commit()
             .await
@@ -3547,6 +3697,7 @@ impl JobAttemptRepository<'_> {
             });
         }
         validate_execution_outcome(outcome)?;
+        let tails = self.capture_failed_log_tails(claim, outcome).await;
         if finish.exit_code != outcome.exit_code
             || finish.error != outcome.error
             || outcome.term_signal.is_some()
@@ -3611,7 +3762,7 @@ impl JobAttemptRepository<'_> {
             "oom_killed": finish.oom_killed,
             "container_error": finish.error,
         });
-        finish_execution_transaction(&mut transaction, claim, outcome, details).await?;
+        finish_execution_transaction(&mut transaction, claim, outcome, details, tails).await?;
         transaction
             .commit()
             .await
@@ -3697,6 +3848,13 @@ impl JobAttemptRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin cancellation request", source))?;
+        // Reserve the WAL writer before reading; a deferred read cannot safely
+        // upgrade its snapshot while another worker commits.
+        sqlx::query("UPDATE jobs SET updated_at = updated_at WHERE id = ?")
+            .bind(job_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| db("reserve cancellation writer", source))?;
         let row = sqlx::query("SELECT project_id, state FROM jobs WHERE id = ?")
             .bind(job_id.to_string())
             .fetch_optional(&mut *transaction)
@@ -3797,6 +3955,12 @@ impl JobAttemptRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin job retry", source))?;
+        // Take the writer reservation before observing the job and last attempt.
+        sqlx::query("UPDATE jobs SET updated_at = updated_at WHERE id = ?")
+            .bind(job_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| db("reserve job retry writer", source))?;
         let row = sqlx::query("SELECT project_id, spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE id = ?")
             .bind(job_id.to_string())
             .fetch_optional(&mut *transaction)
@@ -3957,25 +4121,41 @@ impl JobAttemptRepository<'_> {
     }
 
     pub async fn logs_for_job(&self, job_id: JobId) -> PersistenceResult<JobLogs> {
+        self.logs_for_job_attempt(job_id, None).await
+    }
+
+    pub async fn logs_for_job_attempt(
+        &self,
+        job_id: JobId,
+        attempt_id: Option<AttemptId>,
+    ) -> PersistenceResult<JobLogs> {
         let row = sqlx::query(
             "SELECT jobs.state, attempts.id AS attempt_id,
-                    COALESCE(attempt_units.stdout_path, attempt_processes.stdout_path) AS stdout_path,
-                    COALESCE(attempt_units.stderr_path, attempt_processes.stderr_path) AS stderr_path
+                    COALESCE(attempt_units.stdout_path, attempt_processes.stdout_path, attempt_containers.stdout_path) AS stdout_path,
+                    COALESCE(attempt_units.stderr_path, attempt_processes.stderr_path, attempt_containers.stderr_path) AS stderr_path
              FROM jobs
              JOIN attempts ON attempts.id = (
                  SELECT id FROM attempts AS latest
-                 WHERE latest.job_id = jobs.id ORDER BY sequence DESC LIMIT 1
+                  WHERE latest.job_id = jobs.id AND (?2 IS NULL OR latest.id = ?2) ORDER BY sequence DESC LIMIT 1
              )
              LEFT JOIN attempt_processes ON attempt_processes.attempt_id = attempts.id
-             LEFT JOIN attempt_units ON attempt_units.attempt_id = attempts.id
-             WHERE jobs.id = ?",
+              LEFT JOIN attempt_units ON attempt_units.attempt_id = attempts.id
+              LEFT JOIN attempt_containers ON attempt_containers.attempt_id = attempts.id
+             WHERE jobs.id = ?1",
         )
         .bind(job_id.to_string())
+        .bind(attempt_id.map(|id| id.to_string()))
         .fetch_optional(&self.database.pool)
         .await
         .map_err(|source| db("read job log paths", source))?
         .ok_or(PersistenceError::NotFound { entity: "job" })?;
         Ok(JobLogs {
+            stdout_tail: self
+                .retired_log_tail(parse_id(row.get("attempt_id"), "log attempt")?, "stdout")
+                .await?,
+            stderr_tail: self
+                .retired_log_tail(parse_id(row.get("attempt_id"), "log attempt")?, "stderr")
+                .await?,
             job_id,
             attempt_id: parse_id(row.get("attempt_id"), "log attempt")?,
             state: parse_job_state(row.get("state"))?,
@@ -3985,6 +4165,12 @@ impl JobAttemptRepository<'_> {
             stderr_path: row
                 .get::<Option<String>, _>("stderr_path")
                 .map(PathBuf::from),
+            stdout_archive: self
+                .log_archive(parse_id(row.get("attempt_id"), "log attempt")?, "stdout")
+                .await?,
+            stderr_archive: self
+                .log_archive(parse_id(row.get("attempt_id"), "log attempt")?, "stderr")
+                .await?,
         })
     }
 
@@ -4252,6 +4438,7 @@ async fn finish_execution_transaction(
     claim: &ExecutionClaim,
     outcome: &ExecutionOutcome,
     details: Value,
+    tails: Option<CapturedLogTails>,
 ) -> PersistenceResult<()> {
     let job_state = match outcome.state {
         AttemptState::Succeeded => JobState::Succeeded,
@@ -4296,6 +4483,20 @@ async fn finish_execution_transaction(
         return Err(PersistenceError::Conflict {
             entity: "execution claim",
         });
+    }
+    if let Some(tails) = tails {
+        sqlx::query(
+            "INSERT INTO failed_log_tails (attempt_id, stdout, stderr, limit_kb, complete)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(attempt_id.to_string())
+        .bind(tails.stdout)
+        .bind(tails.stderr)
+        .bind(i64::from(tails.limit_kb))
+        .bind(tails.complete)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| db("persist failed log tails", source))?;
     }
     release_claim_resources(transaction, claim).await?;
     let attempt_event = state_event(
@@ -4854,6 +5055,19 @@ impl ActionRepository<'_> {
             entity: "extraction attempt",
         })?;
         let attempt: AttemptSpec = from_json(&successful_spec, "successful extraction attempt")?;
+        // The action write above reserves the writer before observing supersession.
+        let job_state: String = sqlx::query_scalar(
+            "SELECT j.state FROM jobs j JOIN attempts a ON a.job_id = j.id WHERE a.id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|source| db("read extraction owning job state", source))?;
+        let published_lifecycle = if job_state == "superseded" {
+            "superseded"
+        } else {
+            "published"
+        };
         let document_json = json(document, "metric document")?;
         let existing: Option<String> =
             sqlx::query_scalar("SELECT document_json FROM metric_documents WHERE attempt_id = ?")
@@ -5001,7 +5215,7 @@ impl ActionRepository<'_> {
                         value: "duplicate path".into(),
                     });
                 }
-                let row = sqlx::query("SELECT id, role, role_detail, sha256, size_bytes, state, metadata_json FROM artifacts WHERE attempt_id = ? AND path = ?")
+                let row = sqlx::query("SELECT id, role, role_detail, sha256, size_bytes, state, lifecycle_state, metadata_json FROM artifacts WHERE attempt_id = ? AND path = ?")
                     .bind(attempt_id.to_string()).bind(path)
                     .fetch_optional(&mut *transaction).await
                     .map_err(|source| db("verify registered artifact", source))?
@@ -5011,6 +5225,7 @@ impl ActionRepository<'_> {
                 let digest: Option<String> = row.get("sha256");
                 let size: Option<i64> = row.get("size_bytes");
                 let state: String = row.get("state");
+                let lifecycle: String = row.get("lifecycle_state");
                 let artifact_id: String = row.get("id");
                 if role != declaration["role"].as_str().unwrap_or("")
                     || role_detail.as_deref()
@@ -5031,6 +5246,21 @@ impl ActionRepository<'_> {
                     if state != "staged" {
                         return Err(PersistenceError::Conflict {
                             entity: "artifact staging state",
+                        });
+                    }
+                    if lifecycle == "running" {
+                        let updated = sqlx::query("UPDATE artifacts SET lifecycle_state = 'failed', diagnosis_required = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND attempt_id = ? AND state = 'staged' AND lifecycle_state = 'running'")
+                            .bind(&artifact_id).bind(attempt_id.to_string())
+                            .execute(&mut *transaction).await
+                            .map_err(|source| db("mark partial artifact lifecycle", source))?;
+                        if updated.rows_affected() != 1 {
+                            return Err(PersistenceError::Conflict {
+                                entity: "artifact lifecycle",
+                            });
+                        }
+                    } else if lifecycle != "failed" {
+                        return Err(PersistenceError::Conflict {
+                            entity: "artifact lifecycle",
                         });
                     }
                     continue;
@@ -5058,6 +5288,11 @@ impl ActionRepository<'_> {
                         })?;
                 let mut metadata: Value = from_json(row.get("metadata_json"), "artifact metadata")?;
                 if state == "published" {
+                    if !matches!(lifecycle.as_str(), "published" | "superseded" | "retained") {
+                        return Err(PersistenceError::Conflict {
+                            entity: "artifact lifecycle",
+                        });
+                    }
                     if metadata.get("published_path").and_then(Value::as_str)
                         != Some(published_path)
                     {
@@ -5066,6 +5301,11 @@ impl ActionRepository<'_> {
                         });
                     }
                 } else {
+                    if lifecycle != "running" {
+                        return Err(PersistenceError::Conflict {
+                            entity: "artifact lifecycle",
+                        });
+                    }
                     if metadata
                         .get("staged_path")
                         .and_then(Value::as_str)
@@ -5077,7 +5317,8 @@ impl ActionRepository<'_> {
                         });
                     }
                     metadata["published_path"] = Value::String(published_path.into());
-                    let updated = sqlx::query("UPDATE artifacts SET state = 'published', metadata_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND attempt_id = ? AND state = 'staged'")
+                    let updated = sqlx::query("UPDATE artifacts SET state = 'published', lifecycle_state = ?, metadata_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ? AND attempt_id = ? AND state = 'staged' AND lifecycle_state = 'running'")
+                        .bind(published_lifecycle)
                         .bind(json(&metadata, "published artifact metadata")?)
                         .bind(&artifact_id).bind(attempt_id.to_string())
                         .execute(&mut *transaction).await
@@ -5166,6 +5407,23 @@ impl ActionRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin notification action", source))?;
+        // Reserve the WAL writer before reading the claim to avoid a snapshot upgrade.
+        let locked = sqlx::query(
+            "UPDATE actions SET updated_at = updated_at WHERE id = ? AND kind = 'send_notification'
+             AND state = 'running' AND claim_id = ? AND claim_owner = ?
+             AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        )
+        .bind(claim.record_id.to_string())
+        .bind(claim.lease_id.to_string())
+        .bind(&claim.owner)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| db("lock notification action", source))?;
+        if locked.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict {
+                entity: "notification action",
+            });
+        }
         let row = sqlx::query(
             "SELECT project_id FROM actions WHERE id = ? AND kind = 'send_notification'
              AND state = 'running' AND claim_id = ? AND claim_owner = ?
@@ -5283,7 +5541,7 @@ impl ActionRepository<'_> {
              available_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+' || ? || ' seconds'), last_error = ?,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ? AND state = 'running' AND claim_id = ? AND claim_owner = ?
-               AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') RETURNING project_id",
+               AND claim_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') RETURNING project_id, kind, attempt_id",
         ).bind(state.as_str()).bind(seconds).bind(error).bind(claim.record_id.to_string())
         .bind(claim.lease_id.to_string()).bind(&claim.owner).fetch_optional(&mut *transaction).await
         .map_err(|source| db("transition claimed action", source))?;
@@ -5291,6 +5549,14 @@ impl ActionRepository<'_> {
             entity: "action claim",
         })?;
         let project_id = parse_id(row.get("project_id"), "action project")?;
+        if state == ActionState::Failed
+            && row.get::<String, _>("kind") == "extract_metrics"
+            && let Some(attempt_id) = row.get::<Option<String>, _>("attempt_id")
+        {
+            sqlx::query("UPDATE artifacts SET lifecycle_state = 'failed', diagnosis_required = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE attempt_id = ? AND state IN ('registered', 'staged') AND lifecycle_state = 'running'")
+                .bind(attempt_id).execute(&mut *transaction).await
+                .map_err(|source| db("mark failed extraction artifacts", source))?;
+        }
         let event = state_event(
             EventKind::ActionStateChanged,
             "action",
@@ -5673,7 +5939,76 @@ pub struct ArtifactRepository<'a> {
     database: &'a Database,
 }
 
+// Reusable by cleanup after reserving its writer; never opens a second snapshot.
+pub(crate) async fn replacement_generation_succeeded(
+    transaction: &mut Transaction<'_, Sqlite>,
+    artifact_id: Uuid,
+) -> PersistenceResult<bool> {
+    let attempt: String = sqlx::query_scalar("SELECT attempt_id FROM artifacts WHERE id = ?")
+        .bind(artifact_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|source| db("read artifact replacement family", source))?
+        .ok_or(PersistenceError::NotFound { entity: "artifact" })?;
+    replacement_attempt_succeeded(transaction, parse_id(&attempt, "replacement attempt")?).await
+}
+
+pub(super) async fn replacement_attempt_succeeded(
+    transaction: &mut Transaction<'_, Sqlite>,
+    attempt_id: AttemptId,
+) -> PersistenceResult<bool> {
+    let row = sqlx::query("SELECT j.family_id, j.generation_id, j.state FROM attempts a JOIN jobs j ON j.id = a.job_id WHERE a.id = ?")
+        .bind(attempt_id.to_string()).fetch_one(&mut **transaction).await
+        .map_err(|e| db("read log replacement family", e))?;
+    let family_id: Option<String> = row.get("family_id");
+    let old_id: Option<String> = row.get("generation_id");
+    let (Some(family_id), Some(old_id)) = (family_id, old_id) else {
+        return Ok(false);
+    };
+    if row.get::<String, _>("state") != "superseded" {
+        return Ok(false);
+    }
+    let row = sqlx::query("SELECT id, family_id, generation_number, source_revision, protocol_digest, spec_json FROM generations WHERE family_id = ? AND generation_number > (SELECT generation_number FROM generations WHERE id = ? AND family_id = ?) ORDER BY generation_number DESC LIMIT 1")
+        .bind(&family_id).bind(&old_id).bind(&family_id).fetch_optional(&mut **transaction).await
+        .map_err(|source| db("read current artifact replacement", source))?;
+    let Some(row) = row else { return Ok(false) };
+    let generation = decode_generation(row)?;
+    if generation.identity.id.to_string() == old_id {
+        return Ok(false);
+    }
+    let rows = sqlx::query("SELECT id, family_id, spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE generation_id = ? ORDER BY submission_order")
+        .bind(generation.identity.id.to_string()).fetch_all(&mut **transaction).await
+        .map_err(|source| db("read artifact replacement members", source))?;
+    let mut members = Vec::with_capacity(rows.len());
+    for row in rows {
+        let stored_id: String = row.get("id");
+        if row.get::<Option<String>, _>("family_id").as_deref() != Some(&family_id) {
+            return Ok(false);
+        }
+        let member = decode_job(row)?;
+        if member.spec.id.to_string() != stored_id {
+            return Ok(false);
+        }
+        members.push(member);
+    }
+    Ok(generation.assess(&members)? == GenerationStatus::Comparable)
+}
+
 impl ArtifactRepository<'_> {
+    /// Read-only snapshot eligibility. Cleanup must recheck under its writer lock.
+    pub async fn replacement_generation_succeeded(
+        &self,
+        artifact_id: Uuid,
+    ) -> PersistenceResult<bool> {
+        let mut transaction = self
+            .database
+            .pool
+            .begin()
+            .await
+            .map_err(|source| db("begin artifact replacement read", source))?;
+        replacement_generation_succeeded(&mut transaction, artifact_id).await
+    }
+
     pub async fn prepare_publication_claimed(
         &self,
         claim: &Claim<ActionId>,
@@ -6035,7 +6370,7 @@ impl ArtifactRepository<'_> {
                 entity: "artifact staging claim",
             });
         }
-        let row = sqlx::query("SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json FROM artifacts WHERE id = ? AND attempt_id = ?")
+        let row = sqlx::query("SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, lifecycle_state, diagnosis_required, metadata_json FROM artifacts WHERE id = ? AND attempt_id = ?")
             .bind(artifact_id.to_string()).bind(attempt_id.to_string())
             .fetch_optional(&mut *transaction).await
             .map_err(|source| db("read artifact staging state", source))?
@@ -6127,10 +6462,12 @@ impl ArtifactRepository<'_> {
                 value: "expected attempt-relative path".into(),
             })?;
         let relative = Path::new(path);
-        if !relative
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)))
-        {
+        if success_log_archives::reserved_log_name(relative) {
+            return Err(PersistenceError::Conflict {
+                entity: "reserved log artifact path",
+            });
+        }
+        if !valid_artifact_relative_path(path) {
             return Err(PersistenceError::InvalidValue {
                 entity: "artifact path",
                 value: "must consist only of attempt-relative path components".into(),
@@ -6226,7 +6563,7 @@ impl ArtifactRepository<'_> {
             });
         }
         let existing = sqlx::query(
-            "SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json
+            "SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, lifecycle_state, diagnosis_required, metadata_json
              FROM artifacts WHERE attempt_id = ? AND path = ?",
         ).bind(attempt_id.to_string()).bind(path).fetch_optional(&mut *transaction).await
             .map_err(|source| db("read registered artifact", source))?;
@@ -6250,10 +6587,12 @@ impl ArtifactRepository<'_> {
             sha256: Some(digest),
             size_bytes: Some(size_bytes),
             state: ArtifactPublicationState::Registered,
+            lifecycle: ArtifactLifecycleState::Running,
+            diagnosis_required: false,
             metadata,
         };
         let (role, role_detail) = encode_artifact_role(&artifact.role);
-        sqlx::query("INSERT INTO artifacts (id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, 'registered', ?)")
+        sqlx::query("INSERT INTO artifacts (id, attempt_id, path, role, role_detail, sha256, size_bytes, state, lifecycle_state, diagnosis_required, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, 'registered', 'running', 0, ?)")
             .bind(artifact.id.to_string()).bind(attempt_id.to_string()).bind(&artifact.path)
             .bind(role).bind(role_detail).bind(&artifact.sha256).bind(size)
             .bind(json(&artifact.metadata, "artifact metadata")?)
@@ -6299,8 +6638,8 @@ impl ArtifactRepository<'_> {
             .transpose()?;
         sqlx::query(
             "INSERT INTO artifacts
-                 (id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (id, attempt_id, path, role, role_detail, sha256, size_bytes, state, lifecycle_state, diagnosis_required, metadata_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(artifact.id.to_string())
         .bind(artifact.attempt_id.to_string())
@@ -6310,6 +6649,8 @@ impl ArtifactRepository<'_> {
         .bind(&artifact.sha256)
         .bind(size_bytes)
         .bind(artifact.state.as_str())
+        .bind(artifact.lifecycle.as_str())
+        .bind(artifact.diagnosis_required)
         .bind(json(&artifact.metadata, "artifact metadata")?)
         .execute(&self.database.pool)
         .await
@@ -6319,7 +6660,7 @@ impl ArtifactRepository<'_> {
 
     pub async fn get(&self, id: Uuid) -> PersistenceResult<Option<ArtifactRecord>> {
         let row = sqlx::query(
-            "SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, metadata_json
+            "SELECT id, attempt_id, path, role, role_detail, sha256, size_bytes, state, lifecycle_state, diagnosis_required, metadata_json
              FROM artifacts WHERE id = ?",
         )
         .bind(id.to_string())
@@ -6327,6 +6668,17 @@ impl ArtifactRepository<'_> {
         .await
         .map_err(|source| db("get artifact", source))?;
         row.map(decode_artifact).transpose()
+    }
+
+    pub async fn diagnosis_complete(&self, attempt_id: AttemptId) -> PersistenceResult<bool> {
+        let ready: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM diagnosed_attempts WHERE attempt_id = ?)",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_one(&self.database.pool)
+        .await
+        .map_err(|source| db("check failed artifact diagnosis", source))?;
+        Ok(ready != 0)
     }
 }
 
@@ -6353,6 +6705,21 @@ fn decode_artifact(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<ArtifactRe
             });
         }
     };
+    let lifecycle: &str = row.get("lifecycle_state");
+    let lifecycle = match lifecycle {
+        "running" => ArtifactLifecycleState::Running,
+        "failed" => ArtifactLifecycleState::Failed,
+        "published" => ArtifactLifecycleState::Published,
+        "retained" => ArtifactLifecycleState::Retained,
+        "superseded" => ArtifactLifecycleState::Superseded,
+        "removed" => ArtifactLifecycleState::Removed,
+        _ => {
+            return Err(PersistenceError::InvalidValue {
+                entity: "artifact lifecycle state",
+                value: lifecycle.into(),
+            });
+        }
+    };
     Ok(ArtifactRecord {
         id: parse_id(row.get("id"), "artifact")?,
         attempt_id: parse_id(row.get("attempt_id"), "artifact attempt")?,
@@ -6361,6 +6728,17 @@ fn decode_artifact(row: sqlx::sqlite::SqliteRow) -> PersistenceResult<ArtifactRe
         sha256: row.get("sha256"),
         size_bytes,
         state,
+        lifecycle,
+        diagnosis_required: match row.get::<i64, _>("diagnosis_required") {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(PersistenceError::InvalidValue {
+                    entity: "artifact diagnosis requirement",
+                    value: value.to_string(),
+                });
+            }
+        },
         metadata: from_json(row.get("metadata_json"), "artifact metadata")?,
     })
 }
@@ -6385,13 +6763,53 @@ fn hash_artifact_file(root: &Path, relative: &Path) -> PersistenceResult<(u64, S
     Ok((after.len(), format!("sha256:{:x}", digest.finalize())))
 }
 
-fn open_artifact_source(root: &Path, relative: &Path) -> PersistenceResult<(File, Metadata)> {
-    if !std::fs::symlink_metadata(root)?.file_type().is_dir() {
+fn valid_artifact_relative_path(path: &str) -> bool {
+    !path.contains('\0')
+        && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
+        && Path::new(path)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+}
+
+fn validate_absolute_directory_path(path: &Path) -> PersistenceResult<()> {
+    if !path.is_absolute()
+        || path
+            .as_os_str()
+            .as_bytes()
+            .split(|byte| *byte == b'/')
+            .any(|part| matches!(part, b"." | b".."))
+    {
         return Err(PersistenceError::InvalidValue {
-            entity: "artifact root",
-            value: "must be a real directory".into(),
+            entity: "artifact directory path",
+            value: "must be absolute without dot components".into(),
         });
     }
+    Ok(())
+}
+
+fn validate_real_directory_chain(path: &Path) -> PersistenceResult<()> {
+    validate_absolute_directory_path(path)?;
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if !std::fs::symlink_metadata(&current)?.file_type().is_dir() {
+            return Err(PersistenceError::InvalidValue {
+                entity: "artifact directory chain",
+                value: "must contain only real directories".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn open_artifact_source(root: &Path, relative: &Path) -> PersistenceResult<(File, Metadata)> {
+    if !relative.to_str().is_some_and(valid_artifact_relative_path) {
+        return Err(PersistenceError::InvalidValue {
+            entity: "artifact path",
+            value: "must consist only of attempt-relative path components".into(),
+        });
+    }
+    validate_real_directory_chain(root)?;
     let mut candidate = root.to_path_buf();
     let components: Vec<_> = relative.components().collect();
     for (index, component) in components.iter().enumerate() {
@@ -6441,6 +6859,14 @@ fn same_artifact_file(before: &Metadata, after: &Metadata) -> bool {
 }
 
 fn private_staging_dir(path: &Path) -> PersistenceResult<()> {
+    validate_absolute_directory_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| PersistenceError::InvalidValue {
+            entity: "artifact staging directory",
+            value: "missing parent directory".into(),
+        })?;
+    validate_real_directory_chain(parent)?;
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -6460,14 +6886,8 @@ fn ensure_artifact_publication_root(
     project_root: &Path,
     publication_root: &Path,
 ) -> PersistenceResult<()> {
-    if !std::fs::symlink_metadata(project_root)?
-        .file_type()
-        .is_dir()
-    {
-        return Err(PersistenceError::Conflict {
-            entity: "artifact publication project",
-        });
-    }
+    validate_real_directory_chain(project_root)?;
+    validate_absolute_directory_path(publication_root)?;
     let relative =
         publication_root
             .strip_prefix(project_root)
@@ -6508,11 +6928,7 @@ fn verify_publication_files(
     expected: &BTreeMap<String, (u64, String)>,
     hidden: bool,
 ) -> PersistenceResult<()> {
-    if !std::fs::symlink_metadata(directory)?.file_type().is_dir() {
-        return Err(PersistenceError::Conflict {
-            entity: "artifact publication directory",
-        });
-    }
+    validate_real_directory_chain(directory)?;
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let name = entry.file_name();

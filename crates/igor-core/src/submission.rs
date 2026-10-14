@@ -312,9 +312,23 @@ pub(crate) fn build_submission_with_source(
             contents,
         },
         ResultContract {
+            owned_namespace: Some(true),
+            failed_full_logs: Some(config.retention.failed_full_logs),
+            compress_success_logs: Some(config.retention.compress_success_logs),
+            superseded_artifact_retention: Some(crate::SupersededArtifactRetention {
+                policy: config.retention.superseded_artifacts,
+                keep_on_success: config.artifacts.keep_on_success.clone(),
+            }),
+            failed_artifact_retention: Some(crate::FailedArtifactRetention {
+                policy: config.retention.failed_artifacts,
+                keep_on_failure: config.artifacts.keep_on_failure.clone(),
+            }),
             schema_version: 1,
             extractor,
             publication_root,
+            failed_log_tail_kb: (config.retention.failed_log_tail_kb
+                != crate::project::DEFAULT_FAILED_LOG_TAIL_KB)
+                .then_some(config.retention.failed_log_tail_kb),
         },
     )?;
     let job_event = event(

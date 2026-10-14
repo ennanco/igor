@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    collections::BTreeSet,
+    path::{Component, Path, PathBuf},
+};
 
 use serde::{Deserialize, Deserializer, Serialize, de};
 
@@ -61,8 +64,8 @@ pub enum ReportMode {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReportGenerator {
-    Deterministic,
     #[default]
+    Deterministic,
     Opencode,
     Pi,
 }
@@ -104,11 +107,11 @@ pub struct ReportConfig {
 impl Default for ReportConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             trigger: ReportTrigger::FamilyCompleted,
             output: PathBuf::from("RESULTS.md"),
             mode: ReportMode::ReplaceGeneratedFile,
-            generator: ReportGenerator::Opencode,
+            generator: ReportGenerator::Deterministic,
             prompt_file: PathBuf::from(".igor/report-prompt.md"),
         }
     }
@@ -126,6 +129,106 @@ pub struct ProjectConfig {
     pub delivery_retry: DeliveryRetryPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub results: Option<ResultsConfig>,
+    #[serde(default, skip_serializing_if = "RetentionConfig::is_default")]
+    pub retention: RetentionConfig,
+    #[serde(default, skip_serializing_if = "ArtifactRetentionConfig::is_default")]
+    pub artifacts: ArtifactRetentionConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailedRetention {
+    #[default]
+    DeleteAfterDiagnosis,
+    Keep,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupersededRetention {
+    #[default]
+    DeleteAfterReplacement,
+    Keep,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionConfig {
+    pub failed_artifacts: FailedRetention,
+    pub failed_full_logs: FailedRetention,
+    pub failed_log_tail_kb: u32,
+    pub compress_success_logs: bool,
+    pub delete_repair_worktrees: bool,
+    pub superseded_artifacts: SupersededRetention,
+}
+
+pub const DEFAULT_FAILED_LOG_TAIL_KB: u32 = 512;
+pub const MAX_FAILED_LOG_TAIL_KB: u32 = 16 * 1024;
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            failed_artifacts: FailedRetention::default(),
+            failed_full_logs: FailedRetention::default(),
+            failed_log_tail_kb: DEFAULT_FAILED_LOG_TAIL_KB,
+            compress_success_logs: true,
+            delete_repair_worktrees: true,
+            superseded_artifacts: SupersededRetention::default(),
+        }
+    }
+}
+
+impl RetentionConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArtifactRetentionConfig {
+    pub keep_on_success: Vec<String>,
+    pub keep_on_failure: Vec<String>,
+}
+
+impl ArtifactRetentionConfig {
+    fn is_default(&self) -> bool {
+        self.keep_on_success.is_empty() && self.keep_on_failure.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (field, patterns) in [
+            ("artifacts.keep_on_success", &self.keep_on_success),
+            ("artifacts.keep_on_failure", &self.keep_on_failure),
+        ] {
+            let mut seen = BTreeSet::new();
+            for (index, pattern) in patterns.iter().enumerate() {
+                if pattern.trim().is_empty()
+                    || pattern.contains('\0')
+                    || pattern
+                        .split('/')
+                        .any(|part| part.is_empty() || part == "." || part == "..")
+                    || !Path::new(pattern)
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(DomainError::validation(
+                        ErrorCode::InvalidProject,
+                        &format!("{field}[{index}]"),
+                        "must be a non-empty attempt-relative pattern without empty, dot, or parent components",
+                    ));
+                }
+                if !seen.insert(pattern) {
+                    return Err(DomainError::validation(
+                        ErrorCode::InvalidProject,
+                        &format!("{field}[{index}]"),
+                        "must not duplicate another pattern",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -187,6 +290,10 @@ struct ProjectConfigDocument {
     delivery_retry: DeliveryRetryPolicy,
     #[serde(default)]
     results: Option<ResultsConfig>,
+    #[serde(default)]
+    retention: RetentionConfig,
+    #[serde(default)]
+    artifacts: ArtifactRetentionConfig,
 }
 
 impl Default for ProjectConfigDocument {
@@ -201,6 +308,8 @@ impl Default for ProjectConfigDocument {
             action_retry: ActionRetryPolicy::default(),
             delivery_retry: DeliveryRetryPolicy::default(),
             results: None,
+            retention: RetentionConfig::default(),
+            artifacts: ArtifactRetentionConfig::default(),
         }
     }
 }
@@ -239,6 +348,14 @@ impl ProjectConfig {
         if let Some(results) = &self.results {
             results.validate()?;
         }
+        self.artifacts.validate()?;
+        if self.retention.failed_log_tail_kb > MAX_FAILED_LOG_TAIL_KB {
+            return Err(DomainError::validation(
+                ErrorCode::InvalidProject,
+                "retention.failed_log_tail_kb",
+                "must not exceed 16384 KiB",
+            ));
+        }
         Ok(())
     }
 
@@ -259,6 +376,8 @@ impl ProjectConfig {
             action_retry: document.action_retry,
             delivery_retry: document.delivery_retry,
             results: document.results,
+            retention: document.retention,
+            artifacts: document.artifacts,
         }
     }
 }

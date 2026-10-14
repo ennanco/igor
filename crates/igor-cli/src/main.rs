@@ -1,8 +1,8 @@
 mod service;
 
 use std::{
-    fs::{self, File},
-    io::{self, Read, Seek, SeekFrom, Write},
+    fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
     time::Duration,
@@ -83,6 +83,22 @@ impl From<PathArgs> for ConfigOverrides {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Execute a confirmed bounded retention plan, or preview it.
+    Gc {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        failed: bool,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect tracked storage identities and cleanup evidence.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
     /// Remove Igor's user services while preserving the binary and all data.
     Uninstall {
         /// Skip the confirmation prompt.
@@ -215,6 +231,129 @@ enum ConfigCommand {
     },
     /// Set host scheduling limits in the global configuration.
     Set(ConfigSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageCommand {
+    /// Show a read-only inventory of tracked storage.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn print_storage_status(status: &igor_core::StorageStatus, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(status)?);
+        return Ok(());
+    }
+    match (&status.project_id, &status.project_name) {
+        (Some(id), Some(name)) => println!("Storage scope: {name} ({id})"),
+        _ => println!("Storage scope: global (including unregistered history)"),
+    }
+    for (label, groups) in [
+        ("Active artifacts", &status.artifacts.active),
+        (
+            "Removed artifact history",
+            &status.artifacts.removed_history,
+        ),
+    ] {
+        println!(
+            "{label}: {} rows",
+            groups.iter().map(|g| g.count).sum::<u64>()
+        );
+        for g in groups {
+            println!(
+                "  {}/{}: count={} known={} unknown={} logical bytes={}",
+                g.physical_state,
+                g.lifecycle_state,
+                g.count,
+                g.known_size_count,
+                g.unknown_size_count,
+                g.logical_bytes
+            );
+        }
+    }
+    println!(
+        "Successful log archives: {} rows (identity bytes; prepared is not published existence)",
+        status
+            .successful_log_archives
+            .iter()
+            .map(|g| g.count)
+            .sum::<u64>()
+    );
+    for g in &status.successful_log_archives {
+        println!(
+            "  {} retired={}: count={} original identity bytes={} archive identity bytes={} raw outstanding bytes={}",
+            g.state,
+            g.retired,
+            g.count,
+            g.original_identity_bytes,
+            g.archive_identity_bytes,
+            g.raw_outstanding_bytes
+        );
+    }
+    println!(
+        "Pending log preparations: count={}; temporary bytes not measured",
+        status.pending_log_preparations.count
+    );
+    let tails = &status.failed_tails;
+    for g in &status.failed_log_retirements {
+        println!(
+            "Failed log retirements/{}: count={} original identity bytes={} tail identity bytes={}; raw disk bytes not measured",
+            g.state, g.count, g.original_identity_bytes, g.tail_identity_bytes
+        );
+    }
+    for g in &status.owned_failed_outputs {
+        println!(
+            "Owned failed outputs/{}: count={} manifest identity bytes={}; file disk bytes not measured",
+            g.state, g.count, g.manifest_identity_bytes
+        );
+    }
+    println!(
+        "Failed tails: complete={} incomplete={} stdout BLOB bytes={} stderr BLOB bytes={}",
+        tails.complete_count,
+        tails.incomplete_count,
+        tails.stdout_blob_bytes,
+        tails.stderr_blob_bytes
+    );
+    println!(
+        "Repair worktrees: {} rows; disk bytes not measured",
+        status.repair_worktrees.iter().map(|g| g.count).sum::<u64>()
+    );
+    for g in &status.repair_worktrees {
+        println!(
+            "  {}: count={} patch BLOB bytes={}",
+            g.state, g.count, g.patch_blob_bytes
+        );
+    }
+    println!(
+        "Failed cleanup actions: {} rows",
+        status
+            .failed_cleanup_actions
+            .iter()
+            .map(|g| g.count)
+            .sum::<u64>()
+    );
+    for g in &status.failed_cleanup_actions {
+        println!("  {}: count={}", g.state, g.count);
+    }
+    println!(
+        "Cleanup intents: {} rows",
+        status.cleanup_intents.iter().map(|g| g.count).sum::<u64>()
+    );
+    for g in &status.cleanup_intents {
+        println!("  {}/{}: count={}", g.kind, g.state, g.count);
+    }
+    println!(
+        "Cleanup tombstones: {} rows",
+        status.tombstones.iter().map(|g| g.count).sum::<u64>()
+    );
+    for g in &status.tombstones {
+        println!("  {}/{}: count={}", g.operation, g.outcome, g.count);
+    }
+    println!("Actual disk footprint: not measured");
+    Ok(())
 }
 
 #[derive(Debug, Subcommand)]
@@ -703,6 +842,146 @@ async fn run() -> anyhow::Result<()> {
             };
             print_jobs(&jobs, json)?;
         }
+        Command::Gc {
+            dry_run,
+            failed,
+            yes,
+            json,
+        } => {
+            let effective = effective_config(&overrides, &cwd)?;
+            let client = Client::new(&effective.paths);
+            let selected = selected_registered_project(&client, &effective).await?;
+            if effective.project.is_some() && selected.is_none() {
+                anyhow::bail!("current project is not registered; run `igor project add .`");
+            }
+            let project_id = selected.map(|project| project.id);
+            let plan = match client
+                .request(
+                    DaemonRole::Worker,
+                    Request::GcPlan {
+                        project_id,
+                        failed_only: failed,
+                    },
+                )
+                .await?
+            {
+                Response::GcPlan(plan) => plan,
+                response => anyhow::bail!("unexpected {response:?} GC-plan response"),
+            };
+            if dry_run {
+                print_gc_plan(&plan, json)?;
+            } else {
+                let worklist = plan.worklist()?;
+                // Captured before the worklist is moved into `GcExecute`.
+                let has_selections = !worklist.selections.is_empty();
+                // Consent only: `--yes`, or an affirmative answer below. A plan
+                // without actionable selections never prompts.
+                let mut confirmed = yes;
+                if has_selections {
+                    eprintln!(
+                        "GC: {} selected entries in one bounded pass.",
+                        worklist.selections.len()
+                    );
+                    for selection in &worklist.selections {
+                        let entry = &selection.expected;
+                        eprintln!(
+                            "  {:?} {}: {:?}",
+                            entry.operation, entry.subject_id, entry.status
+                        );
+                        for target in &entry.targets {
+                            eprintln!("    {:?} {}", target.effect, target.path.display());
+                        }
+                    }
+                    if !yes {
+                        use std::io::Write;
+                        eprint!("Execute this GC plan? [y/N] ");
+                        std::io::stderr().flush()?;
+                        let mut answer = String::new();
+                        std::io::stdin().read_line(&mut answer)?;
+                        confirmed =
+                            matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+                    }
+                }
+                let mut result = if confirmed && has_selections {
+                    match client
+                        .request(
+                            DaemonRole::Worker,
+                            Request::GcExecute {
+                                project_id,
+                                failed_only: failed,
+                                worklist,
+                            },
+                        )
+                        .await?
+                    {
+                        Response::GcExecution(result) => result,
+                        response => anyhow::bail!("unexpected {response:?} GC-execution response"),
+                    }
+                } else {
+                    igor_core::GcExecution {
+                        project_id,
+                        confirmed,
+                        ..Default::default()
+                    }
+                };
+                // Preview-unsafe subjects are filtered out of the worklist, so
+                // the executor can never report them. After explicit consent
+                // the CLI appends each one with a static, path-free cause so
+                // mixed and unsafe-only plans still exit 1 instead of silently
+                // reporting success. Declined or empty runs stay untouched.
+                if confirmed || !has_selections {
+                    for entry in plan
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.status == igor_core::GcStatus::Unsafe)
+                    {
+                        result.entries.push(igor_core::GcExecutionEntry {
+                            operation: entry.operation,
+                            subject_id: entry.subject_id.clone(),
+                            status: igor_core::GcExecutionStatus::Unsafe,
+                            cause: Some(igor_core::GcExecutionCause::new(
+                                "unsafe_preview",
+                                "Dry-run preflight rejected this entry; it was not selected for execution",
+                            )),
+                        });
+                        result.unsafe_count += 1;
+                    }
+                }
+                eprintln!(
+                    "GC: completed={} already_done={} deferred={} unsafe={} errors={}",
+                    result.completed,
+                    result.already_done,
+                    result.deferred,
+                    result.unsafe_count,
+                    result.errors
+                );
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                if result.errors > 0 || result.unsafe_count > 0 {
+                    anyhow::bail!("GC encountered errors or unsafe entries");
+                }
+            }
+        }
+        Command::Storage {
+            command: StorageCommand::Status { json },
+        } => {
+            let effective = effective_config(&overrides, &cwd)?;
+            let client = Client::new(&effective.paths);
+            let selected = selected_registered_project(&client, &effective).await?;
+            if effective.project.is_some() && selected.is_none() {
+                anyhow::bail!("current project is not registered; run `igor project add .`");
+            }
+            let project_id = selected.map(|project| project.id);
+            let status = match client
+                .request(DaemonRole::Worker, Request::StorageStatus { project_id })
+                .await?
+            {
+                Response::StorageStatus(status) => status,
+                response => anyhow::bail!("unexpected {response:?} storage-status response"),
+            };
+            print_storage_status(&status, json)?;
+        }
         Command::Show { job_id, json } => {
             let effective = effective_config(&overrides, &cwd)?;
             let detail = request_job(&Client::new(&effective.paths), job_id).await?;
@@ -802,6 +1081,73 @@ async fn run() -> anyhow::Result<()> {
             show_logs(&Client::new(&effective.paths), job_id, follow).await?;
         }
     }
+    Ok(())
+}
+
+fn print_gc_plan(plan: &igor_core::GcPlan, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(plan)?);
+        return Ok(());
+    }
+    println!(
+        "GC dry-run: {}",
+        plan.project_name.as_deref().unwrap_or("all projects")
+    );
+    println!(
+        "Advisory database snapshot; filesystem observed read-only. Future execution must revalidate."
+    );
+    println!("Bounded preview: 32 subjects per operation, 64 artifact rows per attempt.");
+    for entry in &plan.entries {
+        println!(
+            "{} {} {}: {} ({})",
+            serde_json::to_value(entry.operation)?
+                .as_str()
+                .unwrap_or_default(),
+            entry.subject_id,
+            serde_json::to_value(entry.status)?
+                .as_str()
+                .unwrap_or_default(),
+            entry.reason,
+            serde_json::to_value(entry.effect)?
+                .as_str()
+                .unwrap_or_default()
+        );
+        for target in &entry.targets {
+            println!(
+                "  {} {} bytes={}",
+                serde_json::to_value(target.effect)?
+                    .as_str()
+                    .unwrap_or_default(),
+                target.path.display(),
+                target
+                    .bytes
+                    .map_or_else(|| "unknown".into(), |n| n.to_string())
+            );
+        }
+    }
+    for page in &plan.pages {
+        if page.truncated {
+            println!(
+                "{:?}: truncated; continuation after {}",
+                page.operation,
+                page.continuation_after.as_deref().unwrap_or_default()
+            );
+        }
+        for batch in &page.artifact_batches {
+            if batch.truncated {
+                println!(
+                    "{}: artifact batch truncated; continuation after {}",
+                    batch.attempt_id,
+                    batch.continuation_after.as_deref().unwrap_or_default()
+                );
+            }
+        }
+    }
+    println!(
+        "Known verified copy bytes (deduplicated by path): {}",
+        plan.known_copy_bytes
+    );
+    println!("Estimated gzip savings / worktree bytes: unknown");
     Ok(())
 }
 
@@ -1655,16 +2001,17 @@ async fn request_logs(client: &Client, job_id: JobId) -> anyhow::Result<JobLogs>
 }
 
 async fn show_logs(client: &Client, job_id: JobId, follow: bool) -> anyhow::Result<()> {
-    let logs = loop {
-        let logs = request_logs(client, job_id).await?;
+    let mut logs = request_logs(client, job_id).await?;
+    loop {
         if logs.stdout_path.is_some() && logs.stderr_path.is_some() {
-            break logs;
+            break;
         }
-        if !follow || logs.state.is_terminal() {
+        if !follow || log_attempt_terminal(client, job_id, logs.attempt_id).await? {
             anyhow::bail!("logs are not available for attempt {}", logs.attempt_id);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+        logs = request_attempt_logs(client, job_id, logs.attempt_id).await?;
+    }
     let (stdout_path, stderr_path) = match (logs.stdout_path, logs.stderr_path) {
         (Some(stdout), Some(stderr)) => (stdout, stderr),
         _ => anyhow::bail!("logs are not available for attempt {}", logs.attempt_id),
@@ -1672,15 +2019,46 @@ async fn show_logs(client: &Client, job_id: JobId, follow: bool) -> anyhow::Resu
     let mut stdout_offset = 0;
     let mut stderr_offset = 0;
     loop {
-        stdout_offset += emit_log(&stdout_path, stdout_offset, false)?;
-        stderr_offset += emit_log(&stderr_path, stderr_offset, true)?;
+        stdout_offset += emit_job_log(
+            client,
+            job_id,
+            logs.attempt_id,
+            &stdout_path,
+            stdout_offset,
+            false,
+        )
+        .await?;
+        stderr_offset += emit_job_log(
+            client,
+            job_id,
+            logs.attempt_id,
+            &stderr_path,
+            stderr_offset,
+            true,
+        )
+        .await?;
         if !follow {
             break;
         }
-        let detail = request_job(client, job_id).await?;
-        if detail.job.state.is_terminal() {
-            emit_log(&stdout_path, stdout_offset, false)?;
-            emit_log(&stderr_path, stderr_offset, true)?;
+        if log_attempt_terminal(client, job_id, logs.attempt_id).await? {
+            emit_job_log(
+                client,
+                job_id,
+                logs.attempt_id,
+                &stdout_path,
+                stdout_offset,
+                false,
+            )
+            .await?;
+            emit_job_log(
+                client,
+                job_id,
+                logs.attempt_id,
+                &stderr_path,
+                stderr_offset,
+                true,
+            )
+            .await?;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1688,17 +2066,137 @@ async fn show_logs(client: &Client, job_id: JobId, follow: bool) -> anyhow::Resu
     Ok(())
 }
 
-fn emit_log(path: &Path, offset: u64, stderr: bool) -> anyhow::Result<u64> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
+async fn request_attempt_logs(
+    client: &Client,
+    job_id: JobId,
+    attempt_id: igor_core::AttemptId,
+) -> anyhow::Result<JobLogs> {
+    match client
+        .request(
+            DaemonRole::Worker,
+            Request::AttemptLogs { job_id, attempt_id },
+        )
+        .await?
+    {
+        Response::Logs(logs) => Ok(logs),
+        response => anyhow::bail!("unexpected {response:?} attempt logs response"),
+    }
+}
+
+async fn log_attempt_terminal(
+    client: &Client,
+    job_id: JobId,
+    attempt_id: igor_core::AttemptId,
+) -> anyhow::Result<bool> {
+    let detail = request_job(client, job_id).await?;
+    let attempt = detail
+        .attempts
+        .iter()
+        .find(|a| a.spec.id() == attempt_id)
+        .ok_or_else(|| anyhow::anyhow!("observed log attempt {attempt_id} is unavailable"))?;
+    Ok(matches!(
+        attempt.state,
+        igor_core::AttemptState::Succeeded
+            | igor_core::AttemptState::Failed
+            | igor_core::AttemptState::Cancelled
+            | igor_core::AttemptState::Lost
+    ))
+}
+
+async fn emit_job_log(
+    client: &Client,
+    job_id: JobId,
+    attempt_id: igor_core::AttemptId,
+    path: &Path,
+    offset: u64,
+    stderr: bool,
+) -> anyhow::Result<u64> {
+    match emit_log(path, None, offset, stderr) {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let logs = request_attempt_logs(client, job_id, attempt_id).await?;
+            let tail = if stderr {
+                logs.stderr_tail
+            } else {
+                logs.stdout_tail
+            };
+            if let Some(identity) = tail {
+                anyhow::ensure!(
+                    identity.attempt_id == attempt_id && identity.original_path == path,
+                    "retired log identity mismatch"
+                );
+                let mut cursor = offset.max(identity.start);
+                if offset < identity.start {
+                    eprintln!(
+                        "igor: {} log prefix omitted: bytes {offset}..{} were retired after diagnosis",
+                        identity.stream, identity.start
+                    );
+                }
+                while cursor < identity.end {
+                    let chunk = match client
+                        .request(
+                            DaemonRole::Worker,
+                            Request::RetiredLogChunk {
+                                identity: identity.clone(),
+                                offset: cursor,
+                                limit: 65536,
+                            },
+                        )
+                        .await?
+                    {
+                        Response::LogTailChunk(chunk) => chunk,
+                        response => anyhow::bail!("unexpected {response:?} tail chunk response"),
+                    };
+                    anyhow::ensure!(
+                        chunk.identity == identity
+                            && chunk.start == cursor
+                            && chunk.end > cursor
+                            && chunk.end <= identity.end
+                            && chunk.end - cursor == chunk.bytes.len() as u64
+                            && chunk.bytes.len() <= 65536,
+                        "invalid tail chunk coordinates"
+                    );
+                    if stderr {
+                        let mut out = std::io::stderr().lock();
+                        out.write_all(&chunk.bytes)?;
+                        out.flush()?;
+                    } else {
+                        let mut out = std::io::stdout().lock();
+                        out.write_all(&chunk.bytes)?;
+                        out.flush()?;
+                    }
+                    cursor = chunk.end;
+                }
+                return Ok(cursor.saturating_sub(offset));
+            }
+            let archive = if stderr {
+                logs.stderr_archive
+            } else {
+                logs.stdout_archive
+            };
+            emit_log(path, archive.as_ref(), offset, stderr)
+        }
+        result => result,
+    }
+}
+
+fn emit_log(
+    path: &Path,
+    archive: Option<&igor_core::LogArchive>,
+    offset: u64,
+    stderr: bool,
+) -> anyhow::Result<u64> {
     let copied = if stderr {
         let mut output = std::io::stderr().lock();
-        let copied = std::io::copy(&mut file, &mut output)?;
+        let copied = igor_core::copy_log(path, archive, offset, &mut output)?;
         output.flush()?;
         copied
     } else {
         let mut output = std::io::stdout().lock();
-        let copied = std::io::copy(&mut file, &mut output)?;
+        let copied = igor_core::copy_log(path, archive, offset, &mut output)?;
         output.flush()?;
         copied
     };

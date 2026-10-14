@@ -94,8 +94,19 @@ fn submission_freezes_git_command_defaults_and_file_hashes() -> TestResult {
     let (_temporary, project, config) = repository()?;
     let submission = build_submission(&project, &config, input(&project))?;
     assert_eq!(submission.priority, 7);
+    assert_eq!(
+        submission.attempt.result().failed_full_logs,
+        Some(igor_core::FailedRetention::DeleteAfterDiagnosis)
+    );
     assert_eq!(submission.attempt.command().args[2], "");
     assert_eq!(submission.attempt.resources(), &config.resources);
+    assert_eq!(
+        submission.attempt.result().failed_artifact_retention,
+        Some(igor_core::FailedArtifactRetention {
+            policy: igor_core::FailedRetention::DeleteAfterDiagnosis,
+            keep_on_failure: vec![],
+        })
+    );
     assert_eq!(submission.attempt.configuration().contents.len(), 1);
     assert!(
         submission.attempt.configuration().contents[0]
@@ -115,6 +126,10 @@ fn submission_freezes_git_command_defaults_and_file_hashes() -> TestResult {
 #[test]
 fn results_extractor_is_frozen_directly_without_inheriting_environment() -> TestResult {
     let (_temporary, project, mut config) = repository()?;
+    config.retention.failed_log_tail_kb = 1;
+    config.retention.failed_artifacts = igor_core::FailedRetention::Keep;
+    config.retention.failed_full_logs = igor_core::FailedRetention::Keep;
+    config.artifacts.keep_on_failure = vec!["checkpoints/**".into()];
     fs::write(project.root.join("exporter"), "not executed")?;
     git(&project.root, &["add", "exporter"])?;
     git(&project.root, &["commit", "-qm", "add extractor"])?;
@@ -141,13 +156,61 @@ fn results_extractor_is_frozen_directly_without_inheriting_environment() -> Test
     assert_eq!(extractor.shell, ShellPolicy::Direct);
     assert!(extractor.environment.set.is_empty());
     assert_eq!(extractor.environment.inherit, EnvironmentInheritance::None);
+    assert_eq!(submission.attempt.result().failed_log_tail_kb(), 1);
     assert_eq!(
         submission.attempt.result().publication_root.as_deref(),
         Some(project.root.join("artifacts").as_path())
     );
     let frozen = submission.attempt.result().publication_root.clone();
     config.paths.artifact_root = project.root.join("custom-results");
+    config.retention.failed_log_tail_kb = 2;
+    config.retention.failed_full_logs = igor_core::FailedRetention::DeleteAfterDiagnosis;
+    config.retention.failed_artifacts = igor_core::FailedRetention::DeleteAfterDiagnosis;
+    config.artifacts.keep_on_failure.clear();
+    config.retention.superseded_artifacts = igor_core::SupersededRetention::Keep;
+    config.artifacts.keep_on_success = vec!["models/**".into()];
     let later = build_submission(&project, &config, input(&project))?;
+    assert_eq!(
+        submission.attempt.result().failed_full_logs,
+        Some(igor_core::FailedRetention::Keep)
+    );
+    assert_eq!(
+        later.attempt.result().failed_full_logs,
+        Some(igor_core::FailedRetention::DeleteAfterDiagnosis)
+    );
+    assert_eq!(
+        submission.attempt.result().superseded_artifact_retention,
+        Some(igor_core::SupersededArtifactRetention {
+            policy: igor_core::SupersededRetention::DeleteAfterReplacement,
+            keep_on_success: vec![],
+        })
+    );
+    assert_eq!(
+        later.attempt.result().superseded_artifact_retention,
+        Some(igor_core::SupersededArtifactRetention {
+            policy: igor_core::SupersededRetention::Keep,
+            keep_on_success: vec!["models/**".into()],
+        })
+    );
+    assert_eq!(later.attempt.result().failed_log_tail_kb(), 2);
+    assert_eq!(submission.attempt.result().failed_log_tail_kb(), 1);
+    assert_eq!(
+        submission.attempt.result().failed_artifact_retention,
+        Some(igor_core::FailedArtifactRetention {
+            policy: igor_core::FailedRetention::Keep,
+            keep_on_failure: vec!["checkpoints/**".into()],
+        })
+    );
+    assert_eq!(
+        later
+            .attempt
+            .result()
+            .failed_artifact_retention
+            .as_ref()
+            .ok_or("snapshot")?
+            .policy,
+        igor_core::FailedRetention::DeleteAfterDiagnosis
+    );
     assert_eq!(
         later.attempt.result().publication_root.as_deref(),
         Some(config.paths.artifact_root.as_path())
@@ -156,10 +219,30 @@ fn results_extractor_is_frozen_directly_without_inheriting_environment() -> Test
     let mut legacy = serde_json::to_value(&submission.attempt)?;
     legacy["result"]
         .as_object_mut()
+        .ok_or("result")?
+        .remove("failed_full_logs");
+    legacy["result"]
+        .as_object_mut()
         .ok_or("missing result object")?
         .remove("publication_root");
+    legacy["result"]
+        .as_object_mut()
+        .ok_or("missing result object")?
+        .remove("failed_log_tail_kb");
+    legacy["result"]
+        .as_object_mut()
+        .ok_or("missing result object")?
+        .remove("failed_artifact_retention");
+    legacy["result"]
+        .as_object_mut()
+        .ok_or("result")?
+        .remove("superseded_artifact_retention");
     let legacy: igor_core::AttemptSpec = serde_json::from_value(legacy)?;
     assert!(legacy.result().publication_root.is_none());
+    assert!(legacy.result().failed_full_logs.is_none());
+    assert_eq!(legacy.result().failed_log_tail_kb(), 512);
+    assert!(legacy.result().failed_artifact_retention.is_none());
+    assert!(legacy.result().superseded_artifact_retention.is_none());
     config.paths.artifact_root = project.root.join("../escape");
     assert!(build_submission(&project, &config, input(&project)).is_err());
     Ok(())
@@ -187,6 +270,30 @@ fn results_extractor_symlink_cannot_escape_project() -> TestResult {
         .err()
         .ok_or("extractor symlink escape accepted")?;
     assert!(error.to_string().contains("escapes the project root"));
+    Ok(())
+}
+
+#[test]
+fn superseded_retention_snapshot_validates_lexical_paths_and_globs() -> TestResult {
+    for pattern in [
+        "/absolute",
+        "../outside",
+        "nested/../outside",
+        "./model",
+        "nested/./model",
+        "[unclosed",
+    ] {
+        let snapshot = igor_core::SupersededArtifactRetention {
+            policy: igor_core::SupersededRetention::DeleteAfterReplacement,
+            keep_on_success: vec![pattern.into()],
+        };
+        assert!(snapshot.validate().is_err(), "{pattern}");
+    }
+    igor_core::SupersededArtifactRetention {
+        policy: igor_core::SupersededRetention::Keep,
+        keep_on_success: vec!["models/**".into(), "**/*.bin".into()],
+    }
+    .validate()?;
     Ok(())
 }
 

@@ -474,7 +474,7 @@ and current member states in one SQLite read transaction. It returns members
 ordered by submission and generations ordered by number. State counts include
 every job state, with zero-valued entries for absent states, both per
 generation and across the family. These are current **job** counts, not the
-number of attempts. In protocol v11, `family_show`, `family_supersede` and their
+number of attempts. In protocol v18, `family_show`, `family_supersede` and their
 responses require matching CLI/daemon versions.
 
 Each generation exposes a status assessed from the immutable required seed
@@ -830,20 +830,26 @@ changing their scientific meaning.
 ## 15. Markdown Reports
 
 Obsidian is not required by the first version. SQLite stores operational and
-structured result data. When a complete comparable family generation finishes,
-Igor generates a project Markdown report.
+structured result data. Report generation is optional and disabled by default.
+When explicitly enabled, Igor generates a project Markdown report after a
+complete comparable family generation finishes. Execution does not require a
+metric extractor, report generator, coding agent or notification provider.
 
 Default configuration:
 
 ```toml
 [report]
-enabled = true
+enabled = false
 trigger = "family-completed"
 output = "RESULTS.md"
 mode = "replace-generated-file"
-generator = "opencode"
+generator = "deterministic"
 prompt_file = ".igor/report-prompt.md"
 ```
+
+Enable reports with `enabled = true`. The deterministic generator requires no
+coding agent; `opencode` and `pi` are explicit optional integrations. Existing
+project files with an explicit enabled flag or generator retain those choices.
 
 The report includes:
 
@@ -984,6 +990,439 @@ Project exceptions are explicit:
 keep_on_success = ["metrics.json", "model.weights", "figures/**"]
 keep_on_failure = ["crash-dump.json"]
 ```
+
+M13.01 reads optional `[retention]` and `[artifacts]` sections from the
+version-one project configuration. Missing retention fields inherit the
+defaults above, and writing those defaults explicitly preserves the same
+serialized configuration identity as omitting them. `keep_on_success` and
+`keep_on_failure` accept distinct, nonempty attempt-relative patterns such as
+`figures/**`; absolute paths, dot/parent or empty components, and NUL bytes
+are rejected at configuration load time. Later cleanup operations must also
+check the actual filesystem boundary before removing any file.
+
+M13.02 adds `artifacts.lifecycle_state` in migration `0013`, distinct from the
+physical publication `state`. New registrations start `running`; successful
+publication marks `published` in the same transaction as document/action
+completion. Partial/failed extractor documents and terminal extraction failures
+mark staged or registered outputs `failed` without deleting their bytes.
+Migration backfills prior published/removed rows and classifies non-published
+rows from attempt, metric-document and extraction-action outcomes. The schema
+rejects unknown values and inconsistent physical/lifecycle pairs. `retained`
+and `superseded` remain durable lifecycle labels for subsequent policy actions.
+
+M13.03 adds migration `0014` and a durable `diagnosis_required` marker on
+failed artifact rows. A diagnosis counts as complete only when its recovery
+stores `diagnosis_json` and has left `pending`/`diagnosing`, with no other
+unfinished recovery for the attempt. SQLite rejects removing or deleting a
+marked artifact until that evidence exists; retaining it cannot clear the
+marker or bypass the guard. The same read-only diagnosis check is available
+for later cleanup of failed logs. This barrier does not itself remove files.
+
+M13.04 freezes a nondefault `failed_log_tail_kb` per attempt (protocol v12;
+older attempts retain the 512 KiB default). Migration `0015` stores bounded
+raw-byte tails of both stdout and stderr for failed, lost or cancelled attempts
+in SQLite, alongside the terminal transition. The configured limit is per
+stream, supports zero, and is capped at 16384 KiB per stream. Tail capture
+seeks from the end without loading full logs; failed reads retain any available
+stream but mark the row `complete = false`. Cleanup must require a complete row
+before removing full logs, as well as the durable diagnosis required above.
+
+M13.05 freezes `failed_artifact_retention` into new attempt result contracts
+(protocol v13): failed artifact policy and `keep_on_failure` glob patterns.
+Legacy attempts without this snapshot are preserved. An independent supervisor
+task discovers diagnosed failed artifacts in bounded pages and rechecks their
+eligibility under SQLite's writer lock before removing any bytes. It excludes
+active extraction and requires complete log tails for failed/lost/cancelled
+attempts; unsuccessful extraction on a succeeded experiment leaves full logs
+untouched. Policy exceptions mark artifact lifecycle `retained`.
+
+Cleanup preflights the complete batch (up to 64 artifact rows) against the
+persisted attempt log paths, private staging paths and registered size/digest.
+It rejects traversal, symlinked components, mismatched bytes and log-stream
+paths. Hidden or final publication copies defer cleanup to publication recovery.
+Only individual source/staged files are removed, then parent directories are
+synced before publishing `removed` tombstones and cleanup events. An interruption
+after file removal but before database commit can be retried: absent verified
+paths are accepted and existing copies are rechecked. Unregistered outputs,
+full logs and directories are not removed in this step. The writer lock stays
+owned by the blocking worker during filesystem work, including caller abort;
+hashing uses bounded memory but lock duration depends on artifact size.
+
+M13.06 adds migration `0016` and a cleanup consumer for explicitly registered
+repair worktrees; creating them and running repair agents remain in M16. The
+registration links a recovery to exactly `WORKTREE_DIR/RECOVERY_ID`, stores
+Git common/admin paths and filesystem identities, and freezes the deletion
+policy. It rejects symlinked, foreign or main checkouts. Explicit release stores
+patch bytes and SHA-256 plus versioned diagnosis, validation, changed-path and
+optional candidate records in SQLite. Release requires a terminal recovery
+(`succeeded`, `failed`, `rejected`, `cancelled`) and no pending/running repair
+action or active agent session. Those records cannot then be reactivated or
+overwritten while the worktree is released.
+
+A candidate revision must resolve to a commit and is preserved before release
+as a direct `refs/igor/repairs/RECOVERY_ID` ref without replacing a different
+existing ref. Cleanup revalidates this reference and the Git/filesystem identity
+before targeted `git worktree remove --force`; it never broadly prunes worktrees.
+A committed `cleaning` intent permits retry after removal and an event/database
+rollback. Parent directories are synced before the removed tombstone and event
+are committed. If Git leaves a partial removal whose identity cannot be verified,
+cleanup remains deferred in `cleaning`. A false frozen deletion flag publishes
+`retained` instead. Existing unregistered worktrees are never candidates.
+
+M13.07 adds migration `0017`: physically published artifacts of superseded jobs
+are marked lifecycle `superseded`, with retained/removed rows preserved. The
+family supersession transaction performs the same marking; extraction completion
+checks the owning job under its writer lock so late publication cannot lose the
+superseded label. Identical published replay preserves superseded/retained state.
+
+The replacement barrier is live, not a latched success: only the highest-number
+current generation in the same family can qualify. A transaction-local domain
+assessment requires its exact seed membership and frozen protocol to be
+`Comparable`. SQL guards also reject removal or row deletion unless the current
+generation has successful matching members, regardless of artifact lifecycle;
+the domain helper additionally validates the protocol digest before physical
+cleanup. Failed-artifact cleanup invokes this helper under its writer lock before
+any file operation for superseded jobs. G2 success followed by pending/failed G3
+therefore preserves G1 artifacts again. M13.07 does not itself remove superseded
+published files; policy-driven retirement follows in M13.08.
+
+M13.08 freezes `superseded_artifact_retention` in new attempts (protocol v14),
+including `superseded_artifacts` policy and `keep_on_success` patterns. No
+snapshot on a legacy attempt means preservation. Keep/pattern exceptions mark
+`retained` without unlinking; the independent supervisor cleanup processes only
+published/superseded artifacts from succeeded attempts with superseded jobs.
+Deletion requires the current replacement's domain assessment to be comparable
+and no pending/running extraction. Source paths must match persisted execution
+stdout/stderr roots under both writer reservations, not a changed runtime root.
+
+Migration `0018` stores immutable per-artifact cleanup identities and the
+authorized replacement generation before any unlink. The whole batch preflights
+source, staged and final UUID publication files by size/digest and rejects unsafe
+paths or hidden publication-preparation copies. A second writer transaction
+rechecks live replacement eligibility, project/root identity, artifact rows and
+persisted log paths before deletion and directory fsync. Interrupted removals
+can replay missing copies only with prepared intent. If a newer generation is
+now incomplete, cleanup does not unlink remaining copies; it may complete a
+tombstone for an artifact whose copies are already all absent, using a
+transaction-local completion-only marker. Intents and artifact metadata remain
+as evidence; unrelated files, directories and stdout/stderr streams are kept.
+
+M13.09 freezes optional `compress_success_logs` per attempt (protocol v15;
+legacy absence preserves raw logs). Migration `0019` records exact temporary
+reservations and immutable gzip identities per attempt/stream. Compression
+uses a Rust streaming codec, private 0600 temporaries, synced output and atomic
+no-replace publication; only the exact reserved partial temporary is reclaimed
+after interruption. Prepared identity is durable before rename, and published
+metadata before raw retirement. The second phase verifies archive compressed
+size/digest, decompressed size/digest, and raw identity, then unlinks and syncs
+its parent before committing retirement/event.
+
+Every phase rechecks succeeded outcome, frozen policy, persisted raw paths,
+terminal extraction and diagnosis/repair consumers under a writer reservation.
+For process-group attempts it also checks for live group members in `/proc`:
+the leader's success alone does not imply its children's log descriptors are
+closed. A non-quiescent group defers compression; a changed raw log never matches
+and cannot be retired using stale archive identity. Blocking workers retain
+the transaction while doing filesystem work. Corrupt/missing archives preserve
+raw files and cause archive reads to fail rather than silently lose bytes.
+
+Executor metadata and extractor context keep the literal raw paths.
+`logs_for_job` exposes published archive descriptors for process, container and
+unit executions. CLI reads prefer raw files, refresh descriptors if raw files
+disappear, and decode archives using uncompressed follow offsets. It selects
+archives through SQLite metadata, not filename suffix. Raw and archive names
+are reserved from artifact registration/cleanup. Failed/lost/cancelled attempts
+continue to use M13.04's tail records and are not compressed here.
+
+M13.10 audits deletion ownership across cleanup and publication housekeeping.
+Checks walk the full absolute pathname from `/` without canonicalizing away
+links, including ancestors above configured roots. Artifact registration and
+cleanup reject raw empty/dot/parent components and repeated/trailing separators
+before matching retention patterns, so aliases cannot bypass an exact keep rule.
+Failed-artifact cleanup verifies the registered project, strict publication
+subtree and extractor/project association; unregistered or missing-root cases
+preserve bytes. Nested extractor working directories inside the project remain
+valid. Missing-parent replay syncs the nearest surviving validated directory.
+
+| Destructive operation | Registered boundary and ownership check |
+| --- | --- |
+| Failed source/staged artifact removal | Persisted attempt log paths, UUID staging paths, registered project/publication subtree, full no-symlink ancestor walk, size/digest preflight. |
+| Superseded publication/source/staged removal | Frozen publication root within the project and exact published metadata, persisted logs in both transactions, immutable intent and live replacement barrier. |
+| Successful raw-log retirement and partial temporary recovery | Persisted per-stream paths and immutable archive/reservation identity, full ancestor walk, verified gzip/raw bytes and consumer/writer barriers. |
+| Repair worktree removal | Exact recovery-derived worktree and stored Git/admin/directory identity, targeted Git removal, durable release evidence and candidate reference. |
+| Artifact staging/publication temporary removal | Full source/staging/project/candidate directory-chain validation before file operations; only the invocation's temporary or a registered-artifact UUID temporary is eligible. |
+
+These are ownership checks for a trusted same-user local installation, not a
+filesystem sandbox against concurrent adversarial replacement. Race/interruption
+coverage and the broader GC command remain in M13.12–M13.16.
+
+M13.11 adds migration `0020` with failed-artifact cleanup intents and shared
+version-one tombstones. Failed cleanup commits exact policy/project/attempt/copy
+identities before unlink, reacquires the writer and rechecks all barriers.
+Required files missing on first preparation are conflicts; missing files after
+prepared intent may be replayed, while remaining bytes must still match. A new
+incomplete replacement generation never authorizes further removal through an
+old intent.
+
+Failed-artifact discovery idempotently enqueues the existing
+`cleanup_failed_artifacts` action kind, with real job/attempt associations and
+versioned spec. Its executor validates the lease and association under both
+writer reservations. Completion, barrier deferral and remaining batches are
+distinct outcomes: deferral and continuation postpone durably without spending
+operational retries; actual failures retain retry/error history. A long blocking
+preflight or deletion cannot renew through another connection while holding the
+writer, so the owner renews its validated claim inside that transaction before
+commit. Stale claims at phase entry remain rejected.
+
+Failed/superseded artifact cleanup, repair-worktree retirement and successful
+raw-log retirement write immutable tombstones in the transaction publishing
+their terminal state and cleanup event. Each tombstone records operation,
+subject, schema version, reason/outcome, identity and decision/completion times;
+failed-action execution also records its action ID. Replay cannot reset times or
+duplicate terminal events. Existing removed rows are not backfilled with invented
+verified identities or completion times. Superseded/worktree/archive consumers
+retain their existing durable state machines; only failed cleanup is wired into
+the literal failed-artifact action outbox.
+
+Cancellation and job retry also reserve the jobs writer before reading their
+state. This prevents read-to-write WAL snapshot upgrades from failing when
+worker or supervisor writes commit concurrently; the no-op reservation changes
+neither lifecycle semantics nor event history.
+Notification enqueueing likewise reserves its fenced action before reading,
+so delivery insertion and action completion cannot upgrade a stale read snapshot.
+
+M13.12 adds worker protocol v16 `storage_status` and CLI
+`igor storage status [--json]`. Project selection follows `igor list`: a selected
+registered project is scoped; outside a project the inventory is global and
+includes unregistered historical projects. Every section is aggregated through
+independent queries in one deferred read transaction, without reserving a writer
+or running filesystem/cleanup operations.
+
+Artifact logical sizes count each row once and expose unknown-size counts;
+removed history is separate from active records. Archive raw/compressed identity
+bytes are distinct from physical measurements. Unmatched durable log preparation
+reservations are reported separately with unknown temporary size; matching
+archive records prevent double counting their preparation. Failed-tail and
+repair-patch BLOB lengths are payload bytes, not SQLite allocation. Cleanup
+actions/intents and operation-specific tombstone associations show progress and
+history without adding their identities to live storage totals. Actual disk
+footprint and worktree disk sizes remain unmeasured (`null` in JSON).
+
+M13.13 adds worker protocol v17 `gc_plan` and `igor gc --dry-run [--json]`.
+It reads one deferred database snapshot and observes filesystem/process/Git
+identities through read-only preflight helpers shared with retention executors.
+No writer reservation, cleanup intent, action claim, temporary creation, archive
+publication or Git mutation is part of preview. M13.14 adds confirmed execution
+as a separate request, without turning preview into mutation.
+
+The typed plan covers failed/superseded artifacts, repair worktrees and successful
+log compression, with operation/subject IDs, readiness and reason codes, effects
+and exact verified target paths. Unsafe whole-batch preflight suppresses its
+removals; legacy and active-consumer/replacement barriers remain visible. Existing
+owned compression temporaries are described as recompression/reclamation targets,
+not preserved bytes. Unregistered projects defer worktree and raw-log retirement
+in both preview and execution, including a registration change between phases.
+Missing-copy metadata replay retains the existing intent-specific conditions.
+
+Preview is bounded to 32 subjects per operation and 64 artifacts per attempt,
+with truncation and continuation markers rather than silently presenting a
+partial plan as complete. Byte attribution uses individual verified files and
+deduplicates paths; gzip savings and worktree totals stay unknown. The plan is
+advisory and requires writer-fenced revalidation at execution. Tests compare
+stable-fixture effects against existing executors and verify SQL/filesystem
+nonmutation using a read-only connection while another writer holds a transaction.
+
+M13.14 adds protocol v18 `gc_execute` and CLI
+`igor gc [--dry-run] [--failed] [--yes] [--json]`. Interactive execution shows the
+selected work and accepts only an affirmative response; decline/EOF sends no
+execution request. Dry-run never prompts and uses the same failed-only filter.
+JSON stdout is a single plan or execution result; prompts and summaries use
+stderr. Unsafe or error results exit nonzero after preserving partial JSON.
+
+Execution uses one fixed typed worklist selected from initially actionable plan
+entries, deduplicated by attempt/recovery. Artifact IDs and log streams constrain
+both executor phases; newly ready or newly inserted records cannot expand the
+confirmed pass. Per-entry consent fingerprints bind persisted context and
+identity, while observed target paths are compared and never used as unlink
+instructions. Every operation uses its existing writer-fenced executor and
+rechecks policy, consumers, identity, paths and live generation barriers. Counts
+distinguish completed/replayed, deferred, unsafe and error/partial outcomes.
+The command does not claim global outbox work or rediscover/drain candidates.
+
+The bound remains 32 subjects per operation and 64 artifacts per attempt. GC
+execution request frames allow 32 MiB to carry bounded selections, while other
+requests retain the 1 MiB limit. `--failed` includes registered failed-artifact
+retention, failed full-log retirement and explicitly owned private failed outputs,
+with no force deletion or recursive sweep.
+
+A13.01 failed logs adds SQLite v21 and protocol v19. New attempts freeze
+`result.failed_full_logs`; absent legacy snapshots and `keep` preserve full logs,
+and retries clone the original contract. Each stdout/stderr retirement records an
+immutable prepared identity (attempt, stream, exact raw path, original size/hash,
+tail start/end/hash). Both writer-first phases require durable `diagnosed_attempts`,
+a complete bounded tail matching the quiescent raw suffix, a failed/cancelled/lost
+attempt, registered project, no active extractor or repair/diagnostic consumer,
+backend registration and process-group quiescence. Superseded jobs also require
+the current replacement generation to be comparable, including zero-artifact jobs.
+Absolute directory chains, exact persisted paths, regular files and single links
+are verified before removal. Missing raw bytes authorize metadata-only replay
+only with the matching prepared intent. Surviving-parent fsync precedes atomic
+completion, tombstone and one cleanup event per stream. A bounded supervisor
+maintenance pass rediscovers deferred work; explicit GC uses the same executor,
+fixed stream selections and immutable consent identity in both phases.
+
+A13.01 private outputs adds SQLite v22 and protocol v20. Submission freezes
+`result.owned_namespace = Some(true)` alongside failed-artifact retention and
+keep patterns; absent legacy snapshots (including retries) preserve outputs.
+Every process, Docker and systemd log preparation goes through one repository
+helper. A newly created, empty `RuntimePaths.log_dir/ATTEMPT_UUID` directory is
+fsynced and recorded before child launch with exact root, device/inode, attempt
+ID, creation proof and stdout/stderr bindings. Existing directories are never
+adopted; checkout, publication and staging overlap cannot grant ownership.
+
+Discovery happens only after durable diagnosis, complete tails, terminal failed
+outcome, registered project, no extractor/repair consumers, quiescent process
+group and current comparable replacement. It reads at most 4097 directory entries,
+without recursion; namespaces with more than 4096 children explicitly defer.
+Sorted actionable pages contain at most 64 files, skipping protected entries
+without hashing them or spending an actionable slot. Registered sources, exact
+stdout/stderr log/archive names, durable compression temporary paths and `.git`
+boundaries are excluded; ordinary dotfiles, `.tmp`/`.gz`, `config` and `index`
+remain eligible. Directories are preserved. Nonregular, symlinked or hardlinked
+leaves are unsafe; keep patterns apply to relative leaf names. More than 4096 registered exclusions
+defer the namespace rather than dropping exclusions. Truncation is explicit.
+Preview/storage status do not insert manifests, intents or actions.
+
+`owned_output_manifest` records stable attempt/name-hash subjects and immutable
+file/root identities in prepared/completed states. Consent binds the complete
+identity and frozen context; selected execution never adds new files. Both
+writer-first phases recheck eligibility, full absolute directory chains,
+root device/inode, persisted stdout/stderr paths and file digest/device/inode.
+Unlink uses a verified directory descriptor; parent fsync precedes immutable
+completion, `failed_owned_output_retention` tombstone and one subject event.
+Missing leaves are replayable only with matching prepared evidence; substituted
+roots/leaves preserve bytes. The root itself is never deleted. Bounded periodic
+supervisor maintenance and worker-only GC share this executor, including
+zero-registered-artifact candidates. Storage exposes manifest logical bytes,
+pending/completed intent states and tombstone references, not a fabricated
+physical footprint. The real-process acceptance writes binary logs longer than
+their tails, FD-discovered private siblings and checkout/external sentinels;
+diagnosis and supervisor retire only full logs and the disposable sibling.
+
+`owned_output_discovery` records namespace completion separately from immutable
+ownership. A drained or keep-only namespace produces one metadata-only subject
+with consent binding its root identity and sorted child metadata snapshot. New
+files, unsafe roots, consumers or pending manifests prevent this authorization
+from advancing completion. Finishing discovery never expands a confirmed file
+worklist: it is authorized in a subsequent request after the selected outputs
+are retired. Candidate queries exclude completed discoveries while retaining
+prepared manifests, so drained history cannot starve the 33rd namespace.
+Completed namespaces are not rescanned for future unknown outputs. Storage
+reports pending/completed discovery counts without filesystem writes.
+
+`JobLogs` returns descriptors only after completed retirement. `RetiredLogChunk`
+reads one SQLite BLOB `substr` capped at 64 KiB, validates the frozen descriptor,
+and returns original byte coordinates. Tail BLOBs are immutable once an intent
+exists. `igor logs` falls back only after raw NotFound and a completed descriptor,
+pins refreshes to the chosen attempt, preserves binary bytes, reports omitted
+prefixes on stderr and retains original offsets across raw-to-tail follow.
+Neither the two 16 MiB tails nor their JSON byte expansion enter a metadata frame.
+Storage inventory reports intent states and logical identity sizes; physical raw
+footprint stays unknown rather than counting prepared or retired files as present.
+
+A13.02 checks saved read-only plans against independently observed execution
+effects for all six GC operations. Oracles derive target paths and byte lengths
+from fixture files, compare exact file deltas (subtree roots for worktrees),
+verify preserved sentinels and candidate refs, and inspect per-subject outcomes
+and durable evidence. Compression checks the deterministic gzip destination,
+binary roundtrip and absence of residual temporaries across fresh, reserved,
+prepared, published and metadata-only phases; it does not predict fresh private
+temporary names or compressed sizes. Namespace discovery completion changes
+metadata only, never implicitly authorizing a new file-removal worklist.
+
+Under unchanged eligibility and consent, the selected effects and outcomes
+match the plan. Changed consent or barriers defer the saved selection without
+expansion. A successful retain decision with no persisted lifecycle marker is
+reported completed only after strict post-step preview/consent revalidation;
+legacy snapshots and disabled compression do not create fictitious records.
+Persisted terminal subjects retain their already-done reporting semantics.
+
+CLI acceptance compares project/global scope with two real worker attempts,
+human/JSON truncation, fixed failed-only worklists and read-only SQL/filesystem
+snapshots. Initial preview-unsafe subjects remain outside execution consent but
+appear as unsafe outcomes with exit code 1 alongside selected partial results.
+An unsafe-only plan needs no confirmation or execution request and reports the
+rejection even without `--yes`. Decline/EOF of a nonempty worklist still sends no
+request and returns an empty unconfirmed result. No schema or protocol change is
+needed for these outcome-reporting corrections.
+
+A13.03 extends interruption acceptance with fresh database handles after exact
+fault seams for all six operations. Failed/superseded artifacts, full failed
+logs and private outputs retain committed prepared identities across a failed
+completion transaction after real unlinks; restart preserves decision identity,
+stored binary tails and the original selected subjects. Replay checks complete
+SQL/filesystem snapshots and one tombstone/event per subject. Diagnosis,
+consumers, replacement generations and protected/unselected bytes remain
+revalidated through the existing phase-boundary tests.
+
+Compression restart tests cover reservations before any bytes, interrupted
+partial temporaries, rename before publication metadata, raw retirement before
+completion, and event rollback. Only the exact durably reserved temporary is
+recovered; foreign temporaries stay intact and the published gzip still
+reproduces the original binary log. Worktree recovery preserves candidate refs
+and registered Git boundaries; an absent tree without a prior cleaning intent
+remains unsafe, while matching durable cleaning evidence permits targeted replay.
+An interrupted metadata-only namespace closure rolls back without deleting bytes
+and completes once on the same saved selection after reopening SQLite.
+
+Maintenance acceptance expires a running failed-cleanup claim after unlink and
+completion rollback, reopens SQLite, rejects the stale lease and reclaims the
+same idempotent action with a fresh lease. Completion retains the original
+decision identity/time and action attribution without duplicate evidence.
+
+The CLI fixture additionally kills the worker with verified SIGKILL after a
+faulted GC request has left a durable prepared intent, then reopens SQLite and
+starts a new worker on the same paths. It completes the missing-copy metadata
+once and observes an empty read-only preview afterwards. Exact in-operation
+failure locations use SQL trigger faults; this process-kill case occurs after
+the failed request, not inside an active filesystem or SQL phase. Broader
+crash-injection hardening remains in M17.10.
+
+M13.15 complements phase-boundary fault triggers with independent-connection
+concurrency tests. External writers and barrier/oneshot handoffs overlap real
+repository operations without using sleeps to select ordering. Diagnosis commit
+blocks cleanup while rollback permits it; read-only preview sees committed
+diagnosis state even while a substantive writer transaction remains open.
+Late publication racing cleanup preserves files until current replacement
+success. Real G3 supersession racing a confirmed G1 retirement accepts either
+legal serialized outcome and checks that subsequent replay under pending G3
+cannot begin another unlink.
+
+Concurrent worktree cleaners and log compressors preserve unrelated bytes and
+protected candidate references, with exactly one durable tombstone/event per
+removed subject or retired stream. Oracles inspect event identities and stable
+replay records, not merely aggregate counts. Worker futures are structured under
+deadlock watchdogs so test error paths do not detach cleanup tasks. These tests
+exercise writer-first overlap and both legal outcomes; existing triggers remain
+the exact preparation/removal phase seams.
+
+M13.16 extends path negatives to interrupted cleanup with already-absent leaves.
+Prepared intents do not bypass validation of linked source/staging/publication
+ancestry, and an unsafe missing copy blocks retirement of other valid copies
+in the batch. Tests verify external sentinel bytes and link metadata remain
+unchanged, intents remain prepared and no removal tombstone is accepted.
+
+Reserved log temporaries reject symlinks, shared hardlinks, foreign parents and
+nonregular FIFO leaves without reclaiming or publishing bytes. FIFO tests run
+the operation in a killable child test process with a watchdog; a blocking-read
+regression cannot leave the parent suite stuck. Worktree tests cover `.git`,
+admin `gitdir` and `commondir` links/foreign backreferences at registration,
+candidate release and cleanup, plus missing-tree replay behind linked parents.
+They also establish exact lexical path/root matching: normalized-away dot,
+separator or trailing spellings are rejected. The ordinary Git `../..`
+commondir literal and exact absolute common-dir paths remain valid. These
+lexical fixes prevent alias acceptance; the probes did not demonstrate a new
+foreign-file deletion in the worktree code.
 
 Cleanup is an idempotent supervisor action. It must never delete files outside
 registered attempt directories or declared artifact roots.
@@ -1230,7 +1669,7 @@ The local CLI/worker/supervisor wire protocol requires an exact version match
 and project TOML, job and family TOML, and event payloads each have their own
 explicit version (`1` in the current implementation). Readers reject an
 unsupported version rather than silently interpreting it as the current schema.
-SQLite uses numbered, checksummed SQLx migrations (currently through `0012`).
+SQLite uses numbered, checksummed SQLx migrations (currently through `0020`).
 Writable worker startup applies available migrations; `igor db check` only
 reads, and `igor db migrate` explicitly upgrades an existing database after
 integrity and foreign-key checks. Back up before upgrades. Database migration
@@ -1271,6 +1710,7 @@ Current production subprocess entry points and environment boundaries:
 | Local metadata helpers | `submission.rs` Git, `inventory.rs` `nvidia-smi`, `executor.rs` Docker probes | Inherit the worker's environment as trusted local tools. Git's configured helpers/filters and executable resolution therefore remain within the trusted-user boundary; their environment is not used as a job's environment. |
 | Service administration | CLI `systemctl` and `journalctl`; worker `systemctl`/`systemd-run` | Inherit the invoking CLI/worker environment to contact the user manager and display service state. They do not receive Telegram credentials from project job specifications or pass the inherited environment as the experiment unit environment. |
 | Metric extractor | `extract.rs` supervisor action | Starts with `env_clear`, passes only `PATH`, runs the frozen direct command from the private attempt directory, and supplies verified attempt log paths and IDs on stdin. Its stdout/stderr are bounded; extractor code remains trusted same-user code, not a sandbox. |
+| Repair-worktree maintenance | `repair_worktrees.rs` registration/release/cleanup | Uses `/usr/bin/git` with a cleared environment and fixed `PATH`, disables hooks, bounds output and command duration, and operates only on validated repository/worktree identities. Patch evidence is in SQLite and candidate refs are preserved before targeted removal. |
 
 Telegram delivery uses an in-process HTTP client, not a shell child. Hooks,
 coding-agent subprocesses are not implemented yet and must receive their own

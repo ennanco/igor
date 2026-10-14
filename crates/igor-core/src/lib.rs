@@ -53,32 +53,40 @@ pub use id::{
 };
 pub use inventory::{HostGpu, HostInventory, InventoryError, discover_host_inventory};
 pub use job::{
-    AttemptSpec, ConfigurationIdentity, ContentIdentity, ContentRole, FamilyMembership,
-    GenerationIdentity, GitIdentity, JobSpec, ResultContract, Seed, SourceIdentity,
+    AttemptSpec, ConfigurationIdentity, ContentIdentity, ContentRole, FailedArtifactRetention,
+    FamilyMembership, GenerationIdentity, GitIdentity, JobSpec, ResultContract, Seed,
+    SourceIdentity, SupersededArtifactRetention,
 };
 pub use metric::{MetricDocumentError, parse_metric_document_json, validate_metric_document};
 pub use persistence::{
-    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, AttemptLogPaths,
-    AttemptMetrics, Claim, ClaimedAction, ClaimedDelivery, ComparableGeneration, ContainerCreate,
-    ContainerFinish, ContainerRecord, Database, DatabaseOptions, DeliveryRecord,
-    DeliveryRepository, EventRepository, ExecutionClaim, ExecutionOutcome, Family, FamilyDetail,
-    FamilyGenerationDetail, FamilyGenerationRepository, Generation, GenerationStatus,
-    IntegrityCheck, JobAttemptRepository, JobDetail, JobLogs, PersistenceError, ProcessRecord,
-    ProcessStart, ProjectRepository, RecoveredExecution, Resource, ResourceLease,
-    ResourceRepository, ResourceStatus, StoredAttempt, StoredEvent, StoredJob, UnitRecord,
-    UnitReservation,
+    ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, ArtifactStorage,
+    ArtifactStorageGroup, AttemptLogPaths, AttemptMetrics, Claim, ClaimedAction, ClaimedDelivery,
+    CleanupIntentStorage, ComparableGeneration, ContainerCreate, ContainerFinish, ContainerRecord,
+    Database, DatabaseOptions, DeliveryRecord, DeliveryRepository, EventRepository, ExecutionClaim,
+    ExecutionOutcome, FailedLogRetirementStorage, FailedLogTails, FailedTailStorage, Family,
+    FamilyDetail, FamilyGenerationDetail, FamilyGenerationRepository, GcArtifactBatch, GcEffect,
+    GcEntry, GcExecution, GcExecutionCause, GcExecutionEntry, GcExecutionStatus, GcLogStream,
+    GcOperation, GcPage, GcPlan, GcSelection, GcStatus, GcSubject, GcTarget, GcWorklist,
+    Generation, GenerationStatus, IntegrityCheck, JobAttemptRepository, JobDetail, JobLogs,
+    LogArchive, LogArchiveStorage, LogTailChunk, OwnedOutputStorage, PendingLogPreparationsStorage,
+    PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, RecoveredExecution,
+    RepairWorktreeEvidence, RepairWorktreeRepository, RepairWorktreeStorage, Resource,
+    ResourceLease, ResourceRepository, ResourceStatus, RetiredLogTail, StorageStateCount,
+    StorageStatus, StoredAttempt, StoredEvent, StoredJob, TombstoneStorage, UnitRecord,
+    UnitReservation, copy_log,
 };
 pub use project::{
-    PROJECT_CONFIG_VERSION, Project, ProjectConfig, ProjectPaths, ProvenanceConfig, ReportConfig,
-    ReportGenerator, ReportMode, ReportTrigger, ResultsConfig,
+    ArtifactRetentionConfig, FailedRetention, PROJECT_CONFIG_VERSION, Project, ProjectConfig,
+    ProjectPaths, ProvenanceConfig, ReportConfig, ReportGenerator, ReportMode, ReportTrigger,
+    ResultsConfig, RetentionConfig, SupersededRetention,
 };
 pub use resource::{
     GpuRequest, NamedResourceMode, NamedResourceRequest, ResourceMode, ResourceRequest,
 };
 pub use retry::{ActionRetryPolicy, AttemptRetryPolicy, DeliveryRetryPolicy, RetryPolicy};
 pub use state::{
-    ActionState, AttemptState, CleanupState, DeliveryState, JobState, RecoveryState, ReportState,
-    TransitionState,
+    ActionState, ArtifactLifecycleState, AttemptState, CleanupState, DeliveryState, JobState,
+    RecoveryState, ReportState, TransitionState,
 };
 pub use submission::{
     JOB_FILE_VERSION, JobExecution, JobFile, Submission, SubmissionError, SubmissionInput,

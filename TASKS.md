@@ -563,40 +563,71 @@ Dependencies: milestones 10-11.
 
 Dependencies: milestone 12.
 
+Status: accepted (M13.01–M13.16 and A13.01–A13.03 complete).
+
 ### Tasks
 
-- [ ] `M13.01` Implement retention policy parsing and effective defaults.
-- [ ] `M13.02` Track running, failed, published, retained, superseded, and
+- [x] `M13.01` Implement retention policy parsing and effective defaults.
+- [x] `M13.02` Track running, failed, published, retained, superseded, and
   removed artifact states.
-- [ ] `M13.03` Preserve failed files until required diagnosis finishes.
-- [ ] `M13.04` Preserve only the configured failed-log tail in SQLite.
-- [ ] `M13.05` Delete failed large artifacts after diagnosis by default.
-- [ ] `M13.06` Delete repair worktrees after their required records and patches
+- [x] `M13.03` Preserve failed files until required diagnosis finishes.
+- [x] `M13.04` Preserve only the configured failed-log tail in SQLite.
+- [x] `M13.05` Delete failed large artifacts after diagnosis by default.
+- [x] `M13.06` Delete repair worktrees after their required records and patches
   are durable.
-- [ ] `M13.07` Keep superseded artifacts until a replacement generation
+- [x] `M13.07` Keep superseded artifacts until a replacement generation
   succeeds.
-- [ ] `M13.08` Delete superseded artifacts after successful replacement by
+- [x] `M13.08` Delete superseded artifacts after successful replacement by
   default.
-- [ ] `M13.09` Compress successful logs according to policy.
-- [ ] `M13.10` Never delete outside registered attempt or artifact roots.
-- [ ] `M13.11` Implement idempotent cleanup actions and tombstone metadata.
-- [ ] `M13.12` Implement `igor storage status`.
-- [ ] `M13.13` Implement `igor gc --dry-run`.
-- [ ] `M13.14` Implement confirmed `igor gc` and `igor gc --failed`.
-- [ ] `M13.15` Add race tests for diagnosis, publication, replacement, and
+- [x] `M13.09` Compress successful logs according to policy.
+- [x] `M13.10` Never delete outside registered attempt or artifact roots.
+- [x] `M13.11` Implement idempotent cleanup actions and tombstone metadata.
+- [x] `M13.12` Implement `igor storage status`.
+- [x] `M13.13` Implement `igor gc --dry-run`.
+- [x] `M13.14` Implement confirmed `igor gc` and `igor gc --failed`.
+- [x] `M13.15` Add race tests for diagnosis, publication, replacement, and
   cleanup.
-- [ ] `M13.16` Add path traversal and symlink escape tests.
+- [x] `M13.16` Add path traversal and symlink escape tests.
 
 ### Acceptance
 
-- [ ] `A13.01` A failed attempt leaves concise history but no large disposable
+- [x] `A13.01` A failed attempt leaves concise history but no large disposable
   files after diagnosis.
-- [ ] `A13.02` Dry-run output exactly predicts cleanup effects.
-- [ ] `A13.03` Cleanup interruption can be retried safely.
+  - Full failed-log retirement is implemented with frozen policy, durable stream
+    identities, diagnosis/tail/consumer barriers, GC and supervisor maintenance,
+    and chunked binary tail reads. Fresh worker-private namespace ownership is
+    durable before launch; bounded leaf manifests, frozen keep policy, fixed GC
+    consent and idempotent replay preserve legacy/preexisting/external bytes.
+    Combined real-process acceptance verifies binary tail CLI reads and removal
+    of full logs/disposable output with zero registered artifacts, retaining
+    keep-pattern, checkout and external files.
+    Review regressions cover ordinary dot/tmp/gzip outputs, protected-prefix
+    progress, bounded namespace overflow, snapshot-bound metadata-only discovery
+    closure and worker-only GC reaching namespace 33 after draining the first 32.
+- [x] `A13.02` Dry-run output exactly predicts cleanup effects.
+  - Saved read-only plans match independently observed path/byte effects and
+    per-subject outcomes across all six operations, including retained decisions,
+    gzip publication phases and metadata-only namespace closure. Changed consent
+    defers the fixed worklist without authorizing newly eligible files.
+    CLI acceptance verifies project/global isolation, failed-only filters,
+    human/JSON truncation, decline/EOF and mixed/unsafe-only partial reporting.
+- [x] `A13.03` Cleanup interruption can be retried safely.
+  - Exact fault seams followed by database reopen cover all six operations,
+    reserved/partial/published gzip phases and metadata-only namespace closure.
+    Replay preserves committed identities, binary logs, selected scope and Git
+    refs with one tombstone/event per subject. Expired maintenance claims resume
+    the same idempotent action under a fresh lease and reject stale claims.
+    Worker-only CLI recovery verifies SIGKILL after a faulted GC request,
+    durable prepared evidence, restart and completion without duplicates.
 
 ## Milestone 14: Deterministic Markdown Reports
 
 Dependencies: milestones 11-13.
+
+Reports are opt-in: execution must work without an extractor, report generator,
+coding agent or Telegram. Omitted report configuration is disabled; the default
+generator, when enabled, is deterministic. Explicit existing project choices
+remain respected.
 
 ### Tasks
 

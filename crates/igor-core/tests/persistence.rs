@@ -19,8 +19,8 @@ use igor_core::{
     IntegrityCheck, JobId, JobSpec, JobState, NamedResourceMode, NamedResourceRequest,
     PersistenceError, PreparedFamily, ProcessExecutorSpec, ProcessIsolation, ProcessStart, Project,
     ProjectConfig, ProjectId, Resource, ResourceId, ResourceMode, ResultContract, ShellPolicy,
-    SourceIdentity, SubmissionError, UnitReservation, build_family_generation, initialize_project,
-    load_family_file, load_project_config,
+    SourceIdentity, SubmissionError, TransitionState, UnitReservation, build_family_generation,
+    initialize_project, load_family_file, load_project_config,
 };
 use serde_json::json;
 use sha2::Digest;
@@ -29,6 +29,49 @@ use tempfile::TempDir;
 use tokio::sync::{Barrier, oneshot};
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+#[path = "persistence/owned_failed_outputs.rs"]
+mod owned_failed_outputs;
+
+async fn drop_repair_worktrees(database: &Database) -> TestResult {
+    sqlx::raw_sql(
+        "DROP TRIGGER repair_worktrees_recovery_guard;
+        DROP TRIGGER repair_worktrees_action_insert_guard;
+        DROP TRIGGER repair_worktrees_action_update_guard;
+        DROP TRIGGER repair_worktrees_session_insert_guard;
+        DROP TRIGGER repair_worktrees_session_update_guard;
+        DROP TABLE repair_worktrees;",
+    )
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+async fn drop_replacement_barrier(database: &Database) -> TestResult {
+    drop_cleanup_evidence(database).await?;
+    sqlx::raw_sql("DROP TABLE success_log_archive_preparations; DROP TRIGGER success_log_archive_identity_update; DROP TRIGGER success_log_archive_identity_delete; DROP TABLE success_log_archives;")
+        .execute(database.pool()).await?;
+    sqlx::raw_sql("DROP TRIGGER superseded_cleanup_insert_guard; DROP TRIGGER superseded_cleanup_identity_update; DROP TRIGGER superseded_cleanup_identity_delete; DROP TABLE superseded_cleanup_intents;")
+        .execute(database.pool()).await?;
+    sqlx::raw_sql(
+        "DROP TRIGGER artifacts_replacement_update;
+        DROP TRIGGER artifacts_replacement_delete;
+        DROP VIEW successful_current_generations;",
+    )
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+async fn drop_cleanup_evidence(database: &Database) -> TestResult {
+    sqlx::raw_sql("DROP TABLE IF EXISTS owned_output_discovery; DROP TABLE IF EXISTS owned_output_manifest; DROP TABLE IF EXISTS owned_output_namespaces; DELETE FROM _sqlx_migrations WHERE version = 22;").execute(database.pool()).await?;
+    sqlx::raw_sql("DROP TRIGGER IF EXISTS retired_failed_tails_immutable; DROP TRIGGER IF EXISTS retired_failed_tails_preserved; DROP TRIGGER IF EXISTS retired_failed_tails_replacement_guard; DROP TABLE IF EXISTS failed_log_retirements; DELETE FROM _sqlx_migrations WHERE version = 21;")
+        .execute(database.pool()).await?;
+    sqlx::raw_sql("DROP TABLE cleanup_tombstones; DROP TABLE failed_cleanup_intents;")
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
 
 fn missing(message: &'static str) -> io::Error {
     io::Error::other(message)
@@ -88,9 +131,15 @@ fn attempt(job: &JobSpec, sequence: u32) -> Result<AttemptSpec, Box<dyn Error>> 
             contents: Vec::new(),
         },
         ResultContract {
+            owned_namespace: None,
+            failed_full_logs: None,
+            compress_success_logs: None,
+            failed_artifact_retention: None,
+            superseded_artifact_retention: None,
             schema_version: 1,
             extractor: None,
             publication_root: None,
+            failed_log_tail_kb: None,
         },
     )?)
 }
@@ -201,18 +250,29 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "attempt_processes",
         "deliveries",
         "events",
+        "failed_log_tails",
+        "failed_cleanup_intents",
+        "failed_log_retirements",
+        "cleanup_tombstones",
         "families",
         "generations",
         "jobs",
         "metrics",
         "metric_documents",
         "metric_selections",
+        "owned_output_discovery",
+        "owned_output_manifest",
+        "owned_output_namespaces",
         "project_aliases",
         "projects",
         "recoveries",
+        "repair_worktrees",
         "report_runs",
         "resource_leases",
         "resources",
+        "success_log_archives",
+        "success_log_archive_preparations",
+        "superseded_cleanup_intents",
     ]
     .into_iter()
     .map(String::from)
@@ -230,6 +290,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "actions_pending_idx",
         "agent_sessions_cleanup_idx",
         "artifacts_attempt_idx",
+        "artifacts_lifecycle_idx",
         "attempt_containers_state_idx",
         "attempts_job_lookup_idx",
         "deliveries_lease_idx",
@@ -242,6 +303,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "metrics_attempt_idx",
         "metric_selections_split_metric_idx",
         "recoveries_attempt_idx",
+        "repair_worktrees_cleanup_idx",
         "report_runs_generation_idx",
         "resource_leases_expiry_idx",
         "resource_leases_job_idx",
@@ -264,7 +326,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(ledger.len(), 12);
+    assert_eq!(ledger.len(), 22);
     for (index, row) in ledger.iter().enumerate() {
         assert_eq!(row.get::<i64, _>("version"), (index + 1) as i64);
         assert!(row.get::<bool, _>("success"));
@@ -312,7 +374,12 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
             .fetch_all(database.pool())
             .await?;
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    assert_eq!(
+        versions,
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+        ]
+    );
     let checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
             .fetch_one(database.pool())
@@ -459,6 +526,8 @@ async fn repositories_round_trip_and_events_are_append_only() -> TestResult {
             sha256: Some(format!("digest-{index}")),
             size_bytes: None,
             state: igor_core::ArtifactPublicationState::Published,
+            lifecycle: igor_core::ArtifactLifecycleState::Published,
+            diagnosis_required: false,
             metadata: json!({"index": index}),
         };
         database.artifacts().insert(&artifact).await?;
@@ -872,6 +941,148 @@ async fn terminal_attempt_enqueues_notification_and_delivery_atomically() -> Tes
 }
 
 #[tokio::test]
+async fn notification_enqueue_waits_for_external_writer_and_fences_stale_claim() -> TestResult {
+    let (directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let execution = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &execution,
+            &ExecutionOutcome {
+                state: AttemptState::Failed,
+                exit_code: Some(7),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let stale = database
+        .actions()
+        .claim_notification("old-supervisor", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("notification action missing"))?;
+    sqlx::query("UPDATE actions SET claim_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE id = ?")
+        .bind(stale.record_id.to_string()).execute(database.pool()).await?;
+    let claim = database
+        .actions()
+        .claim_notification("supervisor", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("notification action not reclaimed"))?;
+    assert_eq!(claim.record_id, stale.record_id);
+    assert_ne!(claim.lease_id, stale.lease_id);
+    let work = database
+        .actions()
+        .claimed(&claim)
+        .await?
+        .ok_or_else(|| missing("notification claim missing"))?;
+    let event_id: igor_core::EventId = work.action.spec["event_id"]
+        .as_str()
+        .ok_or_else(|| missing("notification event missing"))?
+        .parse()?;
+    let delivery = DeliveryRecord {
+        id: DeliveryId::new(),
+        project_id: project.id,
+        channel: "telegram".into(),
+        state: DeliveryState::Pending,
+        payload: work.action.spec,
+        idempotency_key: "contended-notification-delivery".into(),
+    };
+    assert!(matches!(
+        database
+            .actions()
+            .enqueue_notification(&stale, &delivery, event_id)
+            .await,
+        Err(PersistenceError::Conflict {
+            entity: "notification action"
+        })
+    ));
+    let events_before: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+        .fetch_one(database.pool())
+        .await?;
+    let mut external = SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(directory.path().join("nested/igor.db")),
+    )
+    .await?;
+    let mut held_writer = external.begin().await?;
+    sqlx::query("UPDATE projects SET name = name WHERE id = ?")
+        .bind(project.id.to_string())
+        .execute(&mut *held_writer)
+        .await?;
+    let worker_database = database.clone();
+    let worker_delivery = delivery.clone();
+    let worker_claim = claim.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        worker_database
+            .actions()
+            .enqueue_notification(&worker_claim, &worker_delivery, event_id)
+            .await
+    });
+    started_rx.await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    held_writer.commit().await?;
+    task.await??;
+    for fenced in [&stale, &claim] {
+        assert!(matches!(
+            database
+                .actions()
+                .enqueue_notification(fenced, &delivery, event_id)
+                .await,
+            Err(PersistenceError::Conflict {
+                entity: "notification action"
+            })
+        ));
+    }
+    let deliveries: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT id, state, event_id FROM deliveries")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        deliveries,
+        vec![(
+            delivery.id.to_string(),
+            "pending".into(),
+            event_id.to_string()
+        )]
+    );
+    let action: (String, i64, Option<String>) =
+        sqlx::query_as("SELECT state, attempts, claim_id FROM actions WHERE id = ?")
+            .bind(claim.record_id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(action, ("succeeded".into(), 2, None));
+    let events_after: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(events_after, events_before + 1);
+    let completions: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE kind = 'action_state_changed' AND json_extract(payload_json, '$.data.state') = 'succeeded'")
+        .fetch_one(database.pool()).await?;
+    assert_eq!(completions, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn successful_extractor_is_queued_and_completed_transactionally() -> TestResult {
     let (_directory, database) = database().await?;
     synchronize_test_inventory(&database, 1, Vec::new()).await?;
@@ -1018,7 +1229,7 @@ async fn claimed_artifact_registration_is_fenced_idempotent_and_required_for_ext
     let (directory, database) = database().await?;
     synchronize_test_inventory(&database, 1, Vec::new()).await?;
     let mut project = project();
-    project.root = directory.path().join("project");
+    project.root = directory.path().join("project-parent/project");
     project.config_path = project.root.join(".igor/project.toml");
     fs::create_dir_all(&project.root)?;
     let publication_root = project.root.join("artifacts");
@@ -1105,6 +1316,10 @@ async fn claimed_artifact_registration_is_fenced_idempotent_and_required_for_ext
     assert_eq!(artifact.sha256.as_deref(), Some(sha.as_str()));
     assert_eq!(artifact.size_bytes, Some(contents.len() as u64));
     assert_eq!(
+        artifact.lifecycle,
+        igor_core::ArtifactLifecycleState::Running
+    );
+    assert_eq!(
         artifact.state,
         igor_core::ArtifactPublicationState::Registered
     );
@@ -1125,6 +1340,56 @@ async fn claimed_artifact_registration_is_fenced_idempotent_and_required_for_ext
             .fetch_one(database.pool())
             .await?;
     assert_eq!(after_idempotent, 1);
+    let source_alias = directory.path().join("source-ancestor-link");
+    std::os::unix::fs::symlink(&base, &source_alias)?;
+    fs::write(
+        attempt_dir.join("ancestor-source.bin"),
+        b"external source bytes",
+    )?;
+    for source_root in [
+        source_alias.join(attempt.id().to_string()),
+        base.join(".").join(attempt.id().to_string()),
+        base.join("..")
+            .join("attempt-logs")
+            .join(attempt.id().to_string()),
+    ] {
+        assert!(
+            database
+                .artifacts()
+                .register_claimed(
+                    &action_claim,
+                    attempt.id(),
+                    &source_root,
+                    &json!({"path":"ancestor-source.bin","role":"checkpoint"}),
+                )
+                .await
+                .is_err(),
+            "read artifact through an unsafe source root: {}",
+            source_root.display()
+        );
+    }
+    assert_eq!(
+        fs::read(attempt_dir.join("ancestor-source.bin"))?,
+        b"external source bytes"
+    );
+    let staging_external = directory.path().join("external-staging-ancestor");
+    fs::create_dir_all(staging_external.join("state"))?;
+    let staging_alias = directory.path().join("staging-ancestor-link");
+    std::os::unix::fs::symlink(&staging_external, &staging_alias)?;
+    assert!(
+        database
+            .artifacts()
+            .stage_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &attempt_dir,
+                &staging_alias.join("state/artifact-staging"),
+            )
+            .await
+            .is_err()
+    );
+    assert!(!staging_external.join("state/artifact-staging").exists());
     let symlink_destination = directory.path().join("external-staging");
     fs::create_dir_all(&symlink_destination)?;
     let symlink_root = directory.path().join("staging-symlink");
@@ -1155,6 +1420,7 @@ async fn claimed_artifact_registration_is_fenced_idempotent_and_required_for_ext
         )
         .await?;
     assert_eq!(staged.state, igor_core::ArtifactPublicationState::Staged);
+    assert_eq!(staged.lifecycle, igor_core::ArtifactLifecycleState::Running);
     let staged_path = staging_root
         .join(attempt.id().to_string())
         .join(artifact.id.to_string());
@@ -1265,6 +1531,11 @@ async fn claimed_artifact_registration_is_fenced_idempotent_and_required_for_ext
         igor_core::ArtifactPublicationState::Staged
     );
     for bad in [
+        json!({"path":"checkpoints/./epoch-3.bin", "role":"checkpoint"}),
+        json!({"path":"checkpoints//epoch-3.bin", "role":"checkpoint"}),
+        json!({"path":"checkpoints/epoch-3.bin/", "role":"checkpoint"}),
+        json!({"path":"checkpoints/epoch-3.bin\u{0}", "role":"checkpoint"}),
+        json!({"path":"", "role":"checkpoint"}),
         json!({"path":"../escape", "role":"checkpoint"}),
         json!({"path":attempt_dir.join("checkpoints/epoch-3.bin"), "role":"checkpoint"}),
         json!({"path":"missing.bin", "role":"checkpoint"}),
@@ -1309,6 +1580,26 @@ async fn claimed_artifact_registration_is_fenced_idempotent_and_required_for_ext
             .is_err()
     );
     fs::write(attempt_dir.join("checkpoints/epoch-3.bin"), contents)?;
+    let project_parent = project.root.parent().ok_or("missing project parent")?;
+    let external_project_parent = directory.path().join("external-project-ancestor");
+    fs::rename(project_parent, &external_project_parent)?;
+    std::os::unix::fs::symlink(&external_project_parent, project_parent)?;
+    assert!(
+        database
+            .artifacts()
+            .prepare_publication_claimed(
+                &action_claim,
+                artifact.id,
+                attempt.id(),
+                &staging_root,
+                &publication_root,
+            )
+            .await
+            .is_err()
+    );
+    assert!(!external_project_parent.join("project/artifacts").exists());
+    fs::remove_file(project_parent)?;
+    fs::rename(&external_project_parent, project_parent)?;
     let external_publication = directory.path().join("outside-publication");
     fs::create_dir_all(&external_publication)?;
     std::os::unix::fs::symlink(&external_publication, &publication_root)?;
@@ -1450,6 +1741,66 @@ async fn claimed_artifact_registration_is_fenced_idempotent_and_required_for_ext
         .join(".igor-publication-staging")
         .join(attempt.id().to_string())
         .join(format!(".{}.{}.tmp", artifact.id, uuid::Uuid::new_v4()));
+    fs::write(&orphan, b"interrupted copy")?;
+    let hidden_parent = publication_root.join(".igor-publication-staging");
+    let external_hidden_parent = directory.path().join("external-publication-staging");
+    fs::rename(&hidden_parent, &external_hidden_parent)?;
+    std::os::unix::fs::symlink(&external_hidden_parent, &hidden_parent)?;
+    let external_attempt = external_hidden_parent.join(attempt.id().to_string());
+    let external_orphan = external_attempt.join(orphan.file_name().ok_or("missing temp name")?);
+    assert!(
+        database
+            .artifacts()
+            .finalize_publication_claimed(
+                &action_claim,
+                attempt.id(),
+                &staging_root,
+                &publication_root,
+                &document,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        external_orphan.exists(),
+        "finalize deleted the external orphan temp"
+    );
+    assert_eq!(fs::read(&external_orphan)?, b"interrupted copy");
+    assert_eq!(
+        fs::read(external_attempt.join(artifact.id.to_string()))?,
+        contents
+    );
+    assert_eq!(
+        fs::read(external_attempt.join(second.id.to_string()))?,
+        second_bytes
+    );
+    assert!(!final_dir.exists());
+    fs::remove_file(&hidden_parent)?;
+    fs::rename(&external_hidden_parent, &hidden_parent)?;
+    // Unregistered UUID-shaped temps and malformed suffixes are never deleted.
+    for name in [
+        format!(".{}.{}.tmp", uuid::Uuid::new_v4(), uuid::Uuid::new_v4()),
+        format!(".{}.not-a-uuid.tmp", artifact.id),
+    ] {
+        let unregistered = orphan.parent().ok_or("missing orphan parent")?.join(name);
+        fs::write(&unregistered, b"unregistered bytes")?;
+        assert!(
+            database
+                .artifacts()
+                .finalize_publication_claimed(
+                    &action_claim,
+                    attempt.id(),
+                    &staging_root,
+                    &publication_root,
+                    &document,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&unregistered)?, b"unregistered bytes");
+        fs::remove_file(&unregistered)?;
+    }
+    // A rejected contents check may already have removed the registered orphan.
     fs::write(&orphan, b"interrupted copy")?;
     assert!(
         !final_dir.exists(),
@@ -1620,8 +1971,11 @@ async fn artifact_registration_migration_preserves_legacy_published_metadata() -
         sha256: None,
         size_bytes: None,
         state: igor_core::ArtifactPublicationState::Published,
+        lifecycle: igor_core::ArtifactLifecycleState::Published,
+        diagnosis_required: false,
         metadata: json!({"origin": "old schema"}),
     };
+    drop_replacement_barrier(&database).await?;
     sqlx::query("DROP TABLE artifacts")
         .execute(database.pool())
         .await?;
@@ -1639,14 +1993,1055 @@ async fn artifact_registration_migration_preserves_legacy_published_metadata() -
         .bind(&artifact.path)
         .bind(serde_json::to_string(&artifact.metadata)?)
         .execute(database.pool()).await?;
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 12")
+    sqlx::query("DROP TABLE failed_log_tails")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP VIEW diagnosed_attempts")
+        .execute(database.pool())
+        .await?;
+    drop_repair_worktrees(&database).await?;
+    sqlx::query(
+        "DELETE FROM _sqlx_migrations WHERE version IN (12, 13, 14, 15, 16, 17, 18, 19, 20)",
+    )
+    .execute(database.pool())
+    .await?;
+    database.pool().close().await;
+    let migrated = Database::open(directory.path().join("nested/igor.db")).await?;
+    assert_eq!(migrated.schema_version().await?, 22);
+    assert!(
+        !migrated
+            .artifacts()
+            .replacement_generation_succeeded(artifact.id)
+            .await?
+    );
+    assert_eq!(migrated.artifacts().get(artifact.id).await?, Some(artifact));
+    migrated.integrity_check(IntegrityCheck::Full).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn artifact_lifecycle_migration_preserves_physical_state_and_classifies_partial_outputs()
+-> TestResult {
+    let (directory, database) = database().await?;
+    let (_project, job) = insert_project_job(&database).await?;
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .insert_attempt_with_event(&attempt, &event(EventKind::AttemptCreated, json!({}))?)
+        .await?;
+    let mut artifacts = Vec::new();
+    for (name, state, lifecycle) in [
+        (
+            "registered",
+            igor_core::ArtifactPublicationState::Registered,
+            igor_core::ArtifactLifecycleState::Running,
+        ),
+        (
+            "staged",
+            igor_core::ArtifactPublicationState::Staged,
+            igor_core::ArtifactLifecycleState::Running,
+        ),
+        (
+            "published",
+            igor_core::ArtifactPublicationState::Published,
+            igor_core::ArtifactLifecycleState::Published,
+        ),
+        (
+            "removed",
+            igor_core::ArtifactPublicationState::Removed,
+            igor_core::ArtifactLifecycleState::Removed,
+        ),
+    ] {
+        let active = matches!(
+            state,
+            igor_core::ArtifactPublicationState::Registered
+                | igor_core::ArtifactPublicationState::Staged
+        );
+        let artifact = ArtifactRecord {
+            id: uuid::Uuid::new_v4(),
+            attempt_id: attempt.id(),
+            path: name.into(),
+            role: ArtifactRole::Log,
+            sha256: active.then_some("sha256:old".into()),
+            size_bytes: active.then_some(3),
+            state,
+            lifecycle,
+            diagnosis_required: false,
+            metadata: json!({}),
+        };
+        database.artifacts().insert(&artifact).await?;
+        artifacts.push(artifact);
+    }
+    sqlx::query(
+        "INSERT INTO metric_documents (attempt_id, version, document_json) VALUES (?, 1, ?)",
+    )
+    .bind(attempt.id().to_string())
+    .bind(r#"{"schema_version":1,"status":"partial","metrics":{}}"#)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DROP TABLE failed_log_tails")
+        .execute(database.pool())
+        .await?;
+    for name in [
+        "artifacts_diagnosis_insert",
+        "artifacts_diagnosis_update",
+        "artifacts_diagnosis_delete",
+    ] {
+        sqlx::query(&format!("DROP TRIGGER {name}"))
+            .execute(database.pool())
+            .await?;
+    }
+    sqlx::query("DROP VIEW diagnosed_attempts")
+        .execute(database.pool())
+        .await?;
+    drop_replacement_barrier(&database).await?;
+    sqlx::query("ALTER TABLE artifacts DROP COLUMN diagnosis_required")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP TRIGGER artifacts_lifecycle_insert")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP TRIGGER artifacts_lifecycle_update")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DROP INDEX artifacts_lifecycle_idx")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("ALTER TABLE artifacts DROP COLUMN lifecycle_state")
+        .execute(database.pool())
+        .await?;
+    drop_repair_worktrees(&database).await?;
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (13, 14, 15, 16, 17, 18, 19, 20)")
         .execute(database.pool())
         .await?;
     database.pool().close().await;
-    let migrated = Database::open(directory.path().join("nested/igor.db")).await?;
-    assert_eq!(migrated.schema_version().await?, 12);
-    assert_eq!(migrated.artifacts().get(artifact.id).await?, Some(artifact));
-    migrated.integrity_check(IntegrityCheck::Full).await?;
+
+    let upgraded = Database::open(directory.path().join("nested/igor.db")).await?;
+    assert_eq!(upgraded.schema_version().await?, 22);
+    let first_id = artifacts[0].id;
+    for (index, original) in artifacts.into_iter().enumerate() {
+        let actual = upgraded
+            .artifacts()
+            .get(original.id)
+            .await?
+            .ok_or("missing artifact")?;
+        assert_eq!(actual.state, original.state);
+        assert_eq!(actual.sha256, original.sha256);
+        assert_eq!(actual.size_bytes, original.size_bytes);
+        assert_eq!(actual.metadata, original.metadata);
+        let expected = if index < 2 {
+            igor_core::ArtifactLifecycleState::Failed
+        } else {
+            original.lifecycle
+        };
+        assert_eq!(actual.lifecycle, expected);
+        assert_eq!(actual.diagnosis_required, index < 2);
+    }
+    let rejected =
+        sqlx::query("UPDATE artifacts SET lifecycle_state = 'unknown' WHERE attempt_id = ?")
+            .bind(attempt.id().to_string())
+            .execute(upgraded.pool())
+            .await;
+    assert!(rejected.is_err());
+    for (state, lifecycle) in [
+        ("published", "failed"),
+        ("staged", "published"),
+        ("removed", "retained"),
+    ] {
+        assert!(
+            sqlx::query("UPDATE artifacts SET state = ?, lifecycle_state = ? WHERE id = ?")
+                .bind(state)
+                .bind(lifecycle)
+                .bind(first_id.to_string())
+                .execute(upgraded.pool())
+                .await
+                .is_err()
+        );
+    }
+    upgraded.foreign_key_check().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_and_superseded_artifacts_keep_their_publication_identity() -> TestResult {
+    let (_directory, database) = database().await?;
+    let (_project, job) = insert_project_job(&database).await?;
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .insert_attempt_with_event(&attempt, &event(EventKind::AttemptCreated, json!({}))?)
+        .await?;
+    for lifecycle in [
+        igor_core::ArtifactLifecycleState::Retained,
+        igor_core::ArtifactLifecycleState::Superseded,
+    ] {
+        let artifact = ArtifactRecord {
+            id: uuid::Uuid::new_v4(),
+            attempt_id: attempt.id(),
+            path: lifecycle.as_str().into(),
+            role: ArtifactRole::Checkpoint,
+            sha256: Some("sha256:fixture".into()),
+            size_bytes: Some(7),
+            state: igor_core::ArtifactPublicationState::Published,
+            lifecycle,
+            diagnosis_required: false,
+            metadata: json!({"published_path":"/project/artifacts/fixture"}),
+        };
+        database.artifacts().insert(&artifact).await?;
+        assert_eq!(database.artifacts().get(artifact.id).await?, Some(artifact));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_artifact_cannot_be_removed_before_durable_diagnosis() -> TestResult {
+    let (_directory, database) = database().await?;
+    let (_project, job) = insert_project_job(&database).await?;
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .insert_attempt_with_event(&attempt, &event(EventKind::AttemptCreated, json!({}))?)
+        .await?;
+    let artifact = ArtifactRecord {
+        id: uuid::Uuid::new_v4(),
+        attempt_id: attempt.id(),
+        path: "partial.bin".into(),
+        role: ArtifactRole::Checkpoint,
+        sha256: Some("sha256:fixture".into()),
+        size_bytes: Some(7),
+        state: igor_core::ArtifactPublicationState::Staged,
+        lifecycle: igor_core::ArtifactLifecycleState::Failed,
+        diagnosis_required: true,
+        metadata: json!({}),
+    };
+    database.artifacts().insert(&artifact).await?;
+    assert!(
+        !database
+            .artifacts()
+            .diagnosis_complete(attempt.id())
+            .await?
+    );
+    let remove = || {
+        sqlx::query(
+            "UPDATE artifacts SET state = 'removed', lifecycle_state = 'removed' WHERE id = ?",
+        )
+        .bind(artifact.id.to_string())
+        .execute(database.pool())
+    };
+    assert!(remove().await.is_err());
+    assert!(
+        sqlx::query("DELETE FROM artifacts WHERE id = ?")
+            .bind(artifact.id.to_string())
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE artifacts SET diagnosis_required = 0 WHERE id = ?")
+            .bind(artifact.id.to_string())
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database.artifacts().get(artifact.id).await?,
+        Some(artifact.clone())
+    );
+    sqlx::query("UPDATE artifacts SET lifecycle_state = 'retained' WHERE id = ?")
+        .bind(artifact.id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert!(remove().await.is_err());
+
+    let recovery_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO recoveries (id, attempt_id, state, diagnosis_json, idempotency_key) VALUES (?, ?, 'diagnosing', '{}', ?)")
+        .bind(recovery_id.to_string()).bind(attempt.id().to_string())
+        .bind(format!("diagnosis:{recovery_id}"))
+        .execute(database.pool()).await?;
+    assert!(
+        !database
+            .artifacts()
+            .diagnosis_complete(attempt.id())
+            .await?
+    );
+    assert!(remove().await.is_err());
+
+    sqlx::query("UPDATE recoveries SET state = 'proposed' WHERE id = ?")
+        .bind(recovery_id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert!(
+        database
+            .artifacts()
+            .diagnosis_complete(attempt.id())
+            .await?
+    );
+    let retry_id = uuid::Uuid::new_v4();
+    sqlx::query("INSERT INTO recoveries (id, attempt_id, state, idempotency_key) VALUES (?, ?, 'pending', ?)")
+        .bind(retry_id.to_string()).bind(attempt.id().to_string())
+        .bind(format!("diagnosis:{retry_id}"))
+        .execute(database.pool()).await?;
+    assert!(
+        !database
+            .artifacts()
+            .diagnosis_complete(attempt.id())
+            .await?
+    );
+    assert!(remove().await.is_err());
+    sqlx::query("UPDATE recoveries SET state = 'proposed', diagnosis_json = '{}' WHERE id = ?")
+        .bind(retry_id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert!(
+        database
+            .artifacts()
+            .diagnosis_complete(attempt.id())
+            .await?
+    );
+    remove().await?;
+    let removed = database
+        .artifacts()
+        .get(artifact.id)
+        .await?
+        .ok_or("missing tombstone")?;
+    assert_eq!(removed.state, igor_core::ArtifactPublicationState::Removed);
+    assert_eq!(
+        removed.lifecycle,
+        igor_core::ArtifactLifecycleState::Removed
+    );
+    assert!(removed.diagnosis_required);
+    Ok(())
+}
+
+struct FailedCleanupFixture {
+    _directory: TempDir,
+    database: Database,
+    paths: igor_core::RuntimePaths,
+    attempt_id: AttemptId,
+    artifact: ArtifactRecord,
+    source: PathBuf,
+    staged: PathBuf,
+    project_root: PathBuf,
+}
+
+#[path = "persistence/failed_cleanup.rs"]
+mod failed_cleanup_cases;
+#[path = "support/gc.rs"]
+mod gc_support;
+
+impl FailedCleanupFixture {
+    async fn new() -> Result<Self, Box<dyn Error>> {
+        Self::with_snapshot(json!({"policy":"delete-after-diagnosis", "keep_on_failure":[]})).await
+    }
+
+    async fn with_snapshot(snapshot: serde_json::Value) -> Result<Self, Box<dyn Error>> {
+        Self::with_configuration(snapshot, |_, _| {}).await
+    }
+
+    async fn with_configuration(
+        snapshot: serde_json::Value,
+        configure: impl FnOnce(&mut serde_json::Value, &Path),
+    ) -> Result<Self, Box<dyn Error>> {
+        let (directory, database) = database().await?;
+        let root = directory.path();
+        let paths = igor_core::RuntimePaths {
+            config_file: root.join("config"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("runtime"),
+            database: root.join("nested/igor.db"),
+            log_dir: root.join("logs"),
+            worktree_dir: root.join("worktrees"),
+            report_dir: root.join("reports"),
+            worker_socket: root.join("worker.sock"),
+            supervisor_socket: root.join("supervisor.sock"),
+            resource_dir: root.join("resources"),
+        };
+        let (_, job) = insert_project_job(&database).await?;
+        let project_root = root.join("project");
+        fs::create_dir(&project_root)?;
+        sqlx::query("UPDATE projects SET root_path = ? WHERE id = ?")
+            .bind(project_root.to_str())
+            .bind(job.project_id.to_string())
+            .execute(database.pool())
+            .await?;
+        let mut value = serde_json::to_value(attempt(&job, 1)?)?;
+        value["result"]["failed_artifact_retention"] = snapshot;
+        value["result"]["publication_root"] = json!(project_root.join("publication"));
+        let mut extractor = job.command.clone();
+        extractor.cwd = project_root.clone();
+        value["result"]["extractor"] = serde_json::to_value(extractor)?;
+        configure(&mut value, &project_root);
+        let attempt: AttemptSpec = serde_json::from_value(value)?;
+        let attempt_id = attempt.id();
+        database
+            .jobs()
+            .insert_attempt_with_event(&attempt, &event(EventKind::AttemptCreated, json!({}))?)
+            .await?;
+        // Represents a successful job whose independent extractor failed after staging.
+        sqlx::query("UPDATE attempts SET state = 'succeeded' WHERE id = ?")
+            .bind(attempt_id.to_string())
+            .execute(database.pool())
+            .await?;
+        let attempt_dir = paths.log_dir.join(attempt_id.to_string());
+        fs::create_dir_all(&attempt_dir)?;
+        fs::write(attempt_dir.join("stdout.log"), b"stdout diagnostic")?;
+        fs::write(attempt_dir.join("stderr.log"), b"stderr diagnostic")?;
+        sqlx::query("INSERT INTO attempt_processes (attempt_id, job_id, project_id, pid, process_group_id, process_start_ticks, stdout_path, stderr_path) VALUES (?, ?, ?, 1, 1, 1, ?, ?)")
+            .bind(attempt_id.to_string()).bind(job.id.to_string()).bind(job.project_id.to_string())
+            .bind(attempt_dir.join("stdout.log").to_str()).bind(attempt_dir.join("stderr.log").to_str())
+            .execute(database.pool()).await?;
+        let bytes = vec![7_u8; 256 * 1024];
+        let source = attempt_dir.join("partial.bin");
+        fs::write(&source, &bytes)?;
+        let id = uuid::Uuid::new_v4();
+        let staged = paths
+            .state_dir
+            .join("artifact-staging")
+            .join(attempt_id.to_string())
+            .join(id.to_string());
+        fs::create_dir_all(staged.parent().ok_or("staged parent")?)?;
+        fs::write(&staged, &bytes)?;
+        let artifact = ArtifactRecord {
+            id,
+            attempt_id,
+            path: "partial.bin".into(),
+            role: ArtifactRole::Checkpoint,
+            sha256: Some(format!("sha256:{:x}", sha2::Sha256::digest(&bytes))),
+            size_bytes: Some(bytes.len() as u64),
+            state: igor_core::ArtifactPublicationState::Staged,
+            lifecycle: igor_core::ArtifactLifecycleState::Failed,
+            diagnosis_required: true,
+            metadata: json!({"staged_path":staged}),
+        };
+        database.artifacts().insert(&artifact).await?;
+        Ok(Self {
+            _directory: directory,
+            database,
+            paths,
+            attempt_id,
+            artifact,
+            source,
+            staged,
+            project_root,
+        })
+    }
+
+    async fn diagnose(&self) -> TestResult {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO recoveries (id, attempt_id, state, diagnosis_json, idempotency_key) VALUES (?, ?, 'proposed', '{}', ?)")
+            .bind(&id).bind(self.attempt_id.to_string()).bind(&id).execute(self.database.pool()).await?;
+        Ok(())
+    }
+
+    async fn cleanup(&self) -> Result<usize, PersistenceError> {
+        self.database
+            .artifacts()
+            .cleanup_failed_artifacts(self.attempt_id, &self.paths)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn failed_cleanup_waits_for_diagnosis_and_complete_failed_tails() -> TestResult {
+    let f = FailedCleanupFixture::new().await?;
+    assert_eq!(f.cleanup().await?, 0);
+    assert!(
+        f.database
+            .artifacts()
+            .failed_cleanup_candidates(None)
+            .await?
+            .is_empty()
+    );
+    let recovery_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO recoveries (id, attempt_id, state, idempotency_key) VALUES (?, ?, 'pending', ?)")
+        .bind(&recovery_id).bind(f.attempt_id.to_string()).bind(&recovery_id).execute(f.database.pool()).await?;
+    f.diagnose().await?;
+    assert_eq!(f.cleanup().await?, 0); // Another recovery still has no diagnosis.
+    sqlx::query("UPDATE recoveries SET state = 'proposed', diagnosis_json = '{}' WHERE id = ?")
+        .bind(&recovery_id)
+        .execute(f.database.pool())
+        .await?;
+    assert_eq!(
+        f.database
+            .artifacts()
+            .failed_cleanup_candidates(None)
+            .await?,
+        vec![f.attempt_id]
+    );
+    sqlx::query("UPDATE attempts SET state = 'failed' WHERE id = ?")
+        .bind(f.attempt_id.to_string())
+        .execute(f.database.pool())
+        .await?;
+    assert_eq!(f.cleanup().await?, 0);
+    sqlx::query("INSERT INTO failed_log_tails (attempt_id, stdout, stderr, limit_kb, complete) VALUES (?, X'', X'', 1, 0)")
+        .bind(f.attempt_id.to_string()).execute(f.database.pool()).await?;
+    assert_eq!(f.cleanup().await?, 0);
+    assert!(f.source.is_file() && f.staged.is_file());
+    sqlx::query("UPDATE failed_log_tails SET complete = 1 WHERE attempt_id = ?")
+        .bind(f.attempt_id.to_string())
+        .execute(f.database.pool())
+        .await?;
+    assert_eq!(f.cleanup().await?, 1);
+    assert!(!f.source.exists() && !f.staged.exists());
+    assert!(f.source.with_file_name("stdout.log").exists());
+    assert!(f.source.with_file_name("stderr.log").exists());
+    assert_eq!(
+        f.database
+            .artifacts()
+            .get(f.artifact.id)
+            .await?
+            .ok_or("artifact")?
+            .state,
+        igor_core::ArtifactPublicationState::Removed
+    );
+    assert_eq!(f.cleanup().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_preserves_legacy_keep_and_pattern_snapshots() -> TestResult {
+    for (snapshot, lifecycle) in [
+        (json!(null), igor_core::ArtifactLifecycleState::Failed),
+        (
+            json!({"policy":"keep", "keep_on_failure":[]}),
+            igor_core::ArtifactLifecycleState::Retained,
+        ),
+        (
+            json!({"policy":"delete-after-diagnosis", "keep_on_failure":["*.bin"]}),
+            igor_core::ArtifactLifecycleState::Retained,
+        ),
+        (
+            json!({"policy":"delete-after-diagnosis", "keep_on_failure":["**/partial.bin"]}),
+            igor_core::ArtifactLifecycleState::Retained,
+        ),
+    ] {
+        let f = FailedCleanupFixture::with_snapshot(snapshot).await?;
+        f.diagnose().await?;
+        assert_eq!(f.cleanup().await?, 0);
+        assert!(f.source.is_file() && f.staged.is_file());
+        assert_eq!(
+            f.database
+                .artifacts()
+                .get(f.artifact.id)
+                .await?
+                .ok_or("artifact")?
+                .lifecycle,
+            lifecycle
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_refuses_active_extraction_and_preserves_other_lifecycles() -> TestResult {
+    let f = FailedCleanupFixture::new().await?;
+    f.diagnose().await?;
+    let project_id: String = sqlx::query_scalar("SELECT project_id FROM attempts WHERE id = ?")
+        .bind(f.attempt_id.to_string())
+        .fetch_one(f.database.pool())
+        .await?;
+    let action_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO actions (id, project_id, attempt_id, kind, state, spec_json, idempotency_key, available_at) VALUES (?, ?, ?, 'extract_metrics', 'pending', '{}', ?, '2000-01-01')")
+        .bind(&action_id).bind(project_id).bind(f.attempt_id.to_string()).bind(&action_id).execute(f.database.pool()).await?;
+    assert_eq!(f.cleanup().await?, 0);
+    let claim = f
+        .database
+        .actions()
+        .claim_extraction("cleanup-test", Duration::from_secs(30))
+        .await?
+        .ok_or("claim")?;
+    assert_eq!(f.cleanup().await?, 0);
+    sqlx::query("UPDATE actions SET state = 'failed', claim_id = NULL, claim_owner = NULL, claim_expires_at = NULL WHERE id = ?")
+        .bind(claim.record_id.to_string()).execute(f.database.pool()).await?;
+    for lifecycle in ["retained", "superseded", "published"] {
+        sqlx::query("UPDATE artifacts SET lifecycle_state = ?, state = 'published' WHERE id = ?")
+            .bind(lifecycle)
+            .bind(f.artifact.id.to_string())
+            .execute(f.database.pool())
+            .await?;
+        assert_eq!(f.cleanup().await?, 0);
+        assert!(f.source.is_file() && f.staged.is_file());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_preflights_all_copies_and_refuses_unsafe_paths() -> TestResult {
+    for case in [
+        "tampered",
+        "symlink-file",
+        "symlink-ancestor",
+        "symlink-root",
+        "traversal",
+        "wrong-stage",
+        "wrong-logs",
+        "log-stream",
+        "hidden-publication",
+    ] {
+        let f = FailedCleanupFixture::new().await?;
+        f.diagnose().await?;
+        match case {
+            "tampered" => fs::write(&f.staged, b"different bytes")?,
+            "symlink-file" => {
+                fs::remove_file(&f.staged)?;
+                std::os::unix::fs::symlink(&f.source, &f.staged)?;
+            }
+            "symlink-ancestor" | "symlink-root" => {
+                let original = if case == "symlink-root" {
+                    f.paths.state_dir.clone()
+                } else {
+                    f.paths.state_dir.join("artifact-staging")
+                };
+                let moved = original.with_extension("moved");
+                fs::rename(&original, &moved)?;
+                std::os::unix::fs::symlink(&moved, &original)?;
+            }
+            "traversal" | "log-stream" => {
+                sqlx::query("UPDATE artifacts SET path = ? WHERE id = ?")
+                    .bind(if case == "traversal" {
+                        "../outside.bin"
+                    } else {
+                        "stdout.log"
+                    })
+                    .bind(f.artifact.id.to_string())
+                    .execute(f.database.pool())
+                    .await?;
+            }
+            "wrong-stage" => {
+                sqlx::query("UPDATE artifacts SET metadata_json = '{\"staged_path\":\"/outside/file\"}' WHERE id = ?")
+                    .bind(f.artifact.id.to_string()).execute(f.database.pool()).await?;
+            }
+            "wrong-logs" => {
+                sqlx::query("UPDATE attempt_processes SET stdout_path = '/outside/stdout.log' WHERE attempt_id = ?")
+                    .bind(f.attempt_id.to_string()).execute(f.database.pool()).await?;
+            }
+            "hidden-publication" => {
+                let publication = f.project_root.join("publication");
+                let hidden = publication
+                    .join(".igor-publication-staging")
+                    .join(f.attempt_id.to_string())
+                    .join(f.artifact.id.to_string());
+                fs::create_dir_all(hidden.parent().ok_or("hidden parent")?)?;
+                fs::write(&hidden, b"preparation")?;
+            }
+            _ => return Err("unknown case".into()),
+        }
+        assert!(f.cleanup().await.is_err(), "{case}");
+        assert!(
+            f.source.is_file(),
+            "source deleted during failed preflight: {case}"
+        );
+        assert_eq!(
+            f.database
+                .artifacts()
+                .get(f.artifact.id)
+                .await?
+                .ok_or("artifact")?
+                .state,
+            igor_core::ArtifactPublicationState::Staged
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_replays_physical_removal_after_event_rollback() -> TestResult {
+    let f = FailedCleanupFixture::new().await?;
+    f.diagnose().await?;
+    fs::write(f.source.with_file_name("unregistered.bin"), b"unregistered")?;
+    sqlx::query("CREATE TRIGGER reject_cleanup_event BEFORE INSERT ON events WHEN NEW.kind = 'cleanup_state_changed' BEGIN SELECT RAISE(ABORT, 'injected cleanup event failure'); END")
+        .execute(f.database.pool()).await?;
+    assert!(f.cleanup().await.is_err());
+    assert!(!f.source.exists() && !f.staged.exists());
+    assert_eq!(
+        f.database.artifacts().get(f.artifact.id).await?,
+        Some(f.artifact.clone())
+    );
+    let decided: String =
+        sqlx::query_scalar("SELECT decided_at FROM failed_cleanup_intents WHERE artifact_id = ?")
+            .bind(f.artifact.id.to_string())
+            .fetch_one(f.database.pool())
+            .await?;
+    assert!(
+        f.database
+            .cleanup_tombstone("failed_artifact_retention", &f.artifact.id.to_string())
+            .await?
+            .is_none()
+    );
+    // Simulate interruption after only one copy was removed. Replay must hash
+    // the remaining copy, while accepting the absent copy solely via its intent.
+    fs::write(&f.source, vec![7_u8; 256 * 1024])?;
+    sqlx::query("DROP TRIGGER reject_cleanup_event")
+        .execute(f.database.pool())
+        .await?;
+    f.database.pool().close().await;
+    let reopened = Database::open(&f.paths.database).await?;
+    assert_eq!(
+        reopened
+            .artifacts()
+            .cleanup_failed_artifacts(f.attempt_id, &f.paths)
+            .await?,
+        1
+    );
+    let evidence = reopened
+        .cleanup_tombstone("failed_artifact_retention", &f.artifact.id.to_string())
+        .await?
+        .ok_or("tombstone")?;
+    assert_eq!(evidence["decided_at"], decided);
+    let tombstone = reopened
+        .artifacts()
+        .get(f.artifact.id)
+        .await?
+        .ok_or("artifact")?;
+    assert_eq!(
+        tombstone.state,
+        igor_core::ArtifactPublicationState::Removed
+    );
+    assert_eq!(tombstone.metadata, f.artifact.metadata);
+    assert_eq!(tombstone.sha256, f.artifact.sha256);
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE kind = 'cleanup_state_changed' AND attempt_id = ?",
+    )
+    .bind(f.attempt_id.to_string())
+    .fetch_one(reopened.pool())
+    .await?;
+    assert_eq!(events, 1);
+    assert_eq!(
+        reopened
+            .artifacts()
+            .cleanup_failed_artifacts(f.attempt_id, &f.paths)
+            .await?,
+        0
+    );
+    assert_eq!(
+        reopened
+            .cleanup_tombstone("failed_artifact_retention", &f.artifact.id.to_string())
+            .await?,
+        Some(evidence)
+    );
+    assert!(f.source.with_file_name("unregistered.bin").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_rejects_raw_aliases_before_keep_patterns() -> TestResult {
+    for path in [
+        "dir/./file",
+        "dir//file",
+        "dir/file/",
+        "dir/../file",
+        "dir/file\0",
+    ] {
+        for policy in ["keep", "delete-after-diagnosis"] {
+            let f = FailedCleanupFixture::with_snapshot(json!({
+                "policy":policy, "keep_on_failure":["dir/file"]
+            }))
+            .await?;
+            f.diagnose().await?;
+            let logical_file = f.source.parent().ok_or("source parent")?.join("dir/file");
+            fs::create_dir_all(logical_file.parent().ok_or("logical parent")?)?;
+            fs::copy(&f.source, &logical_file)?;
+            sqlx::query("UPDATE artifacts SET path = ? WHERE id = ?")
+                .bind(path)
+                .bind(f.artifact.id.to_string())
+                .execute(f.database.pool())
+                .await?;
+            assert!(f.cleanup().await.is_err(), "{policy}: {path:?}");
+            assert_eq!(fs::read(&logical_file)?, fs::read(&f.source)?);
+            assert_eq!(fs::read(&f.staged)?, fs::read(&f.source)?);
+            let record = f
+                .database
+                .artifacts()
+                .get(f.artifact.id)
+                .await?
+                .ok_or("artifact")?;
+            assert_eq!(record.lifecycle, igor_core::ArtifactLifecycleState::Failed);
+            assert_eq!(record.state, igor_core::ArtifactPublicationState::Staged);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_rejects_symlinks_above_runtime_roots() -> TestResult {
+    for state in [false, true] {
+        let mut f = FailedCleanupFixture::new().await?;
+        f.diagnose().await?;
+        let external = TempDir::new()?;
+        let original = if state {
+            &f.paths.state_dir
+        } else {
+            &f.paths.log_dir
+        };
+        let name = if state { "state" } else { "logs" };
+        let moved = external.path().join(name);
+        fs::rename(original, &moved)?;
+        let link = f._directory.path().join("linked-ancestor");
+        std::os::unix::fs::symlink(external.path(), &link)?;
+        let external_file;
+        if state {
+            f.paths.state_dir = link.join(name);
+            let relative = PathBuf::from("artifact-staging")
+                .join(f.attempt_id.to_string())
+                .join(f.artifact.id.to_string());
+            f.staged = f.paths.state_dir.join(&relative);
+            external_file = moved.join(relative);
+            sqlx::query("UPDATE artifacts SET metadata_json = ? WHERE id = ?")
+                .bind(json!({"staged_path":f.staged}).to_string())
+                .bind(f.artifact.id.to_string())
+                .execute(f.database.pool())
+                .await?;
+        } else {
+            f.paths.log_dir = link.join(name);
+            let attempt_dir = f.paths.log_dir.join(f.attempt_id.to_string());
+            f.source = attempt_dir.join("partial.bin");
+            external_file = moved.join(f.attempt_id.to_string()).join("partial.bin");
+            sqlx::query("UPDATE attempt_processes SET stdout_path = ?, stderr_path = ? WHERE attempt_id = ?")
+                .bind(attempt_dir.join("stdout.log").to_str()).bind(attempt_dir.join("stderr.log").to_str())
+                .bind(f.attempt_id.to_string()).execute(f.database.pool()).await?;
+        }
+        let bytes = fs::read(&external_file)?;
+        assert!(f.cleanup().await.is_err());
+        assert_eq!(fs::read(external_file)?, bytes);
+        assert_eq!(fs::read(&f.source)?, bytes);
+        assert_eq!(fs::read(&f.staged)?, bytes);
+        assert_eq!(
+            f.database
+                .artifacts()
+                .get(f.artifact.id)
+                .await?
+                .ok_or("artifact")?
+                .state,
+            igor_core::ArtifactPublicationState::Staged
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_rejects_nonlexical_runtime_roots() -> TestResult {
+    for case in ["dot", "parent", "relative"] {
+        let mut f = FailedCleanupFixture::new().await?;
+        f.diagnose().await?;
+        f.paths.log_dir = match case {
+            "dot" => PathBuf::from(format!("{}/./logs", f._directory.path().display())),
+            "parent" => PathBuf::from(format!("{}/project/../logs", f._directory.path().display())),
+            "relative" => PathBuf::from("logs"),
+            _ => return Err("unknown case".into()),
+        };
+        let attempt_dir = f.paths.log_dir.join(f.attempt_id.to_string());
+        sqlx::query(
+            "UPDATE attempt_processes SET stdout_path = ?, stderr_path = ? WHERE attempt_id = ?",
+        )
+        .bind(attempt_dir.join("stdout.log").to_str())
+        .bind(attempt_dir.join("stderr.log").to_str())
+        .bind(f.attempt_id.to_string())
+        .execute(f.database.pool())
+        .await?;
+        assert!(f.cleanup().await.is_err(), "{case}");
+        assert_eq!(fs::read(&f.source)?, fs::read(&f.staged)?);
+        assert_eq!(
+            f.database.artifacts().get(f.artifact.id).await?,
+            Some(f.artifact.clone())
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_checks_registered_project_and_publication_ancestors() -> TestResult {
+    for case in [
+        "foreign",
+        "equal",
+        "unregistered",
+        "no-root",
+        "cwd",
+        "publication-link",
+        "project-link",
+        "dot-root",
+    ] {
+        let external = TempDir::new()?;
+        let f = FailedCleanupFixture::with_configuration(
+            json!({"policy":"delete-after-diagnosis", "keep_on_failure":[]}),
+            |spec, project_root| match case {
+                "foreign" => {
+                    spec["result"]["publication_root"] = json!(external.path().join("publication"));
+                    spec["result"]["extractor"]["cwd"] = json!(external.path());
+                }
+                "equal" => spec["result"]["publication_root"] = json!(project_root),
+                "no-root" => spec["result"]["publication_root"] = json!(null),
+                "cwd" => spec["result"]["extractor"]["cwd"] = json!(project_root.parent()),
+                "publication-link" => {
+                    spec["result"]["publication_root"] =
+                        json!(project_root.join("link/outputs/publication"))
+                }
+                "dot-root" => {
+                    spec["result"]["publication_root"] =
+                        json!(format!("{}/./publication", project_root.display()))
+                }
+                _ => {}
+            },
+        )
+        .await?;
+        f.diagnose().await?;
+        match case {
+            "unregistered" => {
+                sqlx::query("UPDATE projects SET registered = 0 WHERE id = (SELECT project_id FROM attempts WHERE id = ?)")
+                    .bind(f.attempt_id.to_string()).execute(f.database.pool()).await?;
+            }
+            "publication-link" => {
+                fs::create_dir_all(external.path().join("outputs/publication"))?;
+                let link = f.project_root.join("link");
+                std::os::unix::fs::symlink(external.path(), &link)?;
+            }
+            "project-link" => {
+                fs::rename(&f.project_root, external.path().join("project"))?;
+                std::os::unix::fs::symlink(external.path().join("project"), &f.project_root)?;
+            }
+            _ => {}
+        }
+        if matches!(case, "unregistered" | "no-root") {
+            assert_eq!(f.cleanup().await?, 0, "{case}");
+        } else {
+            assert!(f.cleanup().await.is_err(), "{case}");
+        }
+        assert_eq!(fs::read(&f.source)?, fs::read(&f.staged)?);
+        assert_eq!(
+            f.database.artifacts().get(f.artifact.id).await?,
+            Some(f.artifact.clone())
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_accepts_extractor_cwd_inside_registered_project() -> TestResult {
+    let f = FailedCleanupFixture::with_configuration(
+        json!({"policy":"delete-after-diagnosis", "keep_on_failure":[]}),
+        |spec, root| {
+            spec["result"]["extractor"]["cwd"] = json!(root.join("results"));
+            spec["result"]["publication_root"] = json!(root.join("results/artifacts"));
+        },
+    )
+    .await?;
+    f.diagnose().await?;
+    assert_eq!(f.cleanup().await?, 1);
+    assert!(!f.source.exists() && !f.staged.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_replays_when_copy_parents_disappeared() -> TestResult {
+    let f = FailedCleanupFixture::new().await?;
+    f.diagnose().await?;
+    let bytes = fs::read(&f.source)?;
+    let nested = f
+        .source
+        .parent()
+        .ok_or("source parent")?
+        .join("nested/deeper/file.bin");
+    fs::create_dir_all(nested.parent().ok_or("nested parent")?)?;
+    fs::rename(&f.source, &nested)?;
+    sqlx::query("UPDATE artifacts SET path = 'nested/deeper/file.bin' WHERE id = ?")
+        .bind(f.artifact.id.to_string())
+        .execute(f.database.pool())
+        .await?;
+    sqlx::query("CREATE TRIGGER reject_cleanup_event BEFORE INSERT ON events WHEN NEW.kind = 'cleanup_state_changed' BEGIN SELECT RAISE(ABORT, 'injected cleanup event failure'); END")
+        .execute(f.database.pool()).await?;
+    assert!(f.cleanup().await.is_err());
+    assert!(!nested.exists() && !f.staged.exists());
+    assert_eq!(
+        f.database
+            .artifacts()
+            .get(f.artifact.id)
+            .await?
+            .ok_or("artifact")?
+            .state,
+        igor_core::ArtifactPublicationState::Staged
+    );
+    fs::remove_dir_all(
+        nested
+            .parent()
+            .ok_or("nested parent")?
+            .parent()
+            .ok_or("nested ancestor")?,
+    )?;
+    fs::remove_dir_all(f.paths.state_dir.join("artifact-staging"))?;
+    fs::write(f.source.with_file_name("survivor.bin"), &bytes)?;
+    sqlx::query("DROP TRIGGER reject_cleanup_event")
+        .execute(f.database.pool())
+        .await?;
+    assert_eq!(f.cleanup().await?, 1);
+    let tombstone = f
+        .database
+        .artifacts()
+        .get(f.artifact.id)
+        .await?
+        .ok_or("artifact")?;
+    assert_eq!(
+        tombstone.state,
+        igor_core::ArtifactPublicationState::Removed
+    );
+    assert_eq!(
+        tombstone.lifecycle,
+        igor_core::ArtifactLifecycleState::Removed
+    );
+    assert_eq!(tombstone.sha256, f.artifact.sha256);
+    assert_eq!(fs::read(f.source.with_file_name("survivor.bin"))?, bytes);
+    assert_eq!(f.cleanup().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_cleanup_registered_files_preflight_as_one_batch() -> TestResult {
+    let f = FailedCleanupFixture::new().await?;
+    f.diagnose().await?;
+    let registered_path = f.source.with_file_name("registered.bin");
+    fs::write(&registered_path, b"registered bytes")?;
+    let registered = ArtifactRecord {
+        id: uuid::Uuid::new_v4(),
+        attempt_id: f.attempt_id,
+        path: "registered.bin".into(),
+        role: ArtifactRole::Checkpoint,
+        sha256: Some(format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(b"registered bytes")
+        )),
+        size_bytes: Some(16),
+        state: igor_core::ArtifactPublicationState::Registered,
+        lifecycle: igor_core::ArtifactLifecycleState::Failed,
+        diagnosis_required: true,
+        metadata: json!({}),
+    };
+    f.database.artifacts().insert(&registered).await?;
+    fs::write(&f.staged, b"tampered")?;
+    assert!(f.cleanup().await.is_err());
+    assert!(registered_path.is_file() && f.source.is_file());
+    fs::copy(&f.source, &f.staged)?;
+    // Final publication bytes are outside this cleanup's ownership, even if a failed
+    // publication left the database with a staged row.
+    let final_path = f
+        .project_root
+        .join("publication")
+        .join(f.attempt_id.to_string())
+        .join(f.artifact.id.to_string());
+    fs::create_dir_all(final_path.parent().ok_or("publication parent")?)?;
+    fs::write(&final_path, b"final published bytes")?;
+    assert!(f.cleanup().await.is_err());
+    assert!(registered_path.exists() && f.source.exists() && f.staged.exists());
+    assert_eq!(fs::read(&final_path)?, b"final published bytes");
+    fs::remove_file(final_path)?;
+    assert_eq!(f.cleanup().await?, 2);
+    assert!(!registered_path.exists());
+    assert_eq!(
+        f.database
+            .artifacts()
+            .get(registered.id)
+            .await?
+            .ok_or("registered")?
+            .state,
+        igor_core::ArtifactPublicationState::Removed
+    );
     Ok(())
 }
 
@@ -1708,6 +3103,203 @@ async fn failed_attempt_with_extractor_does_not_enqueue_extraction() -> TestResu
 }
 
 #[tokio::test]
+async fn failed_attempt_log_tail_missing_paths_is_incomplete_but_job_finishes() -> TestResult {
+    {
+        let (_directory, database) = database().await?;
+        synchronize_test_inventory(&database, 1, Vec::new()).await?;
+        let project = project();
+        database.projects().insert(&project).await?;
+        let job = job(project.id);
+        let attempt = attempt(&job, 1)?;
+        database
+            .jobs()
+            .submit(
+                &job,
+                &attempt,
+                0,
+                &event(EventKind::JobSubmitted, json!({}))?,
+                &event(EventKind::AttemptCreated, json!({}))?,
+            )
+            .await?;
+        let claim = database
+            .jobs()
+            .claim_execution("worker", Duration::from_secs(30))
+            .await?
+            .ok_or_else(|| missing("job not claimed"))?;
+        database
+            .jobs()
+            .finish_execution(
+                &claim,
+                &ExecutionOutcome {
+                    state: AttemptState::Failed,
+                    exit_code: Some(7),
+                    term_signal: None,
+                    error: None,
+                },
+            )
+            .await?;
+        let tails = database
+            .jobs()
+            .failed_log_tails(attempt.id())
+            .await?
+            .ok_or_else(|| missing("failed log tails row missing"))?;
+        assert!(tails.stdout.is_empty());
+        assert!(tails.stderr.is_empty());
+        assert_eq!(tails.limit_kb, 512);
+        assert!(!tails.complete);
+        assert_eq!(
+            database
+                .jobs()
+                .get_job(job.id)
+                .await?
+                .ok_or_else(|| missing("failed job missing"))?
+                .state,
+            JobState::Failed
+        );
+    }
+
+    let (_directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let mut attempt = attempt(&job, 1)?;
+    let mut value = serde_json::to_value(&attempt)?;
+    value["result"]["failed_log_tail_kb"] = json!(0);
+    attempt = serde_json::from_value(value)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("job not claimed"))?;
+    database
+        .jobs()
+        .finish_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Failed,
+                exit_code: Some(7),
+                term_signal: None,
+                error: None,
+            },
+        )
+        .await?;
+    let tails = database
+        .jobs()
+        .failed_log_tails(attempt.id())
+        .await?
+        .ok_or_else(|| missing("failed log tails row missing"))?;
+    assert!(tails.stdout.is_empty());
+    assert!(tails.stderr.is_empty());
+    assert_eq!(tails.limit_kb, 0);
+    assert!(tails.complete);
+    assert_eq!(
+        database
+            .jobs()
+            .get_job(job.id)
+            .await?
+            .ok_or_else(|| missing("failed job missing"))?
+            .state,
+        JobState::Failed
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn short_binary_logs_are_preserved_and_a_missing_stream_stays_incomplete() -> TestResult {
+    for missing_stderr in [false, true] {
+        let (directory, database) = database().await?;
+        synchronize_test_inventory(&database, 1, Vec::new()).await?;
+        let project = project();
+        database.projects().insert(&project).await?;
+        let job = job(project.id);
+        let attempt = attempt(&job, 1)?;
+        database
+            .jobs()
+            .submit(
+                &job,
+                &attempt,
+                0,
+                &event(EventKind::JobSubmitted, json!({}))?,
+                &event(EventKind::AttemptCreated, json!({}))?,
+            )
+            .await?;
+        let claim = database
+            .jobs()
+            .claim_execution("worker", Duration::from_secs(30))
+            .await?
+            .ok_or_else(|| missing("job not claimed"))?;
+        let stdout = directory.path().join("stdout.log");
+        let stderr = directory.path().join("stderr.log");
+        fs::write(&stdout, b"out\0\xff")?;
+        if !missing_stderr {
+            fs::write(&stderr, b"err\xff\0")?;
+        }
+        database
+            .jobs()
+            .record_process_started(
+                &claim,
+                &ProcessStart {
+                    pid: 42,
+                    process_group_id: 42,
+                    process_start_ticks: 1,
+                    stdout_path: stdout,
+                    stderr_path: stderr,
+                },
+            )
+            .await?;
+        database
+            .jobs()
+            .finish_execution(
+                &claim,
+                &ExecutionOutcome {
+                    state: AttemptState::Failed,
+                    exit_code: Some(7),
+                    term_signal: None,
+                    error: None,
+                },
+            )
+            .await?;
+        let tails = database
+            .jobs()
+            .failed_log_tails(attempt.id())
+            .await?
+            .ok_or_else(|| missing("missing failed log tails"))?;
+        assert_eq!(tails.limit_kb, 512);
+        assert_eq!(tails.stdout, b"out\0\xff");
+        assert_eq!(
+            tails.stderr,
+            if missing_stderr {
+                &b""[..]
+            } else {
+                &b"err\xff\0"[..]
+            }
+        );
+        assert_eq!(tails.complete, !missing_stderr);
+        assert_eq!(
+            database
+                .jobs()
+                .get_job(job.id)
+                .await?
+                .ok_or_else(|| missing("missing failed job"))?
+                .state,
+            JobState::Failed
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn successful_attempt_without_extractor_does_not_enqueue_extraction() -> TestResult {
     let (_directory, database) = database().await?;
     synchronize_test_inventory(&database, 1, Vec::new()).await?;
@@ -1742,6 +3334,13 @@ async fn successful_attempt_without_extractor_does_not_enqueue_extraction() -> T
             },
         )
         .await?;
+    assert!(
+        database
+            .jobs()
+            .failed_log_tails(attempt.id())
+            .await?
+            .is_none()
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM actions WHERE kind = 'extract_metrics'")
             .fetch_one(database.pool())
@@ -2948,6 +4547,157 @@ async fn concurrent_submissions_receive_distinct_global_order() -> TestResult {
 }
 
 #[tokio::test]
+async fn cancellation_waits_for_external_writer_before_reading() -> TestResult {
+    job_mutation_waits_for_external_writer(false).await
+}
+
+#[tokio::test]
+async fn retry_waits_for_external_writer_before_reading() -> TestResult {
+    job_mutation_waits_for_external_writer(true).await
+}
+
+async fn job_mutation_waits_for_external_writer(retry: bool) -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("writer-contention.db");
+    let database = Database::open_with_options(
+        &path,
+        DatabaseOptions {
+            busy_timeout: Duration::from_secs(2),
+            ..DatabaseOptions::default()
+        },
+    )
+    .await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let job = job(project.id);
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("contention-test", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("contention job was not claimed"))?;
+    assert_eq!(claim.job.state, JobState::Running);
+    database
+        .jobs()
+        .record_process_started(
+            &claim,
+            &ProcessStart {
+                pid: 1234,
+                process_group_id: 1234,
+                process_start_ticks: 9876,
+                stdout_path: directory.path().join("stdout.log"),
+                stderr_path: directory.path().join("stderr.log"),
+            },
+        )
+        .await?;
+    if retry {
+        database
+            .jobs()
+            .finish_execution(
+                &claim,
+                &ExecutionOutcome {
+                    state: AttemptState::Failed,
+                    exit_code: Some(7),
+                    term_signal: None,
+                    error: None,
+                },
+            )
+            .await?;
+        assert_eq!(
+            database
+                .jobs()
+                .get_job(job.id)
+                .await?
+                .ok_or_else(|| missing("failed contention job missing"))?
+                .state,
+            JobState::Failed
+        );
+    }
+    let events_before = database.events().for_job(job.id).await?.len();
+
+    // A separate connection reserves the WAL writer while the repository method
+    // starts. The old SELECT-first transaction fails its upgrade immediately.
+    let mut external =
+        SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
+            .await?;
+    let mut held_writer = external.begin().await?;
+    sqlx::query("UPDATE projects SET name = name WHERE id = ?")
+        .bind(project.id.to_string())
+        .execute(&mut *held_writer)
+        .await?;
+    let worker_database = database.clone();
+    let job_id = job.id;
+    let (started_tx, started_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        if retry {
+            worker_database.jobs().retry(job_id).await
+        } else {
+            worker_database
+                .jobs()
+                .request_cancellation(job_id, Duration::from_secs(3))
+                .await
+        }
+    });
+    started_rx.await?;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    held_writer.commit().await?;
+    let detail = task.await??;
+    assert_eq!(
+        serde_json::to_value(&detail.job.spec)?,
+        serde_json::to_value(&job)?
+    );
+    if retry {
+        assert_eq!(detail.job.state, JobState::Queued);
+        assert_eq!(detail.attempts.len(), 2);
+        assert_eq!(detail.attempts[0].state, AttemptState::Failed);
+        assert_eq!(detail.attempts[1].state, AttemptState::Pending);
+        let new_attempt = &detail.attempts[1].spec;
+        assert_eq!(new_attempt.sequence(), 2);
+        assert_ne!(new_attempt.id(), attempt.id());
+        assert_eq!(new_attempt.source(), attempt.source());
+        assert_eq!(new_attempt.configuration(), attempt.configuration());
+        assert_eq!(new_attempt.result(), attempt.result());
+        assert_eq!(new_attempt.command(), attempt.command());
+        assert_eq!(new_attempt.executor(), attempt.executor());
+        assert_eq!(new_attempt.resources(), attempt.resources());
+        assert_eq!(new_attempt.family(), attempt.family());
+        assert_eq!(
+            database.events().for_job(job.id).await?.len(),
+            events_before + 2
+        );
+    } else {
+        assert_eq!(detail.job.state, JobState::Running);
+        assert_eq!(detail.attempts.len(), 1);
+        assert_eq!(detail.attempts[0].state, AttemptState::Running);
+        assert_eq!(detail.attempts[0].spec.id(), attempt.id());
+        let grace = database
+            .jobs()
+            .cancellation_grace(&claim)
+            .await?
+            .ok_or_else(|| missing("contention cancellation grace missing"))?;
+        assert!(grace > Duration::from_secs(2));
+        assert!(grace <= Duration::from_secs(3));
+        assert_eq!(
+            database.events().for_job(job.id).await?.len(),
+            events_before
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn execution_claims_priority_fifo_and_persists_process_outcomes() -> TestResult {
     let (_directory, database) = database().await?;
     synchronize_test_inventory(&database, 1, Vec::new()).await?;
@@ -3651,6 +5401,69 @@ async fn systemd_unit_reservation_validates_invocation_id_and_claim_lifecycle() 
 }
 
 #[tokio::test]
+async fn failed_systemd_unit_persists_tail_from_reserved_log_paths() -> TestResult {
+    let (directory, database) = database().await?;
+    synchronize_test_inventory(&database, 1, Vec::new()).await?;
+    let project = project();
+    database.projects().insert(&project).await?;
+    let mut job = job(project.id);
+    job.executor = ExecutorSpec::Process(ProcessExecutorSpec {
+        isolation: ProcessIsolation::SystemdUserUnit,
+    });
+    let attempt = attempt(&job, 1)?;
+    database
+        .jobs()
+        .submit(
+            &job,
+            &attempt,
+            0,
+            &event(EventKind::JobSubmitted, json!({}))?,
+            &event(EventKind::AttemptCreated, json!({}))?,
+        )
+        .await?;
+    let claim = database
+        .jobs()
+        .claim_execution("worker-unit", Duration::from_secs(30))
+        .await?
+        .ok_or_else(|| missing("systemd job not claimed"))?;
+    let paths = UnitReservation {
+        stdout_path: directory.path().join("unit.stdout"),
+        stderr_path: directory.path().join("unit.stderr"),
+    };
+    fs::write(&paths.stdout_path, b"systemd\0out")?;
+    fs::write(&paths.stderr_path, b"\xfferr")?;
+    database.jobs().reserve_unit(&claim, &paths).await?;
+    let invocation = "0123456789abcdef0123456789abcdef";
+    database
+        .jobs()
+        .record_unit_started(&claim, invocation)
+        .await?;
+    database
+        .jobs()
+        .finish_unit_execution(
+            &claim,
+            &ExecutionOutcome {
+                state: AttemptState::Failed,
+                exit_code: Some(1),
+                term_signal: None,
+                error: None,
+            },
+            Some(invocation),
+        )
+        .await?;
+    let tails = database
+        .jobs()
+        .failed_log_tails(attempt.id())
+        .await?
+        .ok_or_else(|| missing("missing systemd failed tails"))?;
+    assert_eq!(tails.stdout, b"systemd\0out");
+    assert_eq!(tails.stderr, b"\xfferr");
+    assert_eq!(tails.limit_kb, 512);
+    assert!(tails.complete);
+    Ok(())
+}
+
+#[tokio::test]
 async fn systemd_recovery_transfers_reserved_unit_and_heartbeats_without_process_identity()
 -> TestResult {
     let (_directory, database) = database().await?;
@@ -3952,6 +5765,13 @@ async fn container_finish_is_atomic_and_persists_docker_outcome() -> TestResult 
             .state,
         AttemptState::Running
     );
+    assert!(
+        database
+            .jobs()
+            .failed_log_tails(claim.attempt.spec.id())
+            .await?
+            .is_none()
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM resource_leases WHERE job_id = ?")
             .bind(claim.job.spec.id.to_string())
@@ -3967,6 +5787,13 @@ async fn container_finish_is_atomic_and_persists_docker_outcome() -> TestResult 
         .jobs()
         .finish_container_execution(&claim, &finish, &outcome)
         .await?;
+    assert!(
+        database
+            .jobs()
+            .failed_log_tails(claim.attempt.spec.id())
+            .await?
+            .is_some()
+    );
     let container = database
         .jobs()
         .container_for_attempt(claim.attempt.spec.id())
@@ -4687,6 +6514,13 @@ struct FamilyFixture {
     prepared: PreparedFamily,
 }
 
+#[path = "persistence/failed_log_retirement.rs"]
+mod failed_log_retirement_cases;
+#[path = "persistence/success_log_archives.rs"]
+mod success_log_archive_cases;
+#[path = "persistence/superseded_cleanup.rs"]
+mod superseded_cleanup_cases;
+
 async fn family_fixture() -> Result<FamilyFixture, Box<dyn Error>> {
     let (repository, project, config, file) = family_repository()?;
     let (directory, database) = database().await?;
@@ -4733,6 +6567,582 @@ async fn successor_for(fixture: &FamilyFixture) -> Result<PreparedFamily, Box<dy
     let prepared = build_family_generation(&project, &loaded.config, file)?
         .for_existing_family(fixture.prepared.family.clone(), 2)?;
     Ok(prepared)
+}
+
+#[tokio::test]
+async fn superseded_failed_cleanup_preserves_bytes_until_valid_replacement_succeeds() -> TestResult
+{
+    for policy in ["delete-after-diagnosis", "keep"] {
+        let mut fixture = family_fixture().await?;
+        let root = fixture._database.path();
+        let paths = igor_core::RuntimePaths {
+            config_file: root.join("config"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("runtime"),
+            database: root.join("nested/igor.db"),
+            log_dir: root.join("logs"),
+            worktree_dir: root.join("worktrees"),
+            report_dir: root.join("reports"),
+            worker_socket: root.join("worker.sock"),
+            supervisor_socket: root.join("supervisor.sock"),
+            resource_dir: root.join("resources"),
+        };
+        let mut extractor = fixture.prepared.submissions[0].job.command.clone();
+        extractor.cwd = fixture._repository.path().join("project");
+        for submission in &mut fixture.prepared.submissions {
+            let mut spec = serde_json::to_value(&submission.attempt)?;
+            spec["result"]["failed_artifact_retention"] =
+                json!({"policy":policy,"keep_on_failure":[]});
+            spec["result"]["publication_root"] =
+                json!(fixture._repository.path().join("project/publication"));
+            spec["result"]["extractor"] = serde_json::to_value(&extractor)?;
+            submission.attempt = serde_json::from_value(spec)?;
+        }
+        let database = &fixture.database;
+        let previous = &fixture.prepared;
+        let old_jobs = database.families().submit(previous).await?;
+        for job in &old_jobs {
+            database
+                .jobs()
+                .request_cancellation(job.spec.id, Duration::from_secs(1))
+                .await?;
+        }
+        let attempt_id = previous.submissions[0].attempt.id();
+        sqlx::query("UPDATE attempts SET state = 'failed' WHERE id = ?")
+            .bind(attempt_id.to_string())
+            .execute(database.pool())
+            .await?;
+        let attempt_dir = paths.log_dir.join(attempt_id.to_string());
+        fs::create_dir_all(&attempt_dir)?;
+        fs::write(attempt_dir.join("stdout.log"), b"stdout diagnostic")?;
+        fs::write(attempt_dir.join("stderr.log"), b"stderr diagnostic")?;
+        sqlx::query("INSERT INTO attempt_processes (attempt_id, job_id, project_id, pid, process_group_id, process_start_ticks, stdout_path, stderr_path) VALUES (?, ?, ?, 1, 1, 1, ?, ?)")
+            .bind(attempt_id.to_string()).bind(old_jobs[0].spec.id.to_string())
+            .bind(previous.family.project_id.to_string())
+            .bind(attempt_dir.join("stdout.log").to_str()).bind(attempt_dir.join("stderr.log").to_str())
+            .execute(database.pool()).await?;
+        let id = uuid::Uuid::new_v4();
+        let source = attempt_dir.join("partial.bin");
+        let staged = paths
+            .state_dir
+            .join("artifact-staging")
+            .join(attempt_id.to_string())
+            .join(id.to_string());
+        fs::create_dir_all(staged.parent().ok_or("staged parent")?)?;
+        let bytes = b"preserved failed checkpoint";
+        fs::write(&source, bytes)?;
+        fs::write(&staged, bytes)?;
+        let artifact = ArtifactRecord {
+            id,
+            attempt_id,
+            path: "partial.bin".into(),
+            role: ArtifactRole::Checkpoint,
+            sha256: Some(format!("sha256:{:x}", sha2::Sha256::digest(bytes))),
+            size_bytes: Some(bytes.len() as u64),
+            state: igor_core::ArtifactPublicationState::Staged,
+            lifecycle: igor_core::ArtifactLifecycleState::Failed,
+            diagnosis_required: true,
+            metadata: json!({"staged_path":staged}),
+        };
+        database.artifacts().insert(&artifact).await?;
+        let recovery_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO recoveries (id, attempt_id, state, diagnosis_json, idempotency_key) VALUES (?, ?, 'proposed', '{}', ?)")
+            .bind(&recovery_id).bind(attempt_id.to_string()).bind(&recovery_id)
+            .execute(database.pool()).await?;
+        sqlx::query("INSERT INTO failed_log_tails (attempt_id, stdout, stderr, limit_kb, complete) VALUES (?, X'', X'', 1, 1)")
+            .bind(attempt_id.to_string()).execute(database.pool()).await?;
+        let successor = successor_for(&fixture).await?;
+        let new_jobs = database
+            .families()
+            .supersede(previous.generation.identity.id, &successor)
+            .await?;
+        for state in ["queued", "failed", "succeeded"] {
+            sqlx::query("UPDATE jobs SET state = ? WHERE generation_id = ?")
+                .bind(state)
+                .bind(successor.generation.identity.id.to_string())
+                .execute(database.pool())
+                .await?;
+            // Success counts alone cannot authorize cleanup with invalid membership.
+            let original: String = sqlx::query_scalar("SELECT spec_json FROM jobs WHERE id = ?")
+                .bind(new_jobs[1].spec.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+            if state == "succeeded" {
+                let mut malformed: serde_json::Value = serde_json::from_str(&original)?;
+                malformed["family"]["seed"] = json!(1);
+                sqlx::query("UPDATE jobs SET spec_json = ? WHERE id = ?")
+                    .bind(malformed.to_string())
+                    .bind(new_jobs[1].spec.id.to_string())
+                    .execute(database.pool())
+                    .await?;
+            }
+            assert_eq!(
+                database
+                    .artifacts()
+                    .cleanup_failed_artifacts(attempt_id, &paths)
+                    .await?,
+                0
+            );
+            assert_eq!(fs::read(&source)?, bytes);
+            assert_eq!(fs::read(&staged)?, bytes);
+            assert_eq!(database.artifacts().get(id).await?, Some(artifact.clone()));
+            sqlx::query("UPDATE jobs SET spec_json = ? WHERE id = ?")
+                .bind(original)
+                .bind(new_jobs[1].spec.id.to_string())
+                .execute(database.pool())
+                .await?;
+        }
+        let removed = policy == "delete-after-diagnosis";
+        if removed {
+            sqlx::raw_sql(&format!("CREATE TRIGGER replacement_change AFTER INSERT ON failed_cleanup_intents BEGIN UPDATE jobs SET state = 'queued' WHERE generation_id = '{}'; END;", successor.generation.identity.id))
+                .execute(database.pool()).await?;
+            assert_eq!(
+                database
+                    .artifacts()
+                    .cleanup_failed_artifacts(attempt_id, &paths)
+                    .await?,
+                0
+            );
+            assert_eq!(fs::read(&source)?, bytes);
+            assert_eq!(fs::read(&staged)?, bytes);
+            sqlx::raw_sql("DROP TRIGGER replacement_change; UPDATE jobs SET state = 'succeeded' WHERE state = 'queued'; CREATE TRIGGER failed_event BEFORE INSERT ON events WHEN NEW.kind = 'cleanup_state_changed' BEGIN SELECT RAISE(ABORT, 'fault'); END;")
+                .execute(database.pool()).await?;
+            assert!(
+                database
+                    .artifacts()
+                    .cleanup_failed_artifacts(attempt_id, &paths)
+                    .await
+                    .is_err()
+            );
+            assert!(!source.exists() && !staged.exists());
+            sqlx::raw_sql("DROP TRIGGER failed_event;")
+                .execute(database.pool())
+                .await?;
+            sqlx::query("UPDATE jobs SET state = 'queued' WHERE generation_id = ?")
+                .bind(successor.generation.identity.id.to_string())
+                .execute(database.pool())
+                .await?;
+            assert_eq!(
+                database
+                    .artifacts()
+                    .cleanup_failed_artifacts(attempt_id, &paths)
+                    .await?,
+                0
+            );
+            assert!(
+                database
+                    .cleanup_tombstone("failed_artifact_retention", &id.to_string())
+                    .await?
+                    .is_none()
+            );
+            sqlx::query("UPDATE jobs SET state = 'succeeded' WHERE generation_id = ?")
+                .bind(successor.generation.identity.id.to_string())
+                .execute(database.pool())
+                .await?;
+        }
+        assert_eq!(
+            database
+                .artifacts()
+                .cleanup_failed_artifacts(attempt_id, &paths)
+                .await?,
+            usize::from(removed)
+        );
+        let final_artifact = database.artifacts().get(id).await?.ok_or("artifact")?;
+        assert_eq!(
+            final_artifact.lifecycle,
+            if removed {
+                igor_core::ArtifactLifecycleState::Removed
+            } else {
+                igor_core::ArtifactLifecycleState::Retained
+            }
+        );
+        assert_eq!(source.exists(), !removed);
+        assert_eq!(staged.exists(), !removed);
+        assert!(attempt_dir.join("stdout.log").exists());
+        assert!(attempt_dir.join("stderr.log").exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn superseded_artifact_barrier_tracks_current_exact_membership() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    let previous = &fixture.prepared;
+    let old_jobs = database.families().submit(previous).await?;
+    let artifact = family_published_artifact(&fixture, 0, "model.bin").await?;
+    let retained = family_published_artifact(&fixture, 1, "retained.bin").await?;
+    sqlx::query("UPDATE artifacts SET lifecycle_state = 'retained' WHERE id = ?")
+        .bind(retained.id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .artifacts()
+            .replacement_generation_succeeded(artifact.id)
+            .await?
+    );
+    assert!(matches!(
+        database
+            .artifacts()
+            .replacement_generation_succeeded(uuid::Uuid::new_v4())
+            .await,
+        Err(PersistenceError::NotFound { entity: "artifact" })
+    ));
+    for job in &old_jobs {
+        database
+            .jobs()
+            .request_cancellation(job.spec.id, Duration::from_secs(1))
+            .await?;
+    }
+    let successor = successor_for(&fixture).await?;
+    let new_jobs = database
+        .families()
+        .supersede(previous.generation.identity.id, &successor)
+        .await?;
+    assert_eq!(
+        database
+            .artifacts()
+            .get(artifact.id)
+            .await?
+            .ok_or("artifact")?
+            .lifecycle,
+        igor_core::ArtifactLifecycleState::Superseded
+    );
+    assert_eq!(
+        database
+            .artifacts()
+            .get(retained.id)
+            .await?
+            .ok_or("artifact")?
+            .lifecycle,
+        igor_core::ArtifactLifecycleState::Retained
+    );
+    for id in [artifact.id, retained.id] {
+        assert_replacement_blocks_retirement(database, id).await?;
+    }
+    sqlx::query("UPDATE jobs SET state = 'failed' WHERE generation_id = ?")
+        .bind(successor.generation.identity.id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert_replacement_blocks_retirement(database, artifact.id).await?;
+    assert_eq!(
+        fs::read(artifact.metadata["published_path"].as_str().ok_or("path")?)?,
+        b"preserved model"
+    );
+    sqlx::query("UPDATE jobs SET state = 'succeeded' WHERE generation_id = ?")
+        .bind(successor.generation.identity.id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert!(
+        database
+            .artifacts()
+            .replacement_generation_succeeded(artifact.id)
+            .await?
+    );
+    // SQL allows retirement only now; roll back so this test preserves rows/bytes.
+    let mut transaction = database.pool().begin().await?;
+    sqlx::query("UPDATE artifacts SET state = 'removed', lifecycle_state = 'removed' WHERE id = ?")
+        .bind(artifact.id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM artifacts WHERE id = ?")
+        .bind(retained.id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    transaction.rollback().await?;
+    // Same succeeded count, but duplicate seeds and a missing required seed.
+    let original: String = sqlx::query_scalar("SELECT spec_json FROM jobs WHERE id = ?")
+        .bind(new_jobs[1].spec.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    for field in ["seed", "source_revision", "protocol_digest"] {
+        let mut malformed: serde_json::Value = serde_json::from_str(&original)?;
+        if field == "seed" {
+            malformed["family"][field] = json!(1);
+        } else {
+            malformed["family"]["generation"][field] = json!("different");
+        }
+        sqlx::query("UPDATE jobs SET spec_json = ? WHERE id = ?")
+            .bind(malformed.to_string())
+            .bind(new_jobs[1].spec.id.to_string())
+            .execute(database.pool())
+            .await?;
+        assert_replacement_blocks_retirement(database, artifact.id).await?;
+    }
+    sqlx::query("UPDATE jobs SET spec_json = ? WHERE id = ?")
+        .bind(original)
+        .bind(new_jobs[1].spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    // An absent required member cannot be hidden by successes in the old generation.
+    let mut transaction = database.pool().begin().await?;
+    sqlx::query("UPDATE jobs SET generation_id = ? WHERE id = ?")
+        .bind(previous.generation.identity.id.to_string())
+        .bind(new_jobs[1].spec.id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+    let ready: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM successful_current_generations WHERE id = ?")
+            .bind(successor.generation.identity.id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+    assert_eq!(ready, 0);
+    transaction.rollback().await?;
+    let root = fixture._repository.path().join("project");
+    fs::write(root.join("train.py"), "print('third revision')\n")?;
+    git(&root, &["add", "train.py"])?;
+    git(&root, &["commit", "-qm", "third"])?;
+    let loaded = load_project_config(&root.join(".igor/project.toml"))?;
+    let project = Project {
+        id: previous.family.project_id,
+        name: "family-project".into(),
+        root: root.clone(),
+        config_path: loaded.config_file,
+    };
+    let third = build_family_generation(
+        &project,
+        &loaded.config,
+        load_family_file(&root.join("family.toml"))?,
+    )?
+    .for_existing_family(previous.family.clone(), 3)?;
+    database
+        .families()
+        .supersede(successor.generation.identity.id, &third)
+        .await?;
+    assert_replacement_blocks_retirement(database, artifact.id).await?;
+    sqlx::query("UPDATE jobs SET state = 'failed' WHERE generation_id = ?")
+        .bind(third.generation.identity.id.to_string())
+        .execute(database.pool())
+        .await?;
+    assert_replacement_blocks_retirement(database, retained.id).await?;
+    assert_eq!(
+        fs::read(artifact.metadata["published_path"].as_str().ok_or("path")?)?,
+        b"preserved model"
+    );
+    Ok(())
+}
+
+async fn family_published_artifact(
+    fixture: &FamilyFixture,
+    member: usize,
+    name: &str,
+) -> Result<ArtifactRecord, Box<dyn Error>> {
+    let path = fixture._database.path().join(name);
+    fs::write(&path, b"preserved model")?;
+    let artifact = ArtifactRecord {
+        id: uuid::Uuid::new_v4(),
+        attempt_id: fixture.prepared.submissions[member].attempt.id(),
+        path: name.into(),
+        role: ArtifactRole::Model,
+        sha256: Some(format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(b"preserved model")
+        )),
+        size_bytes: Some(15),
+        state: igor_core::ArtifactPublicationState::Published,
+        lifecycle: igor_core::ArtifactLifecycleState::Published,
+        diagnosis_required: false,
+        metadata: json!({"published_path":path,"keep":"evidence"}),
+    };
+    fixture.database.artifacts().insert(&artifact).await?;
+    Ok(artifact)
+}
+
+async fn assert_replacement_blocks_retirement(database: &Database, id: uuid::Uuid) -> TestResult {
+    assert!(
+        !database
+            .artifacts()
+            .replacement_generation_succeeded(id)
+            .await?
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE artifacts SET state = 'removed', lifecycle_state = 'removed' WHERE id = ?"
+        )
+        .bind(id.to_string())
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM artifacts WHERE id = ?")
+            .bind(id.to_string())
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn superseded_artifact_late_extraction_and_retained_replay_preserve_flags() -> TestResult {
+    let mut fixture = family_fixture().await?;
+    let root = fixture._repository.path().join("project/artifacts");
+    for submission in &mut fixture.prepared.submissions {
+        let mut spec = serde_json::to_value(&submission.attempt)?;
+        spec["result"]["publication_root"] = json!(root);
+        spec["result"]["extractor"] = json!({"program":"python3", "args":["extract.py"],
+            "cwd":fixture._repository.path().join("project"), "shell":"direct",
+            "environment":{"inherit":"none","set":{}}});
+        submission.attempt = serde_json::from_value(spec)?;
+    }
+    let database = &fixture.database;
+    let previous = &fixture.prepared;
+    let old_jobs = database.families().submit(previous).await?;
+    let attempt = &previous.submissions[0].attempt;
+    sqlx::query("UPDATE attempts SET state = 'succeeded' WHERE id = ?")
+        .bind(attempt.id().to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE jobs SET state = 'succeeded' WHERE id = ?")
+        .bind(old_jobs[0].spec.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .jobs()
+        .request_cancellation(old_jobs[1].spec.id, Duration::from_secs(1))
+        .await?;
+    let successor = successor_for(&fixture).await?;
+    let id = uuid::Uuid::new_v4();
+    let published_path = root.join(attempt.id().to_string()).join(id.to_string());
+    fs::create_dir_all(published_path.parent().ok_or("parent")?)?;
+    fs::write(&published_path, b"model")?;
+    let artifact = ArtifactRecord {
+        id,
+        attempt_id: attempt.id(),
+        path: "model.bin".into(),
+        role: ArtifactRole::Model,
+        sha256: Some(format!("sha256:{:x}", sha2::Sha256::digest(b"model"))),
+        size_bytes: Some(5),
+        state: igor_core::ArtifactPublicationState::Staged,
+        lifecycle: igor_core::ArtifactLifecycleState::Running,
+        diagnosis_required: false,
+        metadata: json!({"staged_path":"private-staging/model", "keep":"evidence"}),
+    };
+    database.artifacts().insert(&artifact).await?;
+    let action = ActionRecord {
+        id: ActionId::new(),
+        project_id: previous.family.project_id,
+        kind: "extract_metrics".into(),
+        state: ActionState::Pending,
+        spec: json!({}),
+        idempotency_key: "late-family-extraction".into(),
+    };
+    database.actions().insert(&action).await?;
+    sqlx::query("UPDATE actions SET job_id = ?, attempt_id = ? WHERE id = ?")
+        .bind(old_jobs[0].spec.id.to_string())
+        .bind(attempt.id().to_string())
+        .bind(action.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let claim = database
+        .actions()
+        .claim_extraction("late", Duration::from_secs(60))
+        .await?
+        .ok_or("claim")?;
+    database
+        .families()
+        .supersede(previous.generation.identity.id, &successor)
+        .await?;
+    // Files are already group-published, while SQLite still records staging.
+    assert_eq!(database.artifacts().get(id).await?, Some(artifact));
+    let document = json!({"schema_version":1,"status":"success","metrics":{},
+        "artifacts":[{"path":"model.bin","role":"model"}]});
+    database
+        .actions()
+        .complete_extraction(&claim, attempt.id(), &document)
+        .await?;
+    let published = database.artifacts().get(id).await?.ok_or("artifact")?;
+    assert_eq!(
+        published.lifecycle,
+        igor_core::ArtifactLifecycleState::Superseded
+    );
+    assert_eq!(
+        published.state,
+        igor_core::ArtifactPublicationState::Published
+    );
+    assert_eq!(published.metadata["keep"], "evidence");
+    for lifecycle in ["superseded", "retained"] {
+        sqlx::query(
+            "UPDATE artifacts SET lifecycle_state = ?, diagnosis_required = 1 WHERE id = ?",
+        )
+        .bind(lifecycle)
+        .bind(id.to_string())
+        .execute(database.pool())
+        .await?;
+        let before = database.artifacts().get(id).await?;
+        sqlx::query("UPDATE actions SET state = 'pending' WHERE id = ?")
+            .bind(action.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let replay = database
+            .actions()
+            .claim_extraction("replay", Duration::from_secs(60))
+            .await?
+            .ok_or("claim")?;
+        database
+            .actions()
+            .complete_extraction(&replay, attempt.id(), &document)
+            .await?;
+        assert_eq!(database.artifacts().get(id).await?, before);
+        assert_replacement_blocks_retirement(database, id).await?;
+    }
+    assert_eq!(fs::read(published_path)?, b"model");
+    Ok(())
+}
+
+#[tokio::test]
+async fn superseded_artifact_migration_backfills_v16_without_losing_metadata() -> TestResult {
+    let fixture = family_fixture().await?;
+    let database = &fixture.database;
+    database.families().submit(&fixture.prepared).await?;
+    let published = family_published_artifact(&fixture, 0, "published.bin").await?;
+    let retained = family_published_artifact(&fixture, 1, "retained.bin").await?;
+    sqlx::query("UPDATE artifacts SET lifecycle_state = 'retained' WHERE id = ?")
+        .bind(retained.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let removed = family_published_artifact(&fixture, 0, "removed.bin").await?;
+    sqlx::query("UPDATE artifacts SET state = 'removed', lifecycle_state = 'removed' WHERE id = ?")
+        .bind(removed.id.to_string())
+        .execute(database.pool())
+        .await?;
+    drop_replacement_barrier(database).await?;
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (17, 18, 19, 20)")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE jobs SET state = 'superseded'")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(database.schema_version().await?, 16);
+    database.pool().close().await;
+    let upgraded = Database::open(fixture._database.path().join("nested/igor.db")).await?;
+    assert_eq!(upgraded.schema_version().await?, 22);
+    for (original, lifecycle) in [
+        (published, igor_core::ArtifactLifecycleState::Superseded),
+        (retained, igor_core::ArtifactLifecycleState::Retained),
+        (removed, igor_core::ArtifactLifecycleState::Removed),
+    ] {
+        let actual = upgraded
+            .artifacts()
+            .get(original.id)
+            .await?
+            .ok_or("artifact")?;
+        assert_eq!(
+            actual,
+            ArtifactRecord {
+                lifecycle,
+                state: if lifecycle == igor_core::ArtifactLifecycleState::Removed {
+                    igor_core::ArtifactPublicationState::Removed
+                } else {
+                    original.state
+                },
+                ..original
+            }
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -4865,6 +7275,7 @@ async fn family_supersession_late_event_conflict_rolls_back_everything() -> Test
     let database = &fixture.database;
     let previous = &fixture.prepared;
     let old_jobs = database.families().submit(previous).await?;
+    let artifact = family_published_artifact(&fixture, 0, "rollback.bin").await?;
     for job in &old_jobs {
         database
             .jobs()
@@ -4898,6 +7309,7 @@ async fn family_supersession_late_event_conflict_rolls_back_everything() -> Test
         row_counts(database, &["generations", "jobs", "attempts", "events"]).await?,
         before
     );
+    assert_eq!(database.artifacts().get(artifact.id).await?, Some(artifact));
     for old in &old_jobs {
         assert_eq!(
             database
