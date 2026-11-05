@@ -9,14 +9,19 @@
 
 Igor is a resource-aware experiment runner and recovery orchestrator for Linux.
 It executes process and Docker workloads, coordinates exclusive compute
-resources, persists execution history, and extracts structured results. Project
-reports are planned.
+resources, persists execution history, extracts structured results, and supports
+opt-in deterministic project reports.
 
-The `v0.2` roadmap scope is complete (milestones 0–10). Work on the planned
-`v0.3` scope (11–14) is underway: milestones 12 and 13 have passed acceptance, and
-milestone 11's remaining acceptance check awaits the current-generation
-aggregate; deterministic Markdown reports remain in milestone 14. No
-packaged release has been published, and the current Cargo/binary version is
+The `v0.2` roadmap scope (milestones 0–10) and non-agent `v0.3` scope (11–14)
+have passed acceptance. Families, generation-scoped metrics, recoverable retention
+and deterministic Markdown reports work together in a real five-seed workflow.
+Reports use a normalized read-only context, two-phase atomic publication and
+guarded generated-file replacement. The supervisor triggers durable actions for
+completed comparable families; manual generation and retries are available through
+`igor report generate` and `igor report retry`. Partial or failed replacements
+keep results provisional instead of selecting an older generation's aggregate.
+No packaged release
+has been published, and the current Cargo/binary version is
 still `0.1.0`. Igor remains under active development and is not ready for
 production experiment management. See
 [`DESIGN.md`](DESIGN.md) for the agreed architecture and [`TASKS.md`](TASKS.md)
@@ -38,14 +43,130 @@ Jobs can run with the worker alone. Metric extraction, Markdown reports,
 coding-agent integrations and Telegram are optional and configured independently:
 
 - Omit `[results]` to run without a metric extractor.
-- Reports are disabled by default (`[report] enabled = false`). Reporting is
-  planned for Milestone 14; its default generator is deterministic. OpenCode
-  or Pi are needed only when explicitly selected as optional report generators.
+- Reports are disabled by default (`[report] enabled = false`). The available
+  default generator is deterministic. Optional OpenCode/Pi integrations are
+  planned for Milestone 15; explicit unsupported generators do not silently fall
+  back to deterministic output.
 - Omit Telegram credentials to run without Telegram delivery.
+
+The core report context selects the current family generation in one SQLite
+snapshot and separates historical generations and retries from primary metric
+series. Pending extraction makes the context provisional; projects without an
+extractor have an explicit empty metric result. Git and configuration identities,
+artifacts and repair evidence come from persisted records. The pure
+`render_report_markdown` API renders that context with stable GFM tables,
+provisional/history labels, structured extractor evidence and encoded links to
+published artifacts. `stage_report` prepares a private sibling file, and
+`StagedReport::publish` revalidates its bytes and destination before an atomic
+rename. Competing publishers are serialized; failures before rename preserve the
+old output, while a later directory-sync failure reports the already-published
+file identity explicitly.
+
+The default `replace-generated-file` mode uses `stage_generated_report` and
+requires reports to be explicitly enabled. It creates a missing `RESULTS.md` (or
+the configured output), and replaces an existing file only when its generated-file
+claim matches the project/path and its body checksum is intact. Handwritten
+files and generated reports containing manual edits or appended notes are
+preserved. Explicit OpenCode/Pi choices are not silently replaced by the
+deterministic generator.
+
+With the supervisor running, the `family-completed` trigger discovers the current
+comparable generation and queues one durable report action with a frozen report
+policy. Generations completed with the worker alone are discovered when the
+supervisor starts; repeated discovery or restart does not duplicate requests.
+The current report policy controls opt-in at discovery time. Extraction may
+still be pending when the intent is queued. The report executor defers until the
+current generation is ready, then revalidates the claim, project, report policy
+and exact context before publishing. Superseded requests are cancelled; report
+failures do not rerun experiments or change successful job outcomes. Busy outputs
+and readiness waits preserve the retry budget. A shutdown/client cancellation
+does not abandon an already-started publication transaction. Report executions
+also retain durable context and output-hash history in SQLite.
+
+## Request A Report
+
+In `.igor/project.toml`, enable reporting explicitly:
+
+```toml
+[report]
+enabled = true
+generator = "deterministic"
+```
+
+Request a report for a family's current comparable generation:
+
+```bash
+igor report generate FAMILY_ID
+igor report generate FAMILY_ID --json
+igor --project /path/to/project report generate FAMILY_ID --json
+```
+
+The command returns a durable action ID, generation, state and planned output
+(default `RESULTS.md`). Success means the request was accepted; the supervisor
+publishes asynchronously. Requests can be queued with the worker alone and will
+be processed when `igor supervisor` or its user service is running. No extractor
+or coding agent is required for deterministic reports.
+
+The current/selected project scopes the family; outside a project the family ID
+resolves its registered owner. New requests for disabled reports or a
+non-comparable generation return conflict (exit 9); missing/scoped-out families
+return not-found (exit 8). Repeating the CLI command creates a fresh report
+request without rerunning jobs or resetting an earlier action's retry budget.
+Protocol-level retries with the same request UUID acknowledge the original
+request without re-enqueueing, even if its generation/policy subsequently changed.
+Publication still checks the live policy and protects handwritten/edited files.
+The report RPC uses protocol v22; use matching CLI, worker and supervisor builds.
+
+### Retry A Failed Report
+
+```bash
+igor report retry FAMILY_ID
+igor report retry FAMILY_ID --json
+```
+
+Retry reuses the latest report action for the current comparable generation,
+only when it is failed. It keeps its ID and frozen configuration, resets the
+report retry budget and queues it for the supervisor. The previous error and
+attempt count remain in immutable history. A newer active, successful or cancelled
+request blocks fallback to an older failure (conflict, exit 9); a generation with
+no report request returns not-found (exit 8). Disabled or changed report policy,
+changed project metadata or a stale/incomplete generation also reject new retries.
+
+`--project` and ambient-project scope work as for generation. JSON includes both
+the retry request UUID and the existing action ID. Protocol replay of that same
+UUID only acknowledges the original retry; it does not reset an active or failed
+action again. Jobs and experiment attempts are unchanged, and publication still
+protects handwritten/edited files. Use `report generate` for a fresh request with
+the current configuration rather than reusing an incompatible frozen action.
+
+### Report Provenance And Recovery
+
+SQLite v23 records each report run's exact context JSON/SHA-256, frozen policy
+and generation, claim provenance, destination, and full expected output hash/size.
+The `context` phase is committed before staging; `prepared` records publication
+intent before rename; `published` acknowledges a synced output together with the
+action and its events. A prepared hash alone does not assert that a file exists.
+
+After interruption, a reclaimed action revalidates the live generation/policy
+and compares the destination with the recorded intent/baseline. An exact matching
+output can be synced and acknowledged without rewriting it. Different newer
+content is preserved rather than overwritten by recovery. Failed/retried and
+superseded runs keep their original evidence; legacy runs with no recorded context
+retain unknown provenance. Core read-only APIs `report_run` and `report_runs`
+expose this history and verify context checksums.
+
+The wire protocol remains v22; use updated matching CLI/worker/supervisor builds
+with the v23 database. Old migration checksums are unchanged.
 
 A minimal project configuration is simply `schema_version = 1`. `igor init`
 includes optional configuration examples, with reports disabled. The supervisor
 is used for enabled background services; it is not required to execute jobs.
+
+Acceptance coverage includes a five-seed workflow across successful, failed and
+manually repaired generations, preservation of handwritten files, full Markdown
+snapshots and publication recovery after SIGKILL. The final report contains only
+the current comparable generation's observations. See the
+[acceptance evidence](crates/igor-cli/tests/report/README.md).
 
 ## Install From Source
 

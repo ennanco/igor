@@ -46,6 +46,16 @@ mod gc;
 mod owned_failed_outputs;
 #[path = "repair_worktrees.rs"]
 mod repair_worktrees;
+#[path = "report_actions.rs"]
+mod report_actions;
+#[path = "report_context.rs"]
+mod report_context;
+#[path = "report_execution.rs"]
+mod report_execution;
+#[path = "report_ledger.rs"]
+mod report_ledger;
+#[path = "report_retry.rs"]
+mod report_retry;
 #[path = "storage.rs"]
 mod storage;
 #[path = "success_log_archives.rs"]
@@ -56,6 +66,13 @@ mod superseded_cleanup;
 pub use failed_cleanup::FailedCleanupOutcome;
 pub use gc::*;
 pub use repair_worktrees::{RepairWorktreeEvidence, RepairWorktreeRepository};
+pub use report_actions::{
+    REPORT_ACTION_VERSION, ReportActionSpec, ReportCandidate, ReportOrigin, ReportRequestReceipt,
+};
+pub use report_context::*;
+pub use report_execution::*;
+pub use report_ledger::StoredReportRun;
+pub use report_retry::ReportRetryReceipt;
 pub use storage::*;
 pub use success_log_archives::{LogArchive, copy_log};
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -101,6 +118,8 @@ pub enum PersistenceError {
         generation_id: GenerationId,
         status: GenerationStatus,
     },
+    #[error("report generation is disabled; set [report] enabled = true")]
+    ReportDisabled,
     #[error("invalid lease: {0}")]
     InvalidLease(&'static str),
     #[error("backup destination must differ from the source database")]
@@ -1359,7 +1378,7 @@ async fn release_reclaimable_resource_leases(
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ArtifactRecord {
     pub id: Uuid,
     pub attempt_id: AttemptId,
@@ -1576,10 +1595,18 @@ impl FamilyGenerationRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin comparable generation read", source))?;
+        Self::comparable_in(&mut transaction, family_id, generation_id).await
+    }
+
+    async fn comparable_in(
+        transaction: &mut Transaction<'_, Sqlite>,
+        family_id: FamilyId,
+        generation_id: GenerationId,
+    ) -> PersistenceResult<ComparableGeneration> {
         let row = sqlx::query("SELECT id, family_id, generation_number, source_revision, protocol_digest, spec_json FROM generations WHERE id = ? AND family_id = ?")
             .bind(generation_id.to_string())
             .bind(family_id.to_string())
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(|source| db("read comparable generation", source))?
             .ok_or(PersistenceError::NotFound { entity: "family generation" })?;
@@ -1587,7 +1614,7 @@ impl FamilyGenerationRepository<'_> {
         let rows = sqlx::query("SELECT id, spec_json, state, priority, submission_order, submitted_at, updated_at FROM jobs WHERE generation_id = ? AND family_id = ? ORDER BY submission_order")
             .bind(generation_id.to_string())
             .bind(family_id.to_string())
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|source| db("read comparable generation members", source))?;
         let mut members = Vec::with_capacity(rows.len());
@@ -4783,23 +4810,30 @@ impl ActionRepository<'_> {
             .begin()
             .await
             .map_err(|source| db("begin attempt metrics read", source))?;
+        Self::metrics_in(&mut transaction, attempt_id).await
+    }
+
+    async fn metrics_in(
+        transaction: &mut Transaction<'_, Sqlite>,
+        attempt_id: AttemptId,
+    ) -> PersistenceResult<AttemptMetrics> {
         let row = sqlx::query("SELECT state, last_error FROM actions WHERE attempt_id = ? AND kind = 'extract_metrics' ORDER BY created_at DESC, id DESC LIMIT 1")
-            .bind(attempt_id.to_string()).fetch_optional(&mut *transaction).await
+            .bind(attempt_id.to_string()).fetch_optional(&mut **transaction).await
             .map_err(|source| db("read metric extraction state", source))?;
         let document: Option<String> =
             sqlx::query_scalar("SELECT document_json FROM metric_documents WHERE attempt_id = ?")
                 .bind(attempt_id.to_string())
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await
                 .map_err(|source| db("read metric document", source))?;
         let selection: Option<String> =
             sqlx::query_scalar("SELECT selection_json FROM metric_selections WHERE attempt_id = ?")
                 .bind(attempt_id.to_string())
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await
                 .map_err(|source| db("read metric selection", source))?;
         let values = sqlx::query("SELECT name, value FROM metrics WHERE attempt_id = ? AND value IS NOT NULL ORDER BY name")
-            .bind(attempt_id.to_string()).fetch_all(&mut *transaction).await
+            .bind(attempt_id.to_string()).fetch_all(&mut **transaction).await
             .map_err(|source| db("read attempt metrics", source))?;
         Ok(AttemptMetrics {
             attempt_id,
@@ -4979,10 +5013,10 @@ impl ActionRepository<'_> {
             .fetch_optional(&self.database.pool)
             .await
             .map_err(|source| db("read action kind", source))?;
-        if kind.as_deref() == Some("extract_metrics") {
+        if matches!(kind.as_deref(), Some("extract_metrics" | "generate_report")) {
             return Err(PersistenceError::InvalidValue {
                 entity: "action completion",
-                value: "extract_metrics requires a metric document".into(),
+                value: "extraction/report actions require validated completion".into(),
             });
         }
         self.transition(claim, ActionState::Succeeded, Duration::ZERO, None)
@@ -5549,6 +5583,22 @@ impl ActionRepository<'_> {
             entity: "action claim",
         })?;
         let project_id = parse_id(row.get("project_id"), "action project")?;
+        if row.get::<String, _>("kind") == "generate_report" {
+            report_ledger::finish_runs(
+                &mut transaction,
+                claim.record_id,
+                claim.lease_id,
+                if state == ActionState::Cancelled {
+                    report_ledger::RunFinish::Cancel
+                } else if state == ActionState::Failed {
+                    report_ledger::RunFinish::Failed
+                } else {
+                    report_ledger::RunFinish::Retry
+                },
+                error.unwrap_or("report_action_interrupted"),
+            )
+            .await?;
+        }
         if state == ActionState::Failed
             && row.get::<String, _>("kind") == "extract_metrics"
             && let Some(attempt_id) = row.get::<Option<String>, _>("attempt_id")

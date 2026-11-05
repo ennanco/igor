@@ -161,6 +161,11 @@ enum Command {
         #[command(subcommand)]
         command: FamilyCommand,
     },
+    /// Request generation of a project report.
+    Report {
+        #[command(subcommand)]
+        command: ReportCommand,
+    },
     /// List submitted jobs.
     List {
         #[arg(long)]
@@ -465,6 +470,22 @@ enum FamilyCommand {
         family_id: FamilyId,
         #[arg(long, value_name = "FILE")]
         file: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ReportCommand {
+    /// Queue a report for the current comparable generation; the supervisor publishes it.
+    Generate {
+        family_id: FamilyId,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Requeue the latest failed report action without rerunning experiments.
+    Retry {
+        family_id: FamilyId,
         #[arg(long)]
         json: bool,
     },
@@ -825,6 +846,70 @@ async fn run() -> anyhow::Result<()> {
                 family_supersede(&effective, &cwd, family_id, &file, json).await?;
             }
         },
+        Command::Report { command } => {
+            let (family_id, json, retry) = match command {
+                ReportCommand::Generate { family_id, json } => (family_id, json, false),
+                ReportCommand::Retry { family_id, json } => (family_id, json, true),
+            };
+            let effective = effective_config(&overrides, &cwd)?;
+            let client = Client::new(&effective.paths);
+            let selected = selected_registered_project(&client, &effective).await?;
+            if effective.project.is_some() && selected.is_none() {
+                anyhow::bail!("current project is not registered; run `igor project add .`");
+            }
+            let project_id = selected.map(|project| project.id);
+            let request_id = igor_core::ActionId::new();
+            let request = if retry {
+                Request::ReportRetry {
+                    family_id,
+                    project_id,
+                    request_id,
+                }
+            } else {
+                Request::ReportGenerate {
+                    family_id,
+                    project_id,
+                    request_id,
+                }
+            };
+            let response = client.request(DaemonRole::Worker, request).await?;
+            let (receipt, retry_id) = match response {
+                Response::ReportRequested(receipt) if !retry => (receipt, None),
+                Response::ReportRetried(receipt) if retry => {
+                    (receipt.report, Some(receipt.request_id))
+                }
+                response => anyhow::bail!("unexpected {response:?} report request response"),
+            };
+            if json {
+                if let Some(request_id) = retry_id {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&igor_core::ReportRetryReceipt {
+                            request_id,
+                            report: receipt
+                        })?
+                    );
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&receipt)?);
+                }
+            } else {
+                if let Some(request_id) = retry_id {
+                    println!("Report retry request {request_id}");
+                }
+                println!(
+                    "Report action {} for family {} generation {} ({})",
+                    receipt.action_id,
+                    receipt.family_id,
+                    receipt.generation.number,
+                    receipt.generation.id
+                );
+                println!(
+                    "State: {}\nOutput: {}\nExecution: supervisor",
+                    receipt.state.as_str(),
+                    receipt.output.display()
+                );
+            }
+        }
         Command::List { json } => {
             let effective = effective_config(&overrides, &cwd)?;
             let client = Client::new(&effective.paths);

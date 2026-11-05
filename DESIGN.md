@@ -531,7 +531,8 @@ repaired code is committed and all five seeds are rerun in a successor. The
 superseded attempts remain readable but cannot satisfy the new generation's
 selection; changing a required seed instead of repairing code changes the
 scientific protocol and is rejected. This validates the M11/A11 selection
-boundary; A11.03 requires the actual current-generation aggregate from M12/M14.
+boundary. M14 acceptance closes A11.03 with the actual published current-generation
+aggregate, including a failed intermediate generation and a full five-seed rerun.
 
 ### 10.3 Running Old Generations
 
@@ -867,9 +868,320 @@ Only the newest complete and comparable generation appears as the primary
 result. Superseded generations may be summarized as history but are never mixed
 into the aggregate.
 
+### 15.1 Normalized Report Context
+
+The read-only report context selects the **current** family generation, its
+members, attempts, extraction results, registered artifacts and repair evidence
+in one SQLite snapshot. It reuses the M11 comparable-generation validation in
+that same transaction before exposing primary metric series. An incomplete or
+failed current generation cannot fall back to an older successful one. Previous
+generations and earlier attempts remain explicitly labelled history.
+
+Members are ordered by numeric seed, attempts by sequence, metric names
+lexically, and artifacts and repairs by stable identities. Normalization adds no
+wall-clock timestamp, random identifier or live checkout/environment inspection.
+Git and configuration identities come from immutable attempt specifications.
+Tool versions not recorded at execution time remain unknown; the context records
+the Igor version building the projection without inventing extractor, prompt,
+provider or model provenance.
+
+Primary metric series contain only the latest successful attempt for each seed
+of the current comparable generation. They preserve extractor-provided names,
+values, selection metadata and per-class documents; Igor does not invent a
+project-independent statistical aggregate or model-selection criterion. A
+configured extraction that has not reached a terminal outcome makes the context
+provisional. No extractor is a supported, explicit absence of metrics, and a
+terminal extraction failure remains distinct from experiment failure. Context
+construction does not enable reports or schedule an action; final publication
+must revalidate generation identity, readiness and context after rendering.
+
+### 15.2 Deterministic Markdown Renderer
+
+`render_report_markdown` is a pure projection of report context v1. It emits a
+generated-file marker and fixed sections for generation identity, required seeds,
+primary scalar series, individual attempts, historical generations, repairs and
+tool provenance. Ordering is numeric for seeds and attempt sequences, lexical
+for metric names and stable for artifact/recovery identities. JSON evidence is
+rendered with recursively ordered object keys. No timestamps, environment,
+filesystem reads, subprocesses or scientific model-selection rules are added.
+
+Only a ready context with a comparable current generation exposes primary
+series. Provisional contexts are explicitly labelled and may be rendered for
+inspection; this is not authorization to publish a final report. Historical
+retries and generations are labelled separately. Structured document status,
+selection, per-class values and extractor-provided aggregates remain visible
+without computing new statistics. Missing observations and unknown tool versions
+are explicit. Unsupported context versions and nonfinite scalar observations
+are rendering errors.
+
+Output uses GitHub-flavored Markdown tables, CommonMark HTML character entities
+for literal text, and `<br>` for embedded table-cell newlines. JSON uses fences
+longer than any embedded backtick run. Artifact links use percent-encoded
+absolute local paths only for physically published, published/retained lifecycle
+records. The persisted publication path is preferred; legacy records can use an
+absolute artifact path, while a relative fallback cannot produce a link. Removed
+or unpublished records retain metadata without an active link.
+Latest-job logs are referenced using the existing `igor logs JOB_ID` command;
+the context does not currently carry per-attempt log paths. Rendering returns
+text and does not write a project file or enable report generation.
+
+### 15.3 Atomic Report File Publication
+
+M14.05 provides an explicit two-phase filesystem primitive: `stage_report`
+creates a private, exclusively created sibling temporary, writes the complete
+UTF-8 report, and syncs the file and its directory. `StagedReport::publish`
+serializes cooperating publishers with an exclusive advisory directory lock,
+then revalidates the staged bytes, destination snapshot and directory identities,
+then replaces the destination with one same-directory rename and syncs the
+directory again. The result includes the output path, byte length and SHA-256.
+The output parent must already exist; relative outputs are resolved within an
+absolute project root, and absolute outputs must remain inside that root.
+
+All directory ancestors are checked without accepting symlinks or lexical
+aliases. Existing destinations and staging leaves must be single-link regular
+files, and changed destinations or replaced/modified staging files fail closed.
+Concurrent staged writers cannot silently overwrite an output published since
+their snapshot. This follows the trusted same-user Linux filesystem model; it
+is not a sandbox against adversarial swaps between the final check and rename.
+Staging and published files use private `0600` permissions.
+
+Before rename, failure preserves the previous output. Normal cancellation/drop
+removes only this invocation's still-matching temporary, never a replacement
+entry or an arbitrary stale file. A crash can leave a private temporary; it is
+not adopted or swept implicitly. After rename, a directory-sync failure is
+reported as `PublishedButUnsynced`, with the new report identity, because the
+complete new file is already visible and rollback cannot be claimed. Filesystem
+publication is not a SQLite transaction. Generated-file ownership, opt-in and
+context/action revalidation are integrated by the subsequent M14 tasks.
+
+### 15.4 Default Generated-File Mode
+
+`stage_generated_report` implements opt-in `replace-generated-file` mode using
+the deterministic renderer and M14.05 publisher. It accepts the configured
+project-contained output (default `RESULTS.md`) and requires a ready comparable
+context for that project. Disabled reports, unsupported explicit generators and
+incompatible contexts fail before filesystem writes. The output parent must
+already exist. Live generation/action revalidation remains part of M14.07–M14.11.
+
+A missing destination can be created. Replacing an existing file requires an
+exact v1 generated-file claim on its first line, scoped to the project ID and
+normalized project-relative output path, plus a SHA-256 of every following byte.
+This claim is added around the renderer's unchanged output. Manual body edits,
+appended notes, a foreign project/path, unknown claim versions, and the renderer
+marker alone do not authorize replacement. A checksum is an integrity tag, not
+an authentication boundary against a same-user author deliberately rewriting it.
+Full report-run/context/output bookkeeping still belongs to M14.11.
+
+Ownership is verified on the same no-follow file descriptor used to capture the
+destination's identity/hash snapshot, before creating a staging file. M14.05
+then revalidates that exact snapshot under the directory lock before rename.
+Thus a handwritten destination is not adopted and an edit or another publication
+after staging is preserved. No force/adoption path or sidecar file is introduced;
+the claim and rendered body are replaced together in the same atomic rename.
+
+### 15.5 Family-Completed Report Trigger
+
+The supervisor discovers current comparable generations from durable SQLite
+state in keyset pages of at most 64, with wraparound and per-page configuration
+caching. It loads each registered project's optional report policy outside the
+worker, requiring its canonical root and standard configuration path, a real
+`.igor` directory and a regular non-symlink configuration leaf before loading.
+Static FIFO configurations are rejected without opening them for a blocking read.
+The policy observed at discovery time controls opt-in, including late
+enabling after experiments finish. Disabled or unreadable configuration leaves
+the generation discoverable on a later pass. A family completed with the worker
+alone is discovered when the supervisor starts; restarting cannot lose the
+completion or duplicate its request.
+
+Enqueue reserves the SQLite writer before reading, rechecks project registration
+and identity, current-generation identity and the shared M11 comparability
+boundary, then inserts a `generate_report` action and its pending event in one
+transaction. The versioned action freezes the project, generation and normalized
+report policy. Its key contains trigger, family ID and generation ID; retries or
+multiple supervisors cannot create a second automatic request for that generation
+or silently alter the first request's policy. Historical requests remain history.
+
+The trigger records experiment completion independently of optional metric
+extraction. Extraction may still be pending when the action is enqueued. The
+separate M14.08 consumer revalidates live readiness, current generation and policy
+before publishing; full report-run context/output hash history remains M14.11.
+The discovery loop only enqueues the durable intent. Extraction, notification
+and report consumers use kind-specific claims. Reports do not participate in experiment outcome
+transactions and never make worker-only execution depend on configuration reads,
+agents, Telegram or a running supervisor.
+
+### 15.6 Live Report Execution And Publication Gate
+
+M14.08 adds the kind-specific report consumer. It validates the frozen action,
+registered project and current report policy, selects the current context in one
+SQLite transaction, and defers incomplete generations or pending extraction
+without consuming operational retries. Superseded generations, deregistered or
+changed projects and changed/disabled report policy cancel the stale intent.
+Terminal extraction failure and an absent extractor remain valid ready outcomes.
+
+Rendering, private staging and full filesystem hash verification happen outside
+the SQLite writer, with lease heartbeats during blocking work. Directory flock
+acquisition is nonblocking; a busy output defers without spending retries. Before
+rename, a writer transaction revalidates the claim, frozen action,
+live policy and SHA-256 of the serialized normalized context after the directory
+lock is held (including distinctions such as signed zero in JSON evidence).
+Changed context is deferred for a fresh projection. A final metadata fence catches
+file edits after the hash verification. Lock order is directory flock then SQLite
+writer; publication never waits for a flock while blocking experiment writers.
+
+The action's success update/event are prepared before rename, so SQL preparation
+failure cannot replace the previous report. The lease is renewed under the writer
+and a conservative monotonic expiry guard runs immediately before rename. The
+writer and directory lock remain held through rename/sync and action commit;
+claim identity cannot be reclaimed during that reservation. Once publication
+starts it is owned by a dedicated task and awaited to completion; cancellation of
+the client future cannot drop its in-flight transaction. Post-rename sync
+or commit uncertainty is distinguished from pre-rename failure and deferred for
+reconciliation, never blindly classified as terminal publication failure. Full
+report-run/context/output hash history and crash evidence remain M14.11/M14.13.
+
+### 15.7 Manual Report Generation Request
+
+`igor report generate FAMILY_ID [--json]` asks the worker to enqueue a manual
+report action for the current comparable generation of a registered project.
+It requires `[report] enabled = true` and freezes the configured report policy,
+including an explicit generator choice. It neither starts the supervisor nor
+claims that queue acceptance is publication. The response contains action,
+family/project/generation identity, planned output and action state; the M14.08
+supervisor consumer performs the guarded publication asynchronously.
+
+An ambient or explicitly selected project scopes the request; outside a project,
+the family ID resolves its registered owner. The worker loads that owner's policy
+outside the writer, then revalidates project/current generation/comparability
+transactionally. Missing/scoped-out families return not-found; disabled reports,
+incomplete generations and stale selections return conflict without enqueueing.
+
+Each CLI invocation creates a request UUID; it is also the manual action ID.
+Replaying that same UUID/family/project scope returns the existing immutable
+request, even if the current generation or policy subsequently changed. Such a
+replay only acknowledges history: the executor still enforces live opt-in,
+registration and current-generation policy before any publication. A new
+invocation requests fresh generation of the report without rerunning jobs or
+resetting a failed action's retry budget (that operation is M14.10). Manual and
+automatic intents have separate versioned keys/origins. Existing v1 action specs
+without an origin deserialize as `family-completed`. Protocol v21 adds the request
+and receipt; SQLite remains v22. CLI, worker and supervisor must be upgraded
+together. Generator override flags/adapters remain part of M15.
+
+### 15.8 Retry A Failed Report Action
+
+`igor report retry FAMILY_ID [--json]` requeues the most recently recorded report
+request of the current comparable generation, only when that action is failed.
+It does not fall back to an older failed action if a newer request succeeded, was
+cancelled or is active. Request order follows each action's first immutable event
+sequence, not UUID or wall-clock order. Missing requests return not-found; a
+nonfailed latest action, disabled/changed policy, changed project or generation
+returns conflict. `report generate` remains the way to create a fresh request.
+
+Retry preserves action ID, origin, key and frozen project/generation/report spec,
+resets its operational attempts to zero and makes it pending immediately. Under
+one SQLite writer it revalidates registration, current generation, M11
+comparability and equality with the live report policy before updating the row.
+The pending event records the prior attempt count/error and the retry request
+UUID. That UUID is the immutable event ID, allowing indexed, durable replay
+without adding a table: replay acknowledges the original action's current state
+without resetting it again, even after policy/generation changes. A UUID already
+used by another event fails closed. Scope and event/action identity are validated.
+
+The worker returns a retry receipt binding this UUID to the existing action;
+the supervisor still performs the M14.08 live publication gate. Retry never
+changes jobs/attempts or adopts handwritten files. Protocol v22 adds retry RPC
+and receipt; SQLite remains v22. Durable report-run hash history remains M14.11.
+
+### 15.9 Durable Report Context And Output Ledger
+
+SQLite v23 extends the existing `report_runs` scaffold. A ready deterministic
+preparation commits a run ID, canonical context JSON and its SHA-256, frozen
+action spec, project/family/generation scope, destination, renderer identity and
+claim provenance before staging. The deterministic provider is `igor`, model
+`deterministic-format-v1`, with the empty-prompt SHA (no prompt/model service was
+used). Unsupported generators do not acquire fabricated deterministic provenance.
+Read-only `report_run`/`report_runs` APIs expose history and verify stored context
+checksums. Legacy rows retain unknown/null provenance and cannot be adopted.
+
+Ledger phase `context` has no output evidence. After staging/hash/flock, a separate
+writer transaction revalidates the live gate and commits phase `prepared` with
+the full expected file SHA/byte length and the prior destination SHA (or absence).
+This is an intent, not proof of publication. Only subsequent rename/confirmation,
+file/directory sync and action commit acknowledge phase/state `published`.
+Success SQL and report/action events remain prepared before the filesystem step.
+A SQL trigger forbids action success without a published run for that lease.
+
+The context, frozen spec and scope are immutable; expected output fields are
+write-once, and terminal runs cannot be rewritten or deleted. An explicit retry
+after a failed execution creates a distinct run; a reclaimed unfinished run with
+the same context/spec resumes its existing run ID, retaining initial lease and
+appending takeover evidence. Older acknowledged outputs at the same project/path
+become `superseded` only with a new acknowledged publication, preserving hashes.
+
+An unresolved prepared intent survives deferral and lease replacement. Recovery
+under the directory flock accepts only its exact expected output or its recorded
+previous destination. Matching visible bytes are synced/acknowledged without
+renaming or rewriting their inode. An unchanged baseline can be published normally;
+different bytes cancel recovery instead of overwriting a newer generated report
+or human work. A changed current context may create a new run, but must first
+resolve that same destination fence; the old intent's evidence remains intact.
+Stale policy/project/generation still cancels through M14.08. No stale-file sweep
+or blind temporary adoption is added.
+The wire protocol remains v22; matching updated daemon builds are required after
+the database upgrade, and the SQL completion guard also blocks ledger-free ACKs.
+
 An optional future `managed-section` mode can update a marked region in a
 handwritten Markdown document. The safe default is a fully generated
 `RESULTS.md`.
+
+### 15.10 Publication Failure And Process-Crash Tests
+
+M14.13 exercises the full action/ledger publication path with instance-local
+`cfg(test)` faults in rename and directory sync, including repeated sync failure
+while reconciling an already-visible exact output. Both initial creation and
+replacement of an acknowledged report are covered. Before-rename failure rolls
+back success bookkeeping and preserves the prior bytes/inode; after-rename sync
+failure retains a prepared intent, with no visible success event or premature
+supersession. Terminal retry keeps failed-run evidence distinct.
+
+A separate test process pauses after staging, immediately before rename with the
+final SQL transaction uncommitted, or after rename before directory sync/commit.
+The parent verifies committed state through an independent SQLite reader, sends
+SIGKILL to that child, reopens SQLite and reclaims the expired lease. Recovery
+keeps the run/context identity, produces one run/action success and does not
+rewrite an exact visible output. Unrenamed orphan temporaries remain untouched.
+The parent has a bounded marker wait and kills/reaps the child on error. Fault
+hooks and their environment-driven child harness do not exist in production.
+These are process-death tests, not a simulation of power loss or storage failure.
+
+### 15.11 Non-Agent Workflow Acceptance
+
+A14.01–A14.04 and A11.03 are accepted with renderer/generated-file/failure suites
+and the CLI workflow in `tests/report/acceptance.rs`. A disposable Git project
+runs five real process jobs per generation against three successive revisions;
+the scientific input, seed set and protocol digest stay frozen. The first
+generation produces scores 101–105. Its metrics remain provisional until a
+supervisor starts; extraction publishes verified model copies and the supervisor
+acknowledges both the manual request and automatic completion trigger.
+
+A partially completed second generation already has some indexed results, but
+cannot select that partial series or fall back to the first generation. A failed
+seed and its unchanged-code retry leave the generation terminal/noncomparable,
+with the previous report bytes/inode and published model copies preserved. A
+manually committed third revision reruns every seed, waits again for extraction
+after worker-only completion, and is discovered on supervisor restart. Only its
+five scores 301–305 and attempt identities appear in the published primary series.
+
+Successful report bytes match the renderer output from the durable run context
+and its full-file SHA. Earlier attempts, metrics and report context remain
+historical; superseded model copies are retired only after a comparable current
+replacement, with metadata retained. Scientific files, manual notes, prompt and
+configuration are unchanged, and report/retention work adds no experiment attempts.
+The independent suites cover opt-out/no-extractor operation, manuscripts/edits,
+SQL/filesystem errors and process-death recovery. Detailed evidence and commands
+are in `crates/igor-cli/tests/report/README.md`. This accepts the v0.3 roadmap scope;
+agent generators/assisted repair remain M15/M16, and the binary version stays 0.1.0.
 
 ## 16. Agent-Assisted Report Generation
 

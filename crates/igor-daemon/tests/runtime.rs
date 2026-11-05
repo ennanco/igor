@@ -103,7 +103,7 @@ async fn both_roles_serve_health_version_and_database_status() -> Result<(), Box
         assert!(matches!(
             client.request(role, Request::DatabaseStatus).await?,
             Response::DatabaseStatus(status)
-                if status.role == role && status.schema_version == 22 && status.integrity == "ok"
+                if status.role == role && status.schema_version == 23 && status.integrity == "ok"
         ));
     }
     assert!(matches!(
@@ -278,6 +278,32 @@ async fn supervisor_rejects_worker_operations() -> Result<(), Box<dyn Error>> {
         .await
         .err()
         .ok_or("supervisor accepted a resources request")?;
+    assert!(matches!(error, ClientError::InvalidRequest { .. }));
+    let error = Client::new(&paths)
+        .request(
+            DaemonRole::Supervisor,
+            Request::ReportGenerate {
+                family_id: igor_core::FamilyId::new(),
+                project_id: None,
+                request_id: igor_core::ActionId::new(),
+            },
+        )
+        .await
+        .err()
+        .ok_or("supervisor accepted report enqueue")?;
+    assert!(matches!(error, ClientError::InvalidRequest { .. }));
+    let error = Client::new(&paths)
+        .request(
+            DaemonRole::Supervisor,
+            Request::ReportRetry {
+                family_id: igor_core::FamilyId::new(),
+                project_id: None,
+                request_id: igor_core::ActionId::new(),
+            },
+        )
+        .await
+        .err()
+        .ok_or("supervisor accepted report retry")?;
     assert!(matches!(error, ClientError::InvalidRequest { .. }));
     let _ = stop.send(());
     supervisor.await??;

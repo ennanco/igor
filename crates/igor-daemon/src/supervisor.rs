@@ -12,6 +12,11 @@ const LEASE: Duration = Duration::from_secs(30);
 const POLL: Duration = Duration::from_millis(200);
 
 pub async fn run(database: Database, paths: RuntimePaths, mut shutdown: watch::Receiver<bool>) {
+    let reports = tokio::spawn(crate::reports::run(database.clone(), shutdown.clone()));
+    let report_triggers = tokio::spawn(crate::report_triggers::run(
+        database.clone(),
+        shutdown.clone(),
+    ));
     let owned_outputs = tokio::spawn(run_owned_failed_outputs(
         database.clone(),
         paths.clone(),
@@ -48,6 +53,12 @@ pub async fn run(database: Database, paths: RuntimePaths, mut shutdown: watch::R
         shutdown.clone(),
     ));
     run_notifications(database, paths, &mut shutdown).await;
+    if let Err(error) = reports.await {
+        tracing::error!(%error, "report executor task failed");
+    }
+    if let Err(error) = report_triggers.await {
+        tracing::error!(%error, "family report trigger task failed");
+    }
     if let Err(error) = owned_outputs.await {
         tracing::error!(%error,"owned failed output retirement task failed");
     }

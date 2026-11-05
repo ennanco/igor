@@ -6,6 +6,8 @@ use sqlx::Connection;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn Error>>;
+#[path = "../../igor-core/tests/support/report_ledger.rs"]
+mod report_ledger_schema;
 
 fn command(home: &Path, cwd: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_igor"));
@@ -214,7 +216,7 @@ async fn db_migrate_existing_older_and_current_databases() -> TestResult {
         .create_if_missing(false);
     let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
     sqlx::raw_sql(
-        "DROP TABLE owned_output_discovery; DROP TABLE owned_output_manifest; DROP TABLE owned_output_namespaces; DELETE FROM _sqlx_migrations WHERE version = 22; DROP TABLE failed_log_retirements; DELETE FROM _sqlx_migrations WHERE version = 21;",
+        &format!("{} DROP TABLE owned_output_discovery; DROP TABLE owned_output_manifest; DROP TABLE owned_output_namespaces; DELETE FROM _sqlx_migrations WHERE version = 22; DROP TABLE failed_log_retirements; DELETE FROM _sqlx_migrations WHERE version = 21;", report_ledger_schema::REMOVE_REPORT_LEDGER),
     )
     .execute(&mut connection)
     .await?;

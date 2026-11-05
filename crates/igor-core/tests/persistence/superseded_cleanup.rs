@@ -1334,6 +1334,9 @@ async fn superseded_cleanup_migration_v17_backfill_and_transaction_rollback() ->
         .await?
         .ok_or("artifact")?;
     let mut downgrade = database.pool().begin().await?;
+    sqlx::raw_sql(super::report_ledger_schema::REMOVE_REPORT_LEDGER)
+        .execute(&mut *downgrade)
+        .await?;
     sqlx::raw_sql(
         "DROP TABLE owned_output_discovery; DROP TABLE owned_output_manifest; DROP TABLE owned_output_namespaces;
           DROP TRIGGER retired_failed_tails_immutable; DROP TRIGGER retired_failed_tails_preserved; DROP TRIGGER retired_failed_tails_replacement_guard; DROP TABLE failed_log_retirements;
@@ -1384,7 +1387,7 @@ async fn superseded_cleanup_migration_v17_backfill_and_transaction_rollback() ->
     assert_replacement_blocks_retirement(database, before.id).await?;
     database.pool().close().await;
     let upgraded = Database::open(&fixture.paths.database).await?;
-    assert_eq!(upgraded.schema_version().await?, 22);
+    assert_eq!(upgraded.schema_version().await?, 23);
     assert_eq!(upgraded.artifacts().get(before.id).await?, Some(before));
     let intents: i64 = sqlx::query_scalar("SELECT count(*) FROM superseded_cleanup_intents")
         .fetch_one(upgraded.pool())

@@ -7,12 +7,15 @@ mod error;
 mod event;
 mod executor;
 mod family;
+mod generated_report;
 mod id;
 mod inventory;
 mod job;
 mod metric;
 pub mod persistence;
 mod project;
+mod report;
+mod report_publication;
 mod resource;
 mod retry;
 mod state;
@@ -47,6 +50,7 @@ pub use family::{
     FAMILY_FILE_VERSION, FamilyFile, FamilyMember, PreparedFamily, build_family_generation,
     load_family_file,
 };
+pub use generated_report::{GeneratedReportError, StagedGeneratedReport, stage_generated_report};
 pub use id::{
     ActionId, AgentSessionId, AttemptId, DeliveryId, EventId, FamilyId, GenerationId, JobId,
     ProjectId, RecoveryId, ReportId, ResourceId,
@@ -58,6 +62,8 @@ pub use job::{
     SourceIdentity, SupersededArtifactRetention,
 };
 pub use metric::{MetricDocumentError, parse_metric_document_json, validate_metric_document};
+pub use persistence::ReportRetryReceipt;
+pub use persistence::StoredReportRun;
 pub use persistence::{
     ActionRecord, ActionRepository, ArtifactRecord, ArtifactRepository, ArtifactStorage,
     ArtifactStorageGroup, AttemptLogPaths, AttemptMetrics, Claim, ClaimedAction, ClaimedDelivery,
@@ -69,17 +75,26 @@ pub use persistence::{
     GcOperation, GcPage, GcPlan, GcSelection, GcStatus, GcSubject, GcTarget, GcWorklist,
     Generation, GenerationStatus, IntegrityCheck, JobAttemptRepository, JobDetail, JobLogs,
     LogArchive, LogArchiveStorage, LogTailChunk, OwnedOutputStorage, PendingLogPreparationsStorage,
-    PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, RecoveredExecution,
-    RepairWorktreeEvidence, RepairWorktreeRepository, RepairWorktreeStorage, Resource,
-    ResourceLease, ResourceRepository, ResourceStatus, RetiredLogTail, StorageStateCount,
-    StorageStatus, StoredAttempt, StoredEvent, StoredJob, TombstoneStorage, UnitRecord,
-    UnitReservation, copy_log,
+    PersistenceError, ProcessRecord, ProcessStart, ProjectRepository, REPORT_ACTION_VERSION,
+    REPORT_CONTEXT_VERSION, RecoveredExecution, RepairWorktreeEvidence, RepairWorktreeRepository,
+    RepairWorktreeStorage, ReportActionSpec, ReportAttempt, ReportCandidate, ReportContext,
+    ReportExtractor, ReportGeneration, ReportMember, ReportMetricSeries, ReportMetricValue,
+    ReportRepair, ReportToolVersions, Resource, ResourceLease, ResourceRepository, ResourceStatus,
+    RetiredLogTail, StorageStateCount, StorageStatus, StoredAttempt, StoredEvent, StoredJob,
+    TombstoneStorage, UnitRecord, UnitReservation, copy_log,
 };
+pub use persistence::{
+    LockedReportPublication, PreparedReport, ReportExecutionError, ReportPreparation,
+    ReportPublishOutcome,
+};
+pub use persistence::{ReportOrigin, ReportRequestReceipt};
 pub use project::{
     ArtifactRetentionConfig, FailedRetention, PROJECT_CONFIG_VERSION, Project, ProjectConfig,
     ProjectPaths, ProvenanceConfig, ReportConfig, ReportGenerator, ReportMode, ReportTrigger,
     ResultsConfig, RetentionConfig, SupersededRetention,
 };
+pub use report::{ReportRenderError, render_report_markdown};
+pub use report_publication::{PublishedReport, ReportPublicationError, StagedReport, stage_report};
 pub use resource::{
     GpuRequest, NamedResourceMode, NamedResourceRequest, ResourceMode, ResourceRequest,
 };

@@ -2,6 +2,8 @@
 
 mod extract;
 mod protocol;
+mod report_triggers;
+mod reports;
 mod runtime;
 mod supervisor;
 mod systemd;

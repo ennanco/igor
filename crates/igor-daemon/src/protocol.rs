@@ -7,7 +7,7 @@ use igor_core::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -97,6 +97,16 @@ pub enum Request {
     },
     FamilyShow {
         family_id: FamilyId,
+    },
+    ReportGenerate {
+        family_id: FamilyId,
+        project_id: Option<ProjectId>,
+        request_id: igor_core::ActionId,
+    },
+    ReportRetry {
+        family_id: FamilyId,
+        project_id: Option<ProjectId>,
+        request_id: igor_core::ActionId,
     },
     FamilySupersede {
         project_id: ProjectId,
@@ -192,6 +202,8 @@ pub enum Response {
         jobs: Vec<StoredJob>,
     },
     Family(FamilyDetail),
+    ReportRequested(igor_core::ReportRequestReceipt),
+    ReportRetried(igor_core::ReportRetryReceipt),
     FamilySuperseded {
         family_id: FamilyId,
         previous_generation_id: GenerationId,

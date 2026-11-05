@@ -496,10 +496,10 @@ Dependencies: milestones 3-4 and 9.
 
 Dependencies: milestones 3, 5, and 7.
 
-Status (2026-09-29): M11.01–M11.13 implemented. A11.01–A11.02 verified with
-five-seed fixtures; A11.03 remains pending until M12/M14 publishes a current
-aggregate. Future metric/report consumers must use the current generation and
-generation-scoped comparable selection.
+Status: M11.01–M11.13 and A11.01–A11.03 accepted. M14 acceptance closes A11.03
+with a real five-seed CLI/worker/extractor/report workflow across three generations.
+Metric/report consumers use the current generation and generation-scoped
+comparable selection; partial or failed replacements never fall back to history.
 
 ### Tasks
 
@@ -526,7 +526,7 @@ generation-scoped comparable selection.
 
 - [x] `A11.01` Five configured seeds run against one immutable generation.
 - [x] `A11.02` A mixed-revision family cannot be marked comparable.
-- [ ] `A11.03` Superseded attempts are never selected for the current aggregate.
+- [x] `A11.03` Superseded attempts are never selected for the current aggregate.
 
 ## Milestone 12: Metrics And Artifact Publication
 
@@ -631,29 +631,177 @@ remain respected.
 
 ### Tasks
 
-- [ ] `M14.01` Build a normalized report context for one family generation.
-- [ ] `M14.02` Include jobs, attempts, metrics, Git identity, configurations,
+- [x] `M14.01` Build a normalized report context for one family generation.
+- [x] `M14.02` Include jobs, attempts, metrics, Git identity, configurations,
   repairs, artifacts, and tool versions.
-- [ ] `M14.03` Exclude superseded generations from primary aggregates.
-- [ ] `M14.04` Implement a deterministic Markdown renderer as the reliable
+- [x] `M14.03` Exclude superseded generations from primary aggregates.
+- [x] `M14.04` Implement a deterministic Markdown renderer as the reliable
   baseline.
-- [ ] `M14.05` Write reports to a staging file and publish with atomic rename.
-- [ ] `M14.06` Implement the default generated `RESULTS.md` mode.
-- [ ] `M14.07` Implement the `family-completed` report action trigger.
-- [ ] `M14.08` Do not generate a final report for an incomplete generation.
-- [ ] `M14.09` Implement `igor report generate FAMILY_ID`.
-- [ ] `M14.10` Implement `igor report retry FAMILY_ID`.
-- [ ] `M14.11` Persist report context and output hashes.
-- [ ] `M14.12` Add golden report tests for complete, failed, repaired, and
+- [x] `M14.05` Write reports to a staging file and publish with atomic rename.
+- [x] `M14.06` Implement the default generated `RESULTS.md` mode.
+- [x] `M14.07` Implement the `family-completed` report action trigger.
+- [x] `M14.08` Do not generate a final report for an incomplete generation.
+- [x] `M14.09` Implement `igor report generate FAMILY_ID`.
+- [x] `M14.10` Implement `igor report retry FAMILY_ID`.
+- [x] `M14.11` Persist report context and output hashes.
+- [x] `M14.12` Add golden report tests for complete, failed, repaired, and
   superseded families.
-- [ ] `M14.13` Add atomic-publication failure tests.
+- [x] `M14.13` Add atomic-publication failure tests.
+
+M14.01–M14.03 expose a read-only, versioned context through
+`FamilyGenerationRepository::report_context`. Current generation selection,
+M11 comparability validation, attempts and evidence share one SQLite snapshot.
+Primary metric series use only each current seed's latest successful attempt;
+pending extraction leaves the context provisional, while no extractor or a
+terminal extraction failure is an explicit supported outcome. Earlier
+generations and repairs are labelled history, and unrecorded tool versions stay
+unknown. Tests cover read-only stability under an independent writer, numeric
+seed ordering, retries, other families, supersession and damaged identities.
+A11.03's end-to-end publication requirement is closed by M14 acceptance below.
+
+M14.04 exposes the pure `render_report_markdown` baseline: fixed GFM sections,
+canonical evidence, deterministic ordering and explicit provisional/history
+labels. It preserves extractor selection/per-class data, escapes project text
+and encodes published artifact links; unknown versions remain explicit. Seven
+renderer tests and integration with real read-only contexts verify byte stability
+and isolation. Generated-file ownership and CLI actions follow in M14.06–M14.11;
+the full golden scenarios remain M14.12.
+
+M14.05 exposes `stage_report` and `StagedReport::publish`: private sibling staging,
+file/directory sync, an advisory directory lock for competing publishers,
+destination/staging identity and hash revalidation, and one atomic rename.
+Fourteen tests cover partial-write/rename failures, the post-rename unsynced
+outcome, concurrent writers/readers, external changes and unsafe paths. Drop
+cleans only the still-owned temporary. The primitive requires an existing output
+parent and explicit caller authorization. M14.13 expands failure coverage after
+action/bookkeeping integration.
+
+M14.06 implements `stage_generated_report` for the opt-in deterministic default
+mode. Missing outputs are created; existing files require an exact v1 claim bound
+to project/output and an unchanged body checksum. Handwritten files, bare renderer
+markers, edited generated reports and copied/unknown/malformed claims are
+preserved without staging. Ownership is authorized on the same descriptor and
+metadata snapshot used by the publisher. Ten mode tests plus an authorization
+race test exercise the policy, with publication/renderer regressions passing.
+Live generation/action validation and CLI acceptance remain in the next tasks.
+
+M14.07 adds bounded supervisor discovery of durable current-generation completion
+and a writer-first transactional enqueue. One `generate_report` intent per
+trigger/family/generation freezes the report policy and records its pending event
+atomically. Restart/backfill, opt-in, independent writers, supersession, project
+identity and paging across 65 families are tested. Configuration loading rejects
+foreign roots, symlink/nonregular entries and static FIFOs. Seven persistence
+tests and the daemon suite pass, including real worker-only completion followed
+by supervisor startup/restart. This step produces the durable intent consumed by
+the M14.08 report executor.
+
+M14.08 executes kind-specific report claims with a live publication gate. Pending
+extraction/incomplete generations and busy outputs defer without consuming
+retries; supersession, disabled/changed policy or project registration cancel
+obsolete intents. Staging/full hashes and nonblocking flock occur outside the
+writer, then the claim, frozen spec and serialized-context SHA are revalidated
+under the writer before rename. Publication is task-owned against client
+cancellation; SQL preparation precedes rename and post-rename uncertainty is
+reconciled rather than terminally failed. Ten persistence tests, six publication
+unit tests and daemon end-to-end coverage pass, alongside the complete core
+(214 persistence) and daemon suites. CLI commands and durable report-run hash
+history remain M14.10–M14.11; final golden/crash acceptance remains M14.12–M14.13.
+
+M14.09 adds `igor report generate FAMILY_ID [--json]`, a worker-only enqueue RPC
+and scoped receipt with request/action identity, frozen generation, output and
+state. New requests require enabled reports and a current comparable registered
+family. Manual UUIDs distinguish fresh invocations from replay: the same UUID
+acknowledges the original request without changing policy or retry budget; a new
+UUID creates a fresh manual intent. The supervisor applies the existing live
+publication gate. Six persistence tests plus CLI/protocol/client validation cover
+scope, replay, collisions, errors, worker-only acceptance and actual publication.
+The complete workspace all-features serial suite passes (220 persistence).
+Protocol v21, SQLite v22; old action specs default to automatic origin.
+
+M14.10 adds `igor report retry FAMILY_ID [--json]`. It requeues the latest
+original request of the current comparable generation only if failed, preserving
+action/spec/key/origin and renewing the operational budget. One immutable event
+records the prior error/count and retry UUID; same-UUID replay cannot reset twice.
+Original enqueue-event order prevents fallback to older failures or clock/UUID
+ordering mistakes. Eight persistence tests and real CLI/protocol/scope tests cover
+concurrency, rollback, replay/reopen, stale generation, protected files and actual
+publication without experiment reruns. Workspace all-features serial tests pass
+(228 persistence), with strict Clippy, format and docs. Protocol v22, SQLite v22.
+
+M14.11 adds SQLite v23 durable report-run evidence. Context JSON/SHA and frozen
+scope/spec commit before staging; full expected file hash/size and prior-output
+fence commit before rename. Published acknowledgement, action and events commit
+together after sync. Evidence is immutable/write-once; read-only history APIs
+verify context checksums. Reclaimed runs resume or resolve prior intents, confirm
+matching visible output without an inode rewrite and cancel recovery over
+different newer bytes. Failed/retried and superseded histories remain distinct;
+legacy provenance stays unknown. Nine ledger tests and the complete workspace
+all-features serial suite pass (237 persistence), with strict Clippy/format/docs.
+Protocol remains v22. Golden/failure coverage and milestone acceptance follow below.
+
+M14.12 adds four reviewed full-Markdown format-v1 snapshots under
+`crates/igor-core/tests/report/golden`: complete, failed/provisional, repaired
+with failed-attempt history, and superseded with separate generation/repair
+history. Fixed identities/paths, JSON round trips and collection permutations
+must preserve every byte. Independent semantic assertions cover current-only
+primary series, provisional failures, repair scope/fencing, escaped project text
+and retained/removed artifact links. Normal tests never update snapshots; an
+explicit ignored regeneration helper is documented for reviewed format changes.
+The renderer suite passes (11 tests; one ignored maintenance helper), along with
+strict workspace Clippy, format and diff-check. SQLite v23/protocol v22 unchanged.
+M14.13 and A14.01–A14.04/A11.03 are completed below.
+
+M14.13 adds integrated rename/sync failure tests for both first publication and
+replacement of an acknowledged report. Failure before rename preserves bytes/
+inode and rolls back action/run success; terminal retry preserves failed evidence.
+Post-rename sync failure and repeated sync failure during exact-file reconciliation
+remain uncertain without premature ACK or supersession. An isolated child is
+SIGKILLed after staging, immediately before rename, and after rename before sync/
+commit; reopening/reclaim resumes the same run, confirms matching output without
+rewriting, emits one success per action/run and preserves orphan temporaries.
+Faults are instance-local and compiled only with cfg(test). Three parent tests
+cover seven scenario combinations; the child entry is ignored outside its parent.
+Independent review and the complete workspace all-features serial suite pass
+(237 persistence; core unit tests 26 passed/one child ignored), with strict Clippy,
+format, docs and diff-check. SQLite v23/protocol v22 unchanged. All 13 tasks are
+implemented; A14.01–A14.04/A11.03 are accepted below.
 
 ### Acceptance
 
-- [ ] `A14.01` The same normalized context produces stable Markdown.
-- [ ] `A14.02` Handwritten project files are not modified by the default mode.
-- [ ] `A14.03` A failed report action cannot damage the previous report.
-- [ ] `A14.04` Milestones 11-14 complete the non-agent `v0.3` workflow.
+- [x] `A14.01` The same normalized context produces stable Markdown.
+- [x] `A14.02` Handwritten project files are not modified by the default mode.
+- [x] `A14.03` A failed report action cannot damage the previous report.
+- [x] `A14.04` Milestones 11-14 complete the non-agent `v0.3` workflow.
+
+Hito 14 accepted (13 tasks, four acceptances), also closing A11.03. Evidence:
+
+- A14.01: renderer/golden tests compare complete Markdown bytes, JSON round trips,
+  collection permutations and non-mutation of the source context.
+- A14.02: generated-file tests preserve manuscripts, unknown claims and manual
+  edits without staging; daemon/CLI tests exhaust report retries while preserving
+  handwritten output and successful experiment outcomes.
+- A14.03: integrated rename/sync and real SIGKILL tests preserve the old file before
+  rename, retain a complete identifiable output after an uncertain rename, and
+  reconcile without duplicate ACK/history or rewriting a matching inode. SQL/event/
+  COMMIT failures, stale leases and newer human/generated output are covered too.
+- A14.04/A11.03: `tests/report/acceptance.rs` runs a disposable five-seed process
+  family through three committed revisions. Worker-only success leaves extraction
+  pending; starting the supervisor publishes indexed metrics, verified models and
+  manual/automatic reports. A partial/failed second generation and frozen failed
+  retry cannot select the earlier aggregate or retire its copies. A third revision
+  reruns every seed, waits for extraction after supervisor restart and publishes
+  only scores 301–305, with current attempt IDs and an unchanged scientific digest.
+  Old scores/attempts remain historical, five old published copies are retired with
+  metadata preserved, and the old report ledger/context survives unchanged except
+  supersession. Storage/GC preview/logs remain usable; scientific inputs, manual
+  notes, prompt and project configuration are byte-identical; exactly 16 attempts
+  account for 15 jobs and one explicit failed retry, without report-induced reruns.
+
+The complete workspace all-features serial suite, strict workspace Clippy,
+format, docs and diff-check pass. Cargo/binary stays 0.1.0, SQLite v23/protocol v22;
+this closes the v0.3 roadmap scope, not a packaged release. Agent generators remain
+M15 and assisted repair M16. See `crates/igor-cli/tests/report/README.md` for the
+acceptance map and focused commands.
 
 ## Milestone 15: OpenCode And Pi Report Generators
 
@@ -774,6 +922,14 @@ Dependencies: milestones 0-16.
   whose serialized history can exceed the local protocol frame limit.
 
 ### Final Optimization And Reengineering Phase
+
+Persistence-test review requested during M14 acceptance: profile per-test and
+fixture costs before optimizing the 237-test baseline (195.39 s in the local
+serial run). Review shared report/GC setup, parameterize truly equivalent variants
+while preserving barrier/reopen/concurrency coverage, and split the ~8k-line
+`tests/persistence.rs` entrypoint into cohesive domains. Track this under
+M17.19–M17.22, comparing runtime before/after; reducing test-function counts alone
+does not reduce the cost of unchanged scenarios and fresh SQLite fixtures.
 
 - [ ] `M17.19` Establish reproducible baselines for representative queue,
   scheduling, recovery, SQLite, CLI, and supervisor workloads: throughput,

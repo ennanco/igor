@@ -6,6 +6,82 @@ use igor_daemon::{
     Response, ResponseEnvelope, Version,
 };
 
+#[test]
+fn report_retry_wire_receipt_binds_new_nonce_to_existing_action() -> Result<(), Box<dyn Error>> {
+    let family_id = igor_core::FamilyId::new();
+    let project_id = igor_core::ProjectId::new();
+    let request_id = igor_core::ActionId::new();
+    let action_id = igor_core::ActionId::new();
+    let request = RequestEnvelope::new(Request::ReportRetry {
+        family_id,
+        project_id: Some(project_id),
+        request_id,
+    });
+    assert_eq!(
+        serde_json::from_value::<RequestEnvelope>(serde_json::to_value(&request)?)?,
+        request
+    );
+    let receipt = igor_core::ReportRetryReceipt {
+        request_id,
+        report: igor_core::ReportRequestReceipt {
+            action_id,
+            project_id,
+            family_id,
+            generation: igor_core::GenerationIdentity {
+                id: igor_core::GenerationId::new(),
+                number: 1,
+                source_revision: "revision".into(),
+                protocol_digest: "sha256:protocol".into(),
+            },
+            output: "/fixture/RESULTS.md".into(),
+            state: igor_core::ActionState::Pending,
+        },
+    };
+    let response = ResponseEnvelope::success(Response::ReportRetried(receipt));
+    let json = serde_json::to_value(&response)?;
+    assert_eq!(json["protocol_version"], 22);
+    assert_eq!(json["response"]["request_id"], request_id.to_string());
+    assert_eq!(json["response"]["action_id"], action_id.to_string());
+    assert_eq!(serde_json::from_value::<ResponseEnvelope>(json)?, response);
+    Ok(())
+}
+
+#[test]
+fn manual_report_request_and_receipt_round_trip_with_current_protocol() -> Result<(), Box<dyn Error>>
+{
+    let family_id = igor_core::FamilyId::new();
+    let request_id = igor_core::ActionId::new();
+    let request = RequestEnvelope::new(Request::ReportGenerate {
+        family_id,
+        project_id: None,
+        request_id,
+    });
+    let value = serde_json::to_value(&request)?;
+    assert_eq!(value["protocol_version"], 22);
+    assert_eq!(value["request"]["type"], "report_generate");
+    assert_eq!(value["request"]["request_id"], request_id.to_string());
+    assert_eq!(serde_json::from_value::<RequestEnvelope>(value)?, request);
+    let receipt = igor_core::ReportRequestReceipt {
+        action_id: request_id,
+        project_id: igor_core::ProjectId::new(),
+        family_id,
+        generation: igor_core::GenerationIdentity {
+            id: igor_core::GenerationId::new(),
+            number: 2,
+            source_revision: "frozen-revision".into(),
+            protocol_digest: "sha256:protocol".into(),
+        },
+        output: "/fixture/RESULTS.md".into(),
+        state: igor_core::ActionState::Pending,
+    };
+    let response = ResponseEnvelope::success(Response::ReportRequested(receipt));
+    let value = serde_json::to_value(&response)?;
+    assert_eq!(value["response"]["type"], "report_requested");
+    assert_eq!(value["response"]["state"], "pending");
+    assert_eq!(serde_json::from_value::<ResponseEnvelope>(value)?, response);
+    Ok(())
+}
+
 #[tokio::test]
 async fn storage_inventory_round_trips_with_explicit_unmeasured_bytes() -> Result<(), Box<dyn Error>>
 {
@@ -42,13 +118,13 @@ async fn storage_inventory_round_trips_with_explicit_unmeasured_bytes() -> Resul
     let gc = ResponseEnvelope::success(Response::GcPlan(database.gc_plan(None, &paths).await?));
     let encoded = serde_json::to_value(&gc)?;
     assert_eq!(encoded["response"]["type"], "gc_plan");
-    assert_eq!(encoded["protocol_version"], 20);
+    assert_eq!(encoded["protocol_version"], 22);
     assert_eq!(serde_json::from_value::<ResponseEnvelope>(encoded)?, gc);
     let response = ResponseEnvelope::success(Response::StorageStatus(
         database.storage_status(None).await?,
     ));
     let encoded = serde_json::to_value(&response)?;
-    assert_eq!(encoded["protocol_version"], 20);
+    assert_eq!(encoded["protocol_version"], 22);
     assert_eq!(encoded["response"]["type"], "storage_status");
     assert!(encoded["response"]["actual_disk_footprint"].is_null());
     assert_eq!(encoded["response"]["pending_log_preparations"]["count"], 0);
@@ -65,7 +141,7 @@ async fn storage_inventory_round_trips_with_explicit_unmeasured_bytes() -> Resul
 
 #[test]
 fn gc_execution_wire_contract_round_trips_with_structured_outcomes() -> Result<(), Box<dyn Error>> {
-    assert_eq!(PROTOCOL_VERSION, 20);
+    assert_eq!(PROTOCOL_VERSION, 22);
     let request = RequestEnvelope::new(Request::GcExecute {
         project_id: None,
         failed_only: true,

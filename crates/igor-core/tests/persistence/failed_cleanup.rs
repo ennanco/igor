@@ -1565,7 +1565,7 @@ async fn cleanup_schema20_does_not_fabricate_historical_tombstones() -> TestResu
         .execute(f.database.pool()).await?;
     f.database.pool().close().await;
     let upgraded = Database::open(&f.paths.database).await?;
-    assert_eq!(upgraded.schema_version().await?, 22);
+    assert_eq!(upgraded.schema_version().await?, 23);
     assert!(
         upgraded
             .cleanup_tombstone("failed_artifact_retention", &f.artifact.id.to_string())

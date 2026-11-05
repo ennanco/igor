@@ -29,9 +29,37 @@ use tempfile::TempDir;
 use tokio::sync::{Barrier, oneshot};
 
 type TestResult = Result<(), Box<dyn Error>>;
+#[path = "support/report_ledger.rs"]
+mod report_ledger_schema;
+
+async fn drop_report_ledger(database: &Database) -> TestResult {
+    let present: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pragma_table_info('report_runs') WHERE name = 'action_id'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    if present != 0 {
+        sqlx::raw_sql(report_ledger_schema::REMOVE_REPORT_LEDGER)
+            .execute(database.pool())
+            .await?;
+    }
+    Ok(())
+}
 
 #[path = "persistence/owned_failed_outputs.rs"]
 mod owned_failed_outputs;
+#[path = "persistence/report_actions.rs"]
+mod report_actions;
+#[path = "persistence/report_context.rs"]
+mod report_context;
+#[path = "persistence/report_execution.rs"]
+mod report_execution;
+#[path = "persistence/report_ledger.rs"]
+mod report_ledger_cases;
+#[path = "persistence/report_requests.rs"]
+mod report_requests;
+#[path = "persistence/report_retry.rs"]
+mod report_retry;
 
 async fn drop_repair_worktrees(database: &Database) -> TestResult {
     sqlx::raw_sql(
@@ -64,6 +92,7 @@ async fn drop_replacement_barrier(database: &Database) -> TestResult {
 }
 
 async fn drop_cleanup_evidence(database: &Database) -> TestResult {
+    drop_report_ledger(database).await?;
     sqlx::raw_sql("DROP TABLE IF EXISTS owned_output_discovery; DROP TABLE IF EXISTS owned_output_manifest; DROP TABLE IF EXISTS owned_output_namespaces; DELETE FROM _sqlx_migrations WHERE version = 22;").execute(database.pool()).await?;
     sqlx::raw_sql("DROP TRIGGER IF EXISTS retired_failed_tails_immutable; DROP TRIGGER IF EXISTS retired_failed_tails_preserved; DROP TRIGGER IF EXISTS retired_failed_tails_replacement_guard; DROP TABLE IF EXISTS failed_log_retirements; DELETE FROM _sqlx_migrations WHERE version = 21;")
         .execute(database.pool()).await?;
@@ -305,6 +334,9 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
         "recoveries_attempt_idx",
         "repair_worktrees_cleanup_idx",
         "report_runs_generation_idx",
+        "report_runs_action_idx",
+        "report_runs_output_idx",
+        "report_runs_prepared_idx",
         "resource_leases_expiry_idx",
         "resource_leases_job_idx",
         "resource_leases_resource_idx",
@@ -326,7 +358,7 @@ async fn empty_database_upgrades_to_checksummed_latest_schema() -> TestResult {
     )
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(ledger.len(), 22);
+    assert_eq!(ledger.len(), 23);
     for (index, row) in ledger.iter().enumerate() {
         assert_eq!(row.get::<i64, _>("version"), (index + 1) as i64);
         assert!(row.get::<bool, _>("success"));
@@ -377,7 +409,7 @@ async fn version_one_fixture_upgrades_and_preserves_ledger_checksum() -> TestRes
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
         ]
     );
     let checksum: Vec<u8> =
@@ -2007,7 +2039,7 @@ async fn artifact_registration_migration_preserves_legacy_published_metadata() -
     .await?;
     database.pool().close().await;
     let migrated = Database::open(directory.path().join("nested/igor.db")).await?;
-    assert_eq!(migrated.schema_version().await?, 22);
+    assert_eq!(migrated.schema_version().await?, 23);
     assert!(
         !migrated
             .artifacts()
@@ -2117,7 +2149,7 @@ async fn artifact_lifecycle_migration_preserves_physical_state_and_classifies_pa
     database.pool().close().await;
 
     let upgraded = Database::open(directory.path().join("nested/igor.db")).await?;
-    assert_eq!(upgraded.schema_version().await?, 22);
+    assert_eq!(upgraded.schema_version().await?, 23);
     let first_id = artifacts[0].id;
     for (index, original) in artifacts.into_iter().enumerate() {
         let actual = upgraded
@@ -7118,7 +7150,7 @@ async fn superseded_artifact_migration_backfills_v16_without_losing_metadata() -
     assert_eq!(database.schema_version().await?, 16);
     database.pool().close().await;
     let upgraded = Database::open(fixture._database.path().join("nested/igor.db")).await?;
-    assert_eq!(upgraded.schema_version().await?, 22);
+    assert_eq!(upgraded.schema_version().await?, 23);
     for (original, lifecycle) in [
         (published, igor_core::ArtifactLifecycleState::Superseded),
         (retained, igor_core::ArtifactLifecycleState::Retained),

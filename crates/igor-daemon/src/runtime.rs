@@ -555,6 +555,16 @@ async fn handle_request(
             Ok(None) => ResponseEnvelope::failure(ProtocolError::not_found("family")),
             Err(error) => persistence_response(error),
         },
+        Request::ReportGenerate {
+            family_id,
+            project_id,
+            request_id,
+        } => handle_report_request(database, family_id, project_id, request_id, false).await,
+        Request::ReportRetry {
+            family_id,
+            project_id,
+            request_id,
+        } => handle_report_request(database, family_id, project_id, request_id, true).await,
         Request::FamilySupersede {
             project_id,
             family_id,
@@ -692,6 +702,86 @@ async fn handle_request(
     }
 }
 
+async fn handle_report_request(
+    database: &Database,
+    family_id: igor_core::FamilyId,
+    project_id: Option<igor_core::ProjectId>,
+    request_id: igor_core::ActionId,
+    retry: bool,
+) -> ResponseEnvelope {
+    if retry {
+        match database
+            .actions()
+            .report_retry_request(request_id, family_id, project_id)
+            .await
+        {
+            Ok(Some(receipt)) => {
+                return ResponseEnvelope::success(Response::ReportRetried(receipt));
+            }
+            Ok(None) => {}
+            Err(error) => return persistence_response(error),
+        }
+    } else {
+        match database
+            .actions()
+            .manual_report_request(request_id, family_id, project_id)
+            .await
+        {
+            Ok(Some(receipt)) => {
+                return ResponseEnvelope::success(Response::ReportRequested(receipt));
+            }
+            Ok(None) => {}
+            Err(error) => return persistence_response(error),
+        }
+    }
+    let candidate = match database
+        .actions()
+        .report_candidate(family_id, project_id)
+        .await
+    {
+        Ok(Some(candidate)) => candidate,
+        Ok(None) => {
+            return ResponseEnvelope::failure(ProtocolError::not_found(
+                "family or registered project",
+            ));
+        }
+        Err(error) => return persistence_response(error),
+    };
+    let project = candidate.project.clone();
+    let policy =
+        match tokio::task::spawn_blocking(move || crate::report_triggers::load_policy(&project))
+            .await
+        {
+            Ok(Ok(policy)) => policy,
+            Ok(Err(error)) => {
+                return ResponseEnvelope::failure(ProtocolError::invalid_request(error));
+            }
+            Err(error) => {
+                tracing::error!(%error, "report policy task failed");
+                return ResponseEnvelope::failure(ProtocolError::internal());
+            }
+        };
+    if retry {
+        match database
+            .actions()
+            .retry_family_report(&candidate, &policy, request_id)
+            .await
+        {
+            Ok(receipt) => ResponseEnvelope::success(Response::ReportRetried(receipt)),
+            Err(error) => persistence_response(error),
+        }
+    } else {
+        match database
+            .actions()
+            .enqueue_manual_report(&candidate, &policy, request_id)
+            .await
+        {
+            Ok(receipt) => ResponseEnvelope::success(Response::ReportRequested(receipt)),
+            Err(error) => persistence_response(error),
+        }
+    }
+}
+
 fn normalize_project(mut project: igor_core::Project) -> Result<igor_core::Project, String> {
     project.root = project
         .root
@@ -728,6 +818,15 @@ fn persistence_response(error: PersistenceError) -> ResponseEnvelope {
     let protocol = match error {
         PersistenceError::NotFound { entity } => ProtocolError::not_found(entity),
         PersistenceError::Conflict { entity } => ProtocolError::conflict(entity),
+        PersistenceError::ReportDisabled => {
+            ProtocolError::conflict("report generation is disabled; set [report] enabled = true")
+        }
+        PersistenceError::GenerationNotComparable {
+            generation_id,
+            status,
+        } => ProtocolError::conflict(&format!(
+            "generation {generation_id} is {status:?}; report generation requires a comparable generation"
+        )),
         PersistenceError::Domain(error) => ProtocolError::invalid_request(error.to_string()),
         PersistenceError::InvalidValue { entity, value } => {
             ProtocolError::invalid_request(format!("invalid {entity}: {value}"))
@@ -926,6 +1025,36 @@ fn validate_response(
         | (Request::JobCancel { .. }, Response::Cancelled(_))
         | (Request::JobRetry { .. }, Response::Retried(_))
         | (Request::JobLogs { .. }, Response::Logs(_)) => role == DaemonRole::Worker,
+        (
+            Request::ReportGenerate {
+                family_id,
+                project_id,
+                request_id,
+            },
+            Response::ReportRequested(receipt),
+        ) => {
+            role == DaemonRole::Worker
+                && *family_id == receipt.family_id
+                && *request_id == receipt.action_id
+                && project_id.is_none_or(|id| id == receipt.project_id)
+                && receipt.generation.number > 0
+                && receipt.output.is_absolute()
+        }
+        (
+            Request::ReportRetry {
+                family_id,
+                project_id,
+                request_id,
+            },
+            Response::ReportRetried(receipt),
+        ) => {
+            role == DaemonRole::Worker
+                && *request_id == receipt.request_id
+                && *family_id == receipt.report.family_id
+                && project_id.is_none_or(|id| id == receipt.report.project_id)
+                && receipt.report.generation.number > 0
+                && receipt.report.output.is_absolute()
+        }
         (Request::AttemptLogs { job_id, attempt_id }, Response::Logs(logs)) => {
             role == DaemonRole::Worker && *job_id == logs.job_id && *attempt_id == logs.attempt_id
         }
@@ -1165,6 +1294,127 @@ mod tests {
     use igor_core::{Project, ProjectId, initialize_project};
 
     use super::*;
+
+    #[test]
+    fn report_retry_response_rejects_mismatched_nonce_or_scope() {
+        let family_id = igor_core::FamilyId::new();
+        let project_id = igor_core::ProjectId::new();
+        let request_id = igor_core::ActionId::new();
+        let request = Request::ReportRetry {
+            family_id,
+            project_id: Some(project_id),
+            request_id,
+        };
+        let receipt = igor_core::ReportRetryReceipt {
+            request_id,
+            report: igor_core::ReportRequestReceipt {
+                action_id: igor_core::ActionId::new(),
+                project_id,
+                family_id,
+                generation: igor_core::GenerationIdentity {
+                    id: igor_core::GenerationId::new(),
+                    number: 1,
+                    source_revision: "revision".into(),
+                    protocol_digest: "sha256:protocol".into(),
+                },
+                output: "/fixture/RESULTS.md".into(),
+                state: igor_core::ActionState::Pending,
+            },
+        };
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                request.clone(),
+                Response::ReportRetried(receipt.clone())
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Supervisor,
+                request.clone(),
+                Response::ReportRetried(receipt.clone())
+            )
+            .is_err()
+        );
+        for field in ["nonce", "family", "project"] {
+            let mut wrong = receipt.clone();
+            match field {
+                "nonce" => wrong.request_id = igor_core::ActionId::new(),
+                "family" => wrong.report.family_id = igor_core::FamilyId::new(),
+                "project" => wrong.report.project_id = igor_core::ProjectId::new(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_response(
+                    DaemonRole::Worker,
+                    request.clone(),
+                    Response::ReportRetried(wrong)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn report_receipt_requires_matching_nonce_family_project_and_worker_role() {
+        let family_id = igor_core::FamilyId::new();
+        let project_id = igor_core::ProjectId::new();
+        let request_id = igor_core::ActionId::new();
+        let request = Request::ReportGenerate {
+            family_id,
+            project_id: Some(project_id),
+            request_id,
+        };
+        let receipt = igor_core::ReportRequestReceipt {
+            action_id: request_id,
+            project_id,
+            family_id,
+            generation: igor_core::GenerationIdentity {
+                id: igor_core::GenerationId::new(),
+                number: 1,
+                source_revision: "revision".into(),
+                protocol_digest: "sha256:protocol".into(),
+            },
+            output: "/fixture/RESULTS.md".into(),
+            state: igor_core::ActionState::Pending,
+        };
+        assert!(
+            validate_response(
+                DaemonRole::Worker,
+                request.clone(),
+                Response::ReportRequested(receipt.clone())
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_response(
+                DaemonRole::Supervisor,
+                request.clone(),
+                Response::ReportRequested(receipt.clone())
+            )
+            .is_err()
+        );
+        for field in ["nonce", "family", "project", "output", "generation"] {
+            let mut wrong = receipt.clone();
+            match field {
+                "nonce" => wrong.action_id = igor_core::ActionId::new(),
+                "family" => wrong.family_id = igor_core::FamilyId::new(),
+                "project" => wrong.project_id = igor_core::ProjectId::new(),
+                "output" => wrong.output = "relative.md".into(),
+                "generation" => wrong.generation.number = 0,
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_response(
+                    DaemonRole::Worker,
+                    request.clone(),
+                    Response::ReportRequested(wrong)
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn gc_worklists_use_bounded_large_frames_without_expanding_other_requests()
